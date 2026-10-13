@@ -293,7 +293,7 @@ class TrayApp:
                 online, via = internet_ok(self.session)
             except Exception as exc:
                 self.log.warning("探测异常: %s", type(exc).__name__)
-                online, via = False, ""
+                online = False
             if online:
                 if self.state["mode"] != "online":
                     self.set_state("online", "网络正常")

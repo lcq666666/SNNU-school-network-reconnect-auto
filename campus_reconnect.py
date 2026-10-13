@@ -33,9 +33,8 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 try:
     import keyring
@@ -76,13 +75,20 @@ def setup_logging(verbose: bool) -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("campus")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    # 幂等：先移除本函数此前添加的 handler，避免重复调用时堆叠（对应 T36）。
+    for handler in list(logger.handlers):
+        if getattr(handler, "_campus_handler", False):
+            logger.removeHandler(handler)
+            handler.close()
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     fh = logging.handlers.RotatingFileHandler(
         LOG_DIR / "campus_reconnect.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     fh.setFormatter(fmt)
+    fh._campus_handler = True  # type: ignore[attr-defined]
     logger.addHandler(fh)
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
+    ch._campus_handler = True  # type: ignore[attr-defined]
     logger.addHandler(ch)
     return logger
 
