@@ -1,0 +1,45 @@
+# 校园网自动重连助手 — 精确依赖锁定（F22）
+#
+# 生成环境：Windows x64 / CPython 3.13.7 / .venv（本项目隔离环境）
+# 生成方式：.venv/Scripts/python.exe -m pip freeze
+# 说明：
+#   - 本文件是「已知可构建、可通过全部离线测试」的精确版本快照，用于可追溯重建；
+#   - 不承诺 bit-for-bit 复现（编译产物/时间戳/UPX 版本可能不同），只锁定**依赖版本**；
+#   - 安装：.venv/Scripts/python.exe -m pip install -r requirements-lock.txt
+
+# ---- 运行依赖 ----
+requests==2.34.2
+keyring==25.7.0
+# 运行依赖的传递依赖
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
+urllib3==2.8.0
+jaraco.classes==3.4.0
+jaraco.context==6.1.2
+jaraco.functools==4.6.0
+more-itertools==11.1.0
+six==1.17.0
+
+# ---- 托盘附加依赖 ----
+pystray==0.19.5
+pillow==11.3.0
+
+# ---- 测试 / 静态检查 ----
+pytest==8.4.2
+pytest-cov==6.3.0
+coverage==7.16.2
+pluggy==1.6.0
+iniconfig==2.3.1
+packaging==26.3
+Pygments==2.21.0
+colorama==0.4.6
+ruff==0.14.14
+
+# ---- 打包 ----
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+setuptools==84.0.0
