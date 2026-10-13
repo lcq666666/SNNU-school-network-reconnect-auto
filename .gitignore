@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+logs/
+tray_config.json
+.workbuddy-ai/
