@@ -3,3 +3,6 @@ __pycache__/
 logs/
 tray_config.json
 .workbuddy-ai/
+build/
+dist/
+CampusReconnect.exe

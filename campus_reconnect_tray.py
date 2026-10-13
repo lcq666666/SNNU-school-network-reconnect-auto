@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
+import keyring
 import pystray
 import winreg
 from PIL import Image, ImageDraw
@@ -34,7 +35,10 @@ from campus_reconnect import (edge_fallback, ensure_single_instance,
                               portal_reachable, resolve_port, setup_logging,
                               wifi_state)
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "tray_config.json"
 LOG_DIR = SCRIPT_DIR / "logs"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -87,12 +91,20 @@ def get_autostart() -> bool:
         return False
 
 
+def launcher_command() -> str:
+    """开机自启优先用打包好的 exe；没有 exe 时退回 pythonw + 脚本。"""
+    exe = SCRIPT_DIR / "CampusReconnect.exe"
+    if exe.is_file():
+        return '"%s"' % exe
+    return '"%s" "%s"' % (PYTHONW, SCRIPT_DIR / "campus_reconnect_tray.py")
+
+
 def set_autostart(enabled: bool) -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0,
                             winreg.KEY_SET_VALUE) as key:
             if enabled:
-                cmd = '"%s" "%s"' % (PYTHONW, SCRIPT_DIR / "campus_reconnect_tray.py")
+                cmd = launcher_command()
                 winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
             else:
                 try:
@@ -509,20 +521,63 @@ class TrayApp:
         self.notify("校园网助手已启动", body)
 
 
+def prompt_credentials_dialog(root):
+    """首次运行且无凭据时弹出图形界面输入账号密码（exe 版自包含所需）。"""
+    result = {"value": None}
+    win = tk.Toplevel(root)
+    win.title("校园网账号设置")
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    f = ttk.Frame(win, padding=14)
+    f.grid(sticky="nsew")
+    ttk.Label(f, text="首次使用：请输入校园网账号与密码",
+              font=("Microsoft YaHei", 10, "bold")).grid(row=0, column=0, columnspan=2)
+    ttk.Label(f, text="仅保存在本机 Windows 凭据管理器中").grid(
+        row=1, column=0, columnspan=2, pady=(0, 10))
+    ttk.Label(f, text="账号").grid(row=2, column=0, sticky="e", padx=4)
+    v_user = tk.StringVar()
+    ttk.Entry(f, textvariable=v_user, width=22).grid(row=2, column=1, sticky="w", padx=4)
+    ttk.Label(f, text="密码").grid(row=3, column=0, sticky="e", padx=4, pady=6)
+    v_pwd = tk.StringVar()
+    ttk.Entry(f, textvariable=v_pwd, width=22, show="*").grid(
+        row=3, column=1, sticky="w", padx=4, pady=6)
+
+    def on_ok():
+        u, p = v_user.get().strip(), v_pwd.get()
+        if u and p:
+            result["value"] = (u, p)
+            win.destroy()
+        else:
+            messagebox.showwarning("信息不完整", "账号和密码都不能为空")
+
+    ttk.Button(f, text="保存", command=on_ok).grid(row=4, column=0, columnspan=2, pady=(10, 0))
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.grab_set()
+    root.wait_window(win)
+    return result["value"]
+
+
 def main():
     log = setup_logging(False)
     if not ensure_single_instance(log):
-        root = tk.Tk()
-        root.withdraw()
+        root0 = tk.Tk()
+        root0.withdraw()
         messagebox.showerror(APP_NAME,
                              "已有一个监控实例在运行。\n如需重启，请先在托盘右键退出旧实例。")
-        root.destroy()
+        root0.destroy()
         return
-    if not get_credentials():
-        log.warning("尚未保存校园网凭据（configure 未执行），重连将不可用")
-    app = TrayApp(log)
     root = tk.Tk()
     root.withdraw()
+    if not get_credentials():
+        log.warning("尚未保存凭据，弹出账号设置窗口")
+        creds = prompt_credentials_dialog(root)
+        if creds:
+            keyring.set_password(SERVICE, "username", creds[0])
+            keyring.set_password(SERVICE, "password", creds[1])
+            log.info("凭据已通过界面保存")
+        else:
+            log.warning("未设置账号，自动重连暂不可用（可在凭据管理器中补存后重启）")
+    app = TrayApp(log)
     app.root = root
     log.info("托盘助手启动（autostart=%s, clash_auto_proxy=%s）",
              get_autostart(), app.config.get("clash_auto_proxy"))

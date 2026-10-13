@@ -47,7 +47,10 @@ except ImportError:
 if os.name == "nt":
     import winreg
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_DIR = SCRIPT_DIR / "logs"
 
 SERVICE = "SNNU-Campus-Reconnect"
