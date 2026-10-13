@@ -6,7 +6,8 @@
 - ``bool(None)`` 使「尚未询问」变成「拒绝」，且任意设置保存都会调用
   ``set_autostart()``（T24）。
 
-**本文件在修复前必须失败**（阶段 2 修复后转绿）；不写真实注册表。
+**阶段 2 已修复**：授权绑定版本（过期询问结果不应用、新拒绝优先），设置面板
+只提交用户实际变更项；本用例已并入默认离线集合。不写真实注册表。
 """
 from __future__ import annotations
 
@@ -15,8 +16,6 @@ import logging
 import pytest
 
 import campus_reconnect_tray as tray
-
-pytestmark = pytest.mark.regression
 
 LOG = logging.getLogger("campus")
 

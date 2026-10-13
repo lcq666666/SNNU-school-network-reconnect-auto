@@ -43,6 +43,8 @@ except ImportError:
     print("缺少依赖，请先运行: py -m pip install requests keyring")
     raise SystemExit(2)
 
+from campus_windows import CredentialStore
+
 if os.name == "nt":
     import winreg
 
@@ -72,7 +74,11 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 def setup_logging(verbose: bool) -> logging.Logger:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    """配置 ``campus`` logger（幂等）。
+
+    日志目录不可写（只读安装目录等，见 F13/T37）时**降级**为仅控制台输出并给出
+    可见告警，绝不在 UI 出现前因日志初始化失败而崩溃。
+    """
     logger = logging.getLogger("campus")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     # 幂等：先移除本函数此前添加的 handler，避免重复调用时堆叠（对应 T36）。
@@ -81,15 +87,24 @@ def setup_logging(verbose: bool) -> logging.Logger:
             logger.removeHandler(handler)
             handler.close()
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.handlers.RotatingFileHandler(
-        LOG_DIR / "campus_reconnect.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt)
-    fh._campus_handler = True  # type: ignore[attr-defined]
-    logger.addHandler(fh)
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     ch._campus_handler = True  # type: ignore[attr-defined]
     logger.addHandler(ch)
+    file_error = None
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_DIR / "campus_reconnect.log", maxBytes=1_000_000, backupCount=3,
+            encoding="utf-8")
+        fh.setFormatter(fmt)
+        fh._campus_handler = True  # type: ignore[attr-defined]
+        logger.addHandler(fh)
+    except OSError as exc:
+        file_error = exc
+    if file_error is not None:
+        logger.warning("日志文件不可写（%s），已降级为仅控制台输出；日志目录：%s",
+                       type(file_error).__name__, LOG_DIR)
     return logger
 
 
@@ -212,12 +227,15 @@ def wifi_reconnect(ssid: str, log: logging.Logger) -> bool:
 
 
 def get_credentials() -> Optional[Tuple[str, str]]:
-    try:
-        username = keyring.get_password(SERVICE, "username")
-        password = keyring.get_password(SERVICE, "password")
-    except Exception:
+    """读取凭据；未配置或后端不可用均返回 ``None``。
+
+    需要区分「未配置」与「凭据库不可用」时请改用
+    :meth:`campus_windows.CredentialStore.load`（F11）。
+    """
+    loaded = CredentialStore(keyring).load()
+    if not loaded.ok:
         return None
-    return (username, password) if username and password else None
+    return (loaded.username, loaded.password.reveal())
 
 
 def read_proxy_settings() -> dict:
@@ -275,8 +293,9 @@ def configure() -> None:
     password = getpass.getpass("校园网密码（输入时不显示）：")
     if not password:
         raise SystemExit("密码不能为空")
-    keyring.set_password(SERVICE, "username", username)
-    keyring.set_password(SERVICE, "password", password)
+    result = CredentialStore(keyring).save(username, password)
+    if not result.ok:
+        raise SystemExit("凭据保存失败：%s" % result.detail)
     print("凭据保存完毕（未尝试登录）。")
     print("运营商由 watch/once 的 --yys 参数指定，默认 mobile（移动）。")
 

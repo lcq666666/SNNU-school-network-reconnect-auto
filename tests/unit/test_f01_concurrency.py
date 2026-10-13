@@ -4,7 +4,8 @@
 依据《审查方案》F01：``on_reconnect()`` 每次点击都新建线程，且与监测线程可同时
 调用 ``repair_once()``，没有 repair 锁 —— 掉线时连续点击会产生多个并行认证任务。
 
-**本文件在修复前必须失败**（阶段 2 修复后转绿）；不真实联网，不真实 sleep。
+**阶段 2 已修复**：手动 / 自动请求统一投递到单网络工作线程，重复请求合并，
+同一时刻最多一个认证任务在途；本用例已并入默认离线集合。不真实联网，不真实 sleep。
 """
 from __future__ import annotations
 
@@ -12,11 +13,7 @@ import logging
 import threading
 import time
 
-import pytest
-
 import campus_reconnect_tray as tray
-
-pytestmark = pytest.mark.regression
 
 LOG = logging.getLogger("campus")
 
@@ -59,3 +56,4 @@ def test_t01_manual_reconnects_are_serialized(monkeypatch):
 
     assert state["max"] <= 1, \
         "并发手动重连产生了 %d 个并行认证任务（应最多 1 个）" % state["max"]
+    app.on_quit()   # 清理工作线程，避免影响后续用例

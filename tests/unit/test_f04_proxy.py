@@ -6,15 +6,13 @@
 仅用 ``KEY_SET_VALUE`` 打开句柄却调用 ``QueryValueEx``；读取权限失败返回 False，
 但前面的 ``ProxyEnable=1`` 已经写入（部分写入）。
 
-**本文件在修复前必须失败**（阶段 2 修复后转绿）。
+**阶段 2 已修复**：``apply_system_proxy()`` 先以 ``KEY_QUERY_VALUE |
+KEY_SET_VALUE`` 读完整快照、再验证端点、最后才写 ``ProxyEnable``，本用例已并入
+默认离线集合。
 """
 from __future__ import annotations
 
-import pytest
-
 import campus_reconnect_tray as tray
-
-pytestmark = pytest.mark.regression
 
 
 def test_t08_query_denied_must_not_modify_proxy_enable(monkeypatch, fake_registry):

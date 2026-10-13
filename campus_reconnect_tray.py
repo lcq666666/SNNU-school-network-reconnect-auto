@@ -2,12 +2,24 @@
 """校园网自动重连助手 · 托盘版 (Windows)
 
 在引擎 campus_reconnect.py 之上提供:
-  - 任务栏托盘图标与右键菜单(四态: 在线 / 重连中 / 已断开 / 已暂停)
+  - 任务栏托盘图标与右键菜单(在线 / 重连中 / 已断开 / 已暂停 / 异常)
   - 气泡通知: 启动状态 / 网络断开开始重连 / 重连成功(耗时) / 重连失败(原因)
   - 设置面板(tkinter): 实时状态、参数、开关
-  - "重连成功后自动开启 Clash 系统代理" 的同意询问(记住选择, 可随时改)
+  - "重连成功后自动开启系统代理" 的三态授权(每次询问 / 自动开启 / 不开启)
   - 开机自启开关: HKCU Run 注册表项 CampusReconnectTray
-  - Clash 系统代理开关: 注册表 ProxyEnable(即时生效; Verge 界面状态可能滞后到下次手动切换)
+
+阶段 2（稳定性与系统副作用止血）后的关键结构:
+  - **单网络工作线程 + 命令队列**：手动 / 自动 / 启动检查统一投递，同一时刻最多
+    一个认证任务在途；重复手动请求合并（F01）。
+  - **工作单元异常边界**：探测 / 重连 / 结果处理任一步抛错都转成可识别的 ERROR
+    状态并保留心跳，线程不静默失效，主线程可查看具体故障并重启（F02）。
+  - **配置校验与原子持久化**：非法配置回退安全默认值并给出可见错误；保存使用
+    同目录临时文件 + fsync + os.replace，失败保留旧文件且不谎报成功（F03/F13）。
+  - **代理事务**：先读快照、再验证端点、最后才写 ProxyEnable；失败按事务回滚，
+    回滚与系统刷新结果分别报告；默认不启用、不猜测端点（F04/F05）。
+  - **取消令牌**：退出 / 暂停后不再启动新的 POST / Edge / 代理写入（F10）。
+  - **凭据存储**：区分未配置 / 后端不可用 / 读写失败，部分失败尝试恢复旧对（F11）。
+  - **授权版本**：过期的授权询问结果不应用，新的拒绝优先；设置只保存实际变更项（F12）。
 
 依赖: py -m pip install pystray pillow
 运行: py campus_reconnect_tray.py   (run_tray.bat 可双击启动)
@@ -15,12 +27,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import queue
 import sys
-import traceback
+import tempfile
 import threading
 import time
 import tkinter as tk
+import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -30,56 +46,211 @@ import pystray
 import winreg
 from PIL import Image, ImageDraw
 
-from campus_reconnect import (SERVICE, edge_fallback, ensure_single_instance,
-                              get_credentials, internet_ok, portal_login,
-                              portal_reachable, resolve_port, setup_logging,
-                              wifi_state)
+from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
+                         CredentialClear, CredentialLoad, CredentialSave,
+                         ProxyApplyResult, load_config_text)
+from campus_reconnect import (direct_session, edge_fallback,
+                              ensure_single_instance, get_credentials,
+                              internet_ok, portal_login, portal_reachable,
+                              resolve_port, setup_logging, wifi_state)
+from campus_windows import CredentialStore, ProxyController, default_refresh
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = SCRIPT_DIR / "tray_config.json"
 LOG_DIR = SCRIPT_DIR / "logs"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "CampusReconnectTray"
 PYTHONW = str(Path(sys.executable).with_name("pythonw.exe"))
-CLASH_SERVER_DEFAULT = "127.0.0.1:7897"
+CLASH_SERVER_DEFAULT = "127.0.0.1:7897"   # 仅在用户显式确认时作为**建议值**展示
 APP_NAME = "校园网自动重连助手"
+UI_POLL_MS = 120
 
+#: 托盘配置的完整键集合（保存时只写这些键，未知键永不落盘）。
 DEFAULT_CONFIG = {
+    "schema_version": SCHEMA_VERSION,
     "ssid": "SNNU",
+    "profile": None,
+    "interface": None,
     "yys": "mobile",
+    "account_format": "plain",
     "interval": 15,
     "threshold": 3,
     "cooldown": 180,
     "browser_fallback": True,
-    "clash_auto_proxy": None,   # None=首次成功时询问; True/False=用户选择
+    "clash_auto_proxy": None,   # None=尚未询问; True=同意联动; False=拒绝
+    "proxy_endpoint": None,     # 用户显式确认的代理端点
     "paused": False,
 }
+CONFIG_KEYS = tuple(DEFAULT_CONFIG)
 
 MODE_COLOR = {"online": (63, 185, 80), "reconnecting": (210, 153, 34),
               "offline": (248, 81, 73), "paused": (139, 148, 158),
-              "boot": (88, 166, 255)}
+              "boot": (88, 166, 255), "error": (188, 140, 255)}
 MODE_TEXT = {"online": "在线", "reconnecting": "重连中", "offline": "已断开",
-             "paused": "已暂停", "boot": "启动中"}
+             "paused": "已暂停", "boot": "启动中", "error": "异常"}
+
+#: 代理授权三态在设置面板中的显示标签。
+CONSENT_CHOICES = (("每次询问", None), ("自动开启", True), ("不开启", False))
+CONSENT_LABELS = [label for label, _ in CONSENT_CHOICES]
+CONSENT_LABEL_TO_VALUE = {label: value for label, value in CONSENT_CHOICES}
+CONSENT_VALUE_TO_LABEL = {value: label for label, value in CONSENT_CHOICES}
+
+
+# --------------------------------------------------------------------------- #
+# 数据目录与配置路径（F13）
+# --------------------------------------------------------------------------- #
+def resolve_config_file() -> Path:
+    """默认配置位置。
+
+    - 打包（便携）模式：与 exe 同级；
+    - 源码模式：``%LOCALAPPDATA%\\CampusReconnect\\tray_config.json``
+      （exe 所在目录可能只读，见 F13/T37）。
+    """
+    if getattr(sys, "frozen", False):
+        return SCRIPT_DIR / "tray_config.json"
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / "CampusReconnect" / "tray_config.json"
+    return SCRIPT_DIR / "tray_config.json"
+
+
+CONFIG_FILE = resolve_config_file()
+
+
+def _config_candidates() -> list:
+    """候选配置路径：主路径优先，其次旧位置（仅只读加载，不移动/删除）。"""
+    primary = Path(CONFIG_FILE)
+    candidates = [primary]
+    if primary == resolve_config_file():
+        legacy = SCRIPT_DIR / "tray_config.json"
+        if legacy != primary:
+            candidates.append(legacy)
+    return candidates
+
+
+def _read_config_text():
+    """返回 ``(文本, 来源路径)``；全部缺失时返回 ``("", 主路径)``。"""
+    candidates = _config_candidates()
+    for index, path in enumerate(candidates):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if index > 0:
+            logging.getLogger("campus").warning(
+                "检测到旧位置配置 %s，已只读加载（不移动、不删除旧文件）", path)
+        return text, path
+    return "", candidates[0]
+
+
+def _read_paused_flag(text: str) -> bool:
+    """从原始配置文本里读取 ``paused``（非 bool 一律按 ``False``）。"""
+    try:
+        raw = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if isinstance(raw, dict) and isinstance(raw.get("paused"), bool):
+        return raw["paused"]
+    return False
+
+
+def config_to_dict(config) -> dict:
+    """把 :class:`campus_core.Config` 转成托盘内部 dict。"""
+    return {
+        "schema_version": config.schema_version,
+        "ssid": config.ssid,
+        "profile": config.profile,
+        "interface": config.interface,
+        "yys": config.operator,
+        "account_format": config.account_format,
+        "interval": config.interval,
+        "threshold": config.threshold,
+        "cooldown": config.cooldown,
+        "browser_fallback": config.browser_fallback,
+        "clash_auto_proxy": config.proxy_consent,
+        "proxy_endpoint": config.proxy_endpoint,
+        "paused": False,
+    }
 
 
 def load_config() -> dict:
-    cfg = dict(DEFAULT_CONFIG)
-    try:
-        cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
-    except Exception:
-        pass
+    """读取并**校验**配置，返回托盘内部 dict（F03）。
+
+    非法输入一律回退到安全默认值（绝不因此启用代理），未知键隔离并记录
+    **脱敏**告警；缺失文件按默认值处理。
+    """
+    text, path = _read_config_text()
+    result = load_config_text(text)
+    cfg = config_to_dict(result.config)
+    cfg["paused"] = _read_paused_flag(text)
+    if not result.ok:
+        logger = logging.getLogger("campus")
+        for issue in result.issues:
+            logger.warning("配置问题 [%s] %s：%s", path.name, issue.key, issue.detail)
+        if result.unknown_keys:
+            logger.warning("配置存在未知键 %s，已隔离（不写入运行时配置）",
+                           ", ".join(result.unknown_keys))
     return cfg
 
 
-def save_config(cfg: dict) -> None:
+_SAVE_LOCK = threading.Lock()
+
+
+def _sanitize_config(cfg: dict) -> dict:
+    """只保留已知键，避免把未知键写回磁盘。"""
+    return {key: cfg[key] for key in CONFIG_KEYS if key in cfg}
+
+
+def _fsync_file(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDWR)
     try:
-        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
-                               encoding="utf-8")
-    except OSError:
-        pass
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def save_config(cfg: dict) -> bool:
+    """**原子**保存配置（F13）。
+
+    同目录临时文件 → 写入 → flush/fsync → ``os.replace``；任一步失败都返回
+    ``False`` 且保留旧文件（绝不显示“已保存”）。并发保存由模块级锁串行化。
+    """
+    path = Path(CONFIG_FILE)
+    tmp_path = None
+    with _SAVE_LOCK:
+        try:
+            data = json.dumps(_sanitize_config(cfg), ensure_ascii=False, indent=2)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=".tray_config-", suffix=".tmp",
+                                            dir=str(path.parent))
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            tmp_path.write_text(data, encoding="utf-8")
+            _fsync_file(tmp_path)
+            os.replace(str(tmp_path), str(path))
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+        finally:
+            if tmp_path is not None:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+
+
+# --------------------------------------------------------------------------- #
+# 开机自启（F12 前置：核对命令内容，而非仅判断键是否存在）
+# --------------------------------------------------------------------------- #
+def launcher_command() -> str:
+    """开机自启优先用打包好的 exe；没有 exe 时退回 pythonw + 脚本。"""
+    exe = SCRIPT_DIR / "CampusReconnect.exe"
+    if exe.is_file():
+        return '"%s"' % exe
+    return '"%s" "%s"' % (PYTHONW, SCRIPT_DIR / "campus_reconnect_tray.py")
 
 
 def get_autostart() -> bool:
@@ -91,12 +262,13 @@ def get_autostart() -> bool:
         return False
 
 
-def launcher_command() -> str:
-    """开机自启优先用打包好的 exe；没有 exe 时退回 pythonw + 脚本。"""
-    exe = SCRIPT_DIR / "CampusReconnect.exe"
-    if exe.is_file():
-        return '"%s"' % exe
-    return '"%s" "%s"' % (PYTHONW, SCRIPT_DIR / "campus_reconnect_tray.py")
+def get_autostart_command():
+    """返回自启项当前记录的命令（不存在为 ``None``）。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH) as key:
+            return winreg.QueryValueEx(key, RUN_VALUE_NAME)[0]
+    except OSError:
+        return None
 
 
 def set_autostart(enabled: bool) -> bool:
@@ -104,8 +276,7 @@ def set_autostart(enabled: bool) -> bool:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0,
                             winreg.KEY_SET_VALUE) as key:
             if enabled:
-                cmd = launcher_command()
-                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, launcher_command())
             else:
                 try:
                     winreg.DeleteValue(key, RUN_VALUE_NAME)
@@ -116,25 +287,52 @@ def set_autostart(enabled: bool) -> bool:
         return False
 
 
-def set_system_proxy(enabled: bool) -> bool:
-    """开关 Windows 系统代理(即 Clash Verge 的系统代理开关), 即时生效。"""
-    path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
-                            winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD,
-                              1 if enabled else 0)
-            if enabled:
-                try:
-                    server = winreg.QueryValueEx(key, "ProxyServer")[0]
-                except FileNotFoundError:
-                    server = None
-                if not server:
-                    winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ,
-                                      CLASH_SERVER_DEFAULT)
-        return True
-    except OSError:
-        return False
+# --------------------------------------------------------------------------- #
+# 系统代理（F04 / F05）
+# --------------------------------------------------------------------------- #
+def refresh_system_proxy() -> bool:
+    """通知 Windows 代理设置已变更（独立函数，便于测试替换）。"""
+    return default_refresh()
+
+
+def apply_system_proxy(enabled: bool, endpoint=None,
+                       registry=None, probe=None) -> ProxyApplyResult:
+    """事务式切换系统代理，返回结构化结果（F04/F05）。
+
+    ``enabled=True`` 时必须提供用户**显式确认**的 ``endpoint``；默认不猜测、
+    不启用。任一步失败都不产生部分写入，已发生的写入会按事务回滚。
+    """
+    controller = ProxyController(registry if registry is not None else winreg,
+                                 probe=probe, refresh=refresh_system_proxy)
+    return controller.apply(enabled, endpoint)
+
+
+def set_system_proxy(enabled: bool, endpoint=None) -> bool:
+    """``apply_system_proxy`` 的布尔兼容层（仅表示“整体成功”）。"""
+    return bool(apply_system_proxy(enabled, endpoint).ok)
+
+
+# --------------------------------------------------------------------------- #
+# 凭据（F11）
+# --------------------------------------------------------------------------- #
+def credential_store() -> CredentialStore:
+    """构造凭据适配器（``keyring`` 为模块级引用，便于测试替换）。"""
+    return CredentialStore(keyring)
+
+
+def load_credentials() -> CredentialLoad:
+    """读取凭据并区分「未配置 / 后端不可用」。"""
+    return credential_store().load()
+
+
+def save_credentials(username: str, password: str) -> CredentialSave:
+    """保存凭据；第二条写入失败时尝试恢复旧对。"""
+    return credential_store().save(username, password)
+
+
+def clear_credentials() -> CredentialClear:
+    """清除本程序保存的凭据。"""
+    return credential_store().clear()
 
 
 class TrayApp:
@@ -148,8 +346,33 @@ class TrayApp:
         self.icon = None
         self.root = None
         self.settings_win = None
-        self._ask_event = threading.Event()
-        self._ask_result = {"value": None}
+
+        # ---- 单网络工作线程与命令队列（F01 / F02）----
+        self._commands: "queue.Queue" = queue.Queue()
+        self._worker = None
+        self._worker_lock = threading.Lock()
+        self._heartbeat = 0.0
+        self._repair_busy = threading.Event()
+        self._repair_pending = threading.Event()
+        self._repair_override = False
+        self._last_error = None
+        self._op_seq = 0
+
+        # ---- 取消令牌（F10）----
+        self._cancel = threading.Event()
+
+        # ---- 配置版本（F01：过期结果不得覆盖新状态）----
+        self._config_lock = threading.RLock()
+        self._config_version = 0
+
+        # ---- 授权版本（F12：过期询问结果不应用，新拒绝优先）----
+        self._consent_version = 0
+        self._consent_lock = threading.Lock()
+
+        # ---- Tk 事件队列（F10：网络线程不直接调用 Tk）----
+        self._ui_actions: "queue.Queue" = queue.Queue()
+        self._ui_pump_id = None
+        self._startup_timer = None
 
     # ---------- 图标与通知 ----------
     def make_image(self):
@@ -188,134 +411,381 @@ class TrayApp:
         except Exception:
             self.log.warning("通知发送失败:\n%s", traceback.format_exc())
 
-    # ---------- 重连核心 ----------
+    # ---------- 配置访问（带版本，F01）----------
+    def get_config(self) -> dict:
+        """返回当前配置的**不可变快照**（dict 副本）。"""
+        with self._config_lock:
+            return dict(self.config)
+
+    def update_config(self, changes: dict) -> int:
+        """应用配置变更并提升配置版本（使在途任务的旧结果失效）。"""
+        with self._config_lock:
+            self.config.update(changes)
+            self._config_version += 1
+            return self._config_version
+
+    def config_version(self) -> int:
+        return self._config_version
+
+    def _new_op_id(self) -> str:
+        with self._config_lock:
+            self._op_seq += 1
+            seq = self._op_seq
+        return "op-%s-%03d" % (uuid.uuid4().hex[:6], seq)
+
+    # ---------- 取消令牌（F10）----------
+    def _cancelled(self) -> bool:
+        if self.stop_event.is_set() or self._cancel.is_set():
+            return True
+        return bool(self.config.get("paused")) and not self._repair_override
+
+    # ---------- Tk 事件队列（F10：网络线程不直接调用 Tk）----------
+    def _ui_post(self, action) -> None:
+        self._ui_actions.put(action)
+
+    def _pump_ui(self):
+        if self.root is None:
+            return
+        try:
+            while True:
+                action = self._ui_actions.get_nowait()
+                try:
+                    action()
+                except Exception:
+                    self.log.warning("UI 动作异常:\n%s", traceback.format_exc())
+        except queue.Empty:
+            pass
+        if not self.stop_event.is_set():
+            try:
+                self._ui_pump_id = self.root.after(UI_POLL_MS, self._pump_ui)
+            except tk.TclError:
+                self._ui_pump_id = None
+
+    def _start_ui_pump(self) -> None:
+        if self.root is None:
+            return
+        try:
+            self._ui_pump_id = self.root.after(UI_POLL_MS, self._pump_ui)
+        except tk.TclError:
+            self._ui_pump_id = None
+
+    def _ui_ask(self, title, body, timeout=60.0):
+        """在 Tk 主线程弹一个是/否对话框并同步等待（有界，不永久等待）。"""
+        if self.root is None:
+            return None
+        holder = {"value": None}
+        done = threading.Event()
+
+        def action():
+            try:
+                holder["value"] = bool(messagebox.askyesno(title, body))
+            except Exception:
+                holder["value"] = None
+            finally:
+                done.set()
+
+        self._ui_post(action)
+        if not done.wait(timeout):
+            self.log.warning("授权询问超时（%.0f 秒），本次不执行该操作", timeout)
+            return None
+        return holder["value"]
+
+    # ---------- 重连核心（F01/F10）----------
     def repair_once(self):
-        """执行一次完整重连, 返回 (成功?, 详情, 耗时秒)。"""
-        from campus_reconnect import direct_session
+        """执行一次完整重连, 返回 (成功?, 详情, 耗时秒)。
+
+        - 入口即对配置做**不可变快照**：任务进行中修改运营商 / 参数不影响本次请求；
+        - 取消令牌（退出 / 暂停）在任何副作用（POST / Edge / 代理写入）前重新校验。
+        """
+        cfg = self.get_config()
+        if self.stop_event.is_set() or self._cancel.is_set():
+            return False, "已退出或取消，未发起认证", 0.0
+        if cfg.get("paused") and not self._repair_override:
+            return False, "监测已暂停，未发起认证", 0.0
         if self.session is None:
             self.session = direct_session()
         start = time.monotonic()
-        cfg = self.config
         ssid, _ = wifi_state()
         target = (cfg.get("ssid") or "").strip()
         if target and (not ssid or ssid.casefold() != target.casefold()):
             return False, "当前 Wi-Fi 为 %s，未连接目标 %s" % (ssid or "未连接", target), 0.0
+        if self._cancelled():
+            return False, "已取消，未发起认证", time.monotonic() - start
         port, source = resolve_port(self.session, None)
         self.state["port"] = port
+        if self._cancelled():
+            return False, "已取消，未发起认证", time.monotonic() - start
         if not portal_reachable(self.session, port):
             return False, "Portal 登录页不可达（端口 %d）" % port, time.monotonic() - start
         creds = get_credentials()
         if not creds:
             return False, "尚未保存校园网凭据（请先运行 configure）", time.monotonic() - start
+        if self._cancelled():   # 提交认证前的最后一道校验
+            return False, "已取消，未提交认证", time.monotonic() - start
         account, password = creds
         ok, detail = portal_login(self.session, account, password,
                                   cfg.get("yys") or "mobile", port, self.log)
         if not ok:
             return False, detail, time.monotonic() - start
         for delay in (3, 5, 8):
-            time.sleep(delay)
+            if self._cancelled():
+                return False, "已取消，停止等待公网恢复", time.monotonic() - start
+            if self.stop_event.wait(delay):   # 可唤醒等待，退出立即返回
+                return False, "已退出，停止等待公网恢复", time.monotonic() - start
             online, _ = internet_ok(self.session)
             if online:
                 return True, "Portal 确认在线，公网已恢复（端口 %d · %s）" % (port, source), \
                     time.monotonic() - start
         return False, "Portal 已在线但公网探测仍未通过", time.monotonic() - start
 
-    def _after_repair(self, ok, detail, elapsed):
-        cfg = self.config
+    def _after_repair(self, ok, detail, elapsed, op_id=None, config_version=None):
+        if config_version is not None and config_version != self._config_version:
+            self.log.info("丢弃过期重连结果（配置版本 %s != 当前 %s）",
+                          config_version, self._config_version)
+            return
+        cfg = self.get_config()
         if ok:
             self.state["last_ok"] = datetime.now().strftime("%H:%M:%S")
             self.set_state("online", detail)
             allow = cfg.get("clash_auto_proxy")
             if allow is None:
-                allow = self._ask_proxy_consent()
-                if allow is not None:
-                    cfg["clash_auto_proxy"] = allow
-                    save_config(cfg)
+                token = self._consent_version
+                answer = self._ask_proxy_consent()
+                if (answer is not None and self._consent_version == token
+                        and self.config.get("clash_auto_proxy") is None):
+                    self._apply_consent(answer, save=True)
+                allow = self.config.get("clash_auto_proxy")
             proxy_note = ""
             if allow:
-                if set_system_proxy(True):
-                    proxy_note = "\n已自动开启 Clash 系统代理"
+                if self._cancelled():
+                    proxy_note = "\n已取消，未改动系统代理"
                 else:
-                    proxy_note = "\nClash 系统代理开启失败（可手动开启）"
+                    endpoint = cfg.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
+                    result = apply_system_proxy(True, endpoint)
+                    if result.ok:
+                        proxy_note = "\n已自动开启系统代理（%s）" % (result.endpoint or endpoint)
+                    else:
+                        proxy_note = "\n网络已恢复，但系统代理未开启：%s" % (
+                            result.detail or "原因未知")
             self.notify("重连成功", "用时约 %.0f 秒 · %s%s" % (elapsed, detail, proxy_note))
         else:
             self.set_state("offline", detail)
             extra = ""
             if cfg.get("browser_fallback"):
-                edge_fallback(self.log)
-                extra = "\n已打开 Edge 供手动登录"
+                if self._cancelled():
+                    extra = "\n已取消，未打开 Edge"
+                else:
+                    edge_fallback(self.log)
+                    extra = "\n已打开 Edge 供手动登录"
             self.notify("重连失败", "%s%s" % (detail, extra))
 
+    def _apply_consent(self, value, save=False):
+        """用户显式改变代理授权：提升授权版本，使过期的询问结果失效（F12）。"""
+        with self._config_lock:
+            self._consent_version += 1
+            self.config["clash_auto_proxy"] = value
+            if save and not save_config(self.config):
+                self.log.error("代理授权写入配置失败，本次改动可能不会持久化")
+        return value
+
     def _ask_proxy_consent(self):
-        """首次重连成功时询问是否同意联动开启 Clash 系统代理。"""
-        if self.root is None:
+        """首次重连成功时询问是否同意联动开启系统代理（同一时刻只允许一个询问）。"""
+        if not self._consent_lock.acquire(blocking=False):
+            self.log.info("已有授权询问进行中，跳过重复询问")
             return None
-        self._ask_event.clear()
-        self._ask_result["value"] = None
         try:
-            self.root.after(0, self._ask_dialog)
-        except Exception:
-            return None
-        self._ask_event.wait(60)
-        return self._ask_result["value"]
-
-    def _ask_dialog(self):
-        try:
-            ans = messagebox.askyesno(
-                "Clash 系统代理联动",
-                "校园网重连成功。\n\n是否同意：以后每次重连成功后，"
-                "自动开启 Clash 的系统代理？\n（可随时在托盘菜单或设置面板更改）")
-            self._ask_result["value"] = bool(ans)
-        except Exception:
-            pass
+            if self.root is None:
+                return None
+            endpoint = self.config.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
+            body = ("校园网重连成功。\n\n是否同意：以后每次重连成功后，自动开启系统代理？\n"
+                    "将启用端点：%s\n（可随时在托盘菜单或设置面板更改）" % endpoint)
+            return self._ui_ask("系统代理联动", body, timeout=60.0)
         finally:
-            self._ask_event.set()
+            self._consent_lock.release()
 
-    # ---------- 监测循环 ----------
-    def monitor_loop(self):
-        from campus_reconnect import direct_session
-        self.session = direct_session()
-        cfg = self.config
-        if cfg.get("paused"):
+    # ---------- 网络工作线程（F01 / F02）----------
+    def _ensure_worker(self) -> bool:
+        with self._worker_lock:
+            if self._worker is not None and self._worker.is_alive():
+                return True
+            if self.stop_event.is_set():
+                return False
+            try:
+                self._worker = threading.Thread(target=self._worker_loop,
+                                                name="campus-net", daemon=True)
+                self._worker.start()
+            except Exception as exc:
+                self._report_worker_error("网络工作线程启动失败", exc)
+                self._worker = None
+                return False
+            return True
+
+    def worker_status(self) -> dict:
+        """工作线程与心跳状态（供 UI 显示“监测已停止”并提供重启动作）。"""
+        thread = self._worker
+        alive = bool(thread is not None and thread.is_alive())
+        age = (time.monotonic() - self._heartbeat) if self._heartbeat else None
+        if alive:
+            label = "监测运行中"
+        elif self.stop_event.is_set():
+            label = "监测已停止（已退出）"
+        else:
+            label = "监测已停止"
+        return {"alive": alive, "heartbeat_age": age, "label": label,
+                "last_error": self._last_error}
+
+    def restart_monitor(self, icon=None, item=None):
+        """线程意外退出后的显式重启动作（F02）。"""
+        if self.worker_status()["alive"]:
+            self.notify("监测运行中", "网络工作线程已在运行")
+            return
+        self.stop_event.clear()
+        self._cancel.clear()
+        self._last_error = None
+        if self._ensure_worker():
+            self.notify("监测已重启", "网络工作线程已重新启动")
+        else:
+            self.notify("重启失败", "无法启动网络工作线程")
+
+    def _report_worker_error(self, context, exc, op_id=None):
+        detail = "%s：%s" % (context, type(exc).__name__)
+        if op_id:
+            detail += "（%s）" % op_id
+        self.log.error("%s\n%s", detail, traceback.format_exc())
+        self._last_error = detail
+        self.set_state("error", detail, notify=("监测异常", detail))
+
+    def _interval(self) -> float:
+        try:
+            value = int(self.config.get("interval", 15))
+        except (TypeError, ValueError):
+            value = 15
+        return float(max(1, value))
+
+    def _cooldown(self) -> float:
+        try:
+            value = int(self.config.get("cooldown", 180))
+        except (TypeError, ValueError):
+            value = 180
+        return float(max(60, value))
+
+    def _threshold(self) -> int:
+        try:
+            value = int(self.config.get("threshold", 3))
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, value)
+
+    def _wait_timeout(self, next_probe: float) -> float:
+        if self.config.get("paused") or not next_probe:
+            return self._interval()
+        return max(0.1, next_probe - time.monotonic())
+
+    def _worker_loop(self):
+        """单网络工作线程：独占 Session，串行消费命令（F01）。"""
+        self._heartbeat = time.monotonic()
+        self.log.info("网络工作线程启动")
+        try:
+            if self.session is None:
+                self.session = direct_session()
+        except Exception as exc:
+            self._report_worker_error("初始化网络会话失败", exc)
+            return
+        if self.config.get("paused"):
             self.set_state("paused", "监测已暂停")
         else:
             self.set_state("boot", "正在检查网络状态")
-        while not self.stop_event.is_set():
-            cfg = self.config
-            if cfg.get("paused"):
-                if self.state["mode"] != "paused":
-                    self.set_state("paused", "监测已暂停")
-                self.stop_event.wait(max(1, int(cfg.get("interval", 15))))
-                continue
-            if self.state["mode"] == "paused":
-                self.set_state("boot", "监测恢复，正在检查网络")
-            try:
-                online, via = internet_ok(self.session)
-            except Exception as exc:
-                self.log.warning("探测异常: %s", type(exc).__name__)
-                online = False
-            if online:
-                if self.state["mode"] != "online":
-                    self.set_state("online", "网络正常")
-                self.state["failures"] = 0
-                self.stop_event.wait(max(1, int(cfg.get("interval", 15))))
-                continue
-            self.state["failures"] += 1
-            threshold = max(1, int(cfg.get("threshold", 3)))
-            if self.state["failures"] < threshold:
-                if self.state["mode"] != "offline":
-                    self.set_state("offline", "公网探测失败（%d/%d）"
-                                   % (self.state["failures"], threshold))
-                self.stop_event.wait(max(1, int(cfg.get("interval", 15))))
-                continue
-            if self.state["mode"] != "reconnecting":
-                self.set_state("reconnecting", "正在尝试重新连接",
-                               notify=("校园网已断开", "正在尝试重新连接，请稍候…"))
-            ok, detail, elapsed = self.repair_once()
-            self._after_repair(ok, detail, elapsed)
+        next_probe = 0.0
+        try:
+            while not self.stop_event.is_set():
+                self._heartbeat = time.monotonic()
+                try:
+                    try:
+                        cmd = self._commands.get(timeout=self._wait_timeout(next_probe))
+                    except queue.Empty:
+                        cmd = ("probe", None)
+                    if self.stop_event.is_set():
+                        break
+                    next_probe = self._dispatch(cmd, next_probe)
+                except Exception as exc:   # 工作单元整体异常边界（F02）
+                    self._report_worker_error("工作单元异常", exc)
+                    self._repair_busy.clear()
+                    self._repair_pending.clear()
+                    next_probe = time.monotonic() + self._interval()
+        finally:
+            self.log.info("网络工作线程已退出")
+
+    def _dispatch(self, cmd, next_probe: float) -> float:
+        kind = cmd[0] if cmd else "probe"
+        if kind == "reconnect":
+            force = bool(cmd[1]) if len(cmd) > 1 else False
+            self._run_repair(force=force)
+            return time.monotonic() + self._cooldown()
+        if kind == "probe":
+            return self._probe_tick(next_probe)
+        if kind == "quit":
+            self.stop_event.set()
+            return 0.0
+        return next_probe
+
+    def _probe_tick(self, next_probe: float) -> float:
+        now = time.monotonic()
+        if self.config.get("paused"):
+            if self.state["mode"] != "paused":
+                self.set_state("paused", "监测已暂停")
+            return now + self._interval()
+        if self.state["mode"] == "paused":
+            self.set_state("boot", "监测恢复，正在检查网络")
+        if next_probe and now < next_probe:
+            return next_probe
+        try:
+            online, _ = internet_ok(self.session)
+        except Exception as exc:
+            self.log.warning("探测异常: %s", type(exc).__name__)
+            online = False
+        if online:
+            if self.state["mode"] != "online":
+                self.set_state("online", "网络正常")
             self.state["failures"] = 0
-            self.stop_event.wait(max(60, int(cfg.get("cooldown", 180))))
-        self.log.info("监测循环已退出")
+            return now + self._interval()
+        self.state["failures"] += 1
+        threshold = self._threshold()
+        if self.state["failures"] < threshold:
+            if self.state["mode"] != "offline":
+                self.set_state("offline", "公网探测失败（%d/%d）"
+                               % (self.state["failures"], threshold))
+            return now + self._interval()
+        if self.state["mode"] != "reconnecting":
+            self.set_state("reconnecting", "正在尝试重新连接",
+                           notify=("校园网已断开", "正在尝试重新连接，请稍候…"))
+        self._run_repair()
+        self.state["failures"] = 0
+        return time.monotonic() + self._cooldown()
+
+    def _run_repair(self, force=False):
+        """串行执行一次重连；重复请求合并（F01）。"""
+        if self._repair_busy.is_set():
+            self.log.info("已有一次重连在途，本次请求合并")
+            return
+        self._repair_busy.set()
+        self._repair_override = bool(force)
+        version = self._config_version
+        op_id = self._new_op_id()
+        try:
+            if self._cancelled():
+                self.log.info("已暂停/退出，跳过本次重连（%s）", op_id)
+                return
+            try:
+                ok, detail, elapsed = self.repair_once()
+            except Exception as exc:   # 预期外异常 → 可识别内部错误，不静默失效（F02）
+                self._report_worker_error("重连任务异常", exc, op_id=op_id)
+                return
+            self._after_repair(ok, detail, elapsed, op_id=op_id,
+                               config_version=version)
+        finally:
+            self._repair_override = False
+            self._repair_busy.clear()
+            self._repair_pending.clear()
 
     # ---------- 菜单动作 ----------
     def _status_text(self, item=None):
@@ -324,42 +794,73 @@ class TrayApp:
             extra += " · 端口 %s" % self.state["port"]
         if self.state.get("last_ok"):
             extra += " · 上次重连 %s" % self.state["last_ok"]
+        status = self.worker_status()
+        if not status["alive"]:
+            extra += " · %s" % status["label"]
         return "状态：%s%s" % (MODE_TEXT.get(self.state["mode"], "?"), extra)
 
     def _pause_text(self, item=None):
         return "恢复监测" if self.config.get("paused") else "暂停监测"
 
-    def on_reconnect(self, icon, item=None):
-        threading.Thread(target=self._reconnect_click, daemon=True).start()
-
-    def _reconnect_click(self):
-        online, _ = internet_ok(self.session)
-        if online:
-            self.notify("无需重连", "当前网络正常，未发送认证请求")
+    def on_reconnect(self, icon=None, item=None):
+        """手动重连：投递到单网络工作线程；重复请求合并并提示“正在重连”。"""
+        if self._repair_pending.is_set() or self._repair_busy.is_set():
+            self.notify("正在重连", "已有一次重连在进行，请稍候…")
             return
-        self.set_state("reconnecting", "手动触发重连")
-        ok, detail, elapsed = self.repair_once()
-        self._after_repair(ok, detail, elapsed)
+        if self.config.get("paused"):
+            self._request_manual_while_paused()
+            return
+        self._enqueue_repair(force=False)
 
-    def on_toggle_pause(self, icon, item=None):
-        self.config["paused"] = not self.config.get("paused")
-        save_config(self.config)
-        self.notify("监测已暂停" if self.config["paused"] else "监测已恢复",
+    def _enqueue_repair(self, force=False) -> bool:
+        if not self._ensure_worker():
+            self.notify("无法启动", "网络工作线程启动失败")
+            return False
+        self._repair_pending.set()
+        self._commands.put(("reconnect", bool(force)))
+        return True
+
+    def _request_manual_while_paused(self):
+        """暂停中手动重连需单独确认（F10：默认暂停不启动新认证）。"""
+        answer = self._ui_ask("监测已暂停",
+                              "监测当前处于暂停状态。\n是否仍要执行一次手动重连？")
+        if not answer:
+            self.notify("已取消", "监测处于暂停状态，未发起重连")
+            return
+        self._enqueue_repair(force=True)
+
+    def on_toggle_pause(self, icon=None, item=None):
+        paused = not bool(self.config.get("paused"))
+        self.update_config({"paused": paused})
+        if not save_config(self.config):
+            self.notify("保存失败", "暂停状态未能写入配置（已保留原文件）")
+        if paused:
+            self.set_state("paused", "监测已暂停")
+        else:
+            self.set_state("boot", "监测恢复，正在检查网络")
+        self.notify("监测已暂停" if paused else "监测已恢复",
                     "可在菜单或设置面板随时切换")
+        if self.icon is not None:
+            self.icon.update_menu()
 
-    def on_toggle_proxy(self, icon, item=None):
-        self.config["clash_auto_proxy"] = not bool(self.config.get("clash_auto_proxy"))
-        save_config(self.config)
-        on = self.config["clash_auto_proxy"]
-        self.notify("Clash 联动已%s" % ("开启" if on else "关闭"),
-                    "重连成功后%s自动开启 Clash 系统代理" % ("会" if on else "不会"))
+    def on_toggle_proxy(self, icon=None, item=None):
+        new_value = self.config.get("clash_auto_proxy") is not True
+        self._apply_consent(new_value, save=True)
+        self.notify("Clash 联动已%s" % ("开启" if new_value else "关闭"),
+                    "重连成功后%s自动开启系统代理" % ("会" if new_value else "不会"))
+        if self.icon is not None:
+            self.icon.update_menu()
 
-    def on_toggle_fallback(self, icon, item=None):
-        self.config["browser_fallback"] = not bool(self.config.get("browser_fallback"))
-        save_config(self.config)
-        self.notify("Edge 兜底已%s" % ("开启" if self.config["browser_fallback"] else "关闭"), "")
+    def on_toggle_fallback(self, icon=None, item=None):
+        new_value = not bool(self.config.get("browser_fallback"))
+        self.update_config({"browser_fallback": new_value})
+        if not save_config(self.config):
+            self.notify("保存失败", "Edge 兜底设置未能写入配置（已保留原文件）")
+        self.notify("Edge 兜底已%s" % ("开启" if new_value else "关闭"), "")
+        if self.icon is not None:
+            self.icon.update_menu()
 
-    def on_toggle_autostart(self, icon, item=None):
+    def on_toggle_autostart(self, icon=None, item=None):
         target = not get_autostart()
         if set_autostart(target):
             self.notify("开机自启已%s" % ("开启" if target else "关闭"),
@@ -369,7 +870,19 @@ class TrayApp:
         if self.icon is not None:
             self.icon.update_menu()
 
-    def on_open_log(self, icon, item=None):
+    def on_update_credentials(self, icon=None, item=None):
+        """更新账号 / 密码（F11：失败保持应用可见，不崩溃）。"""
+        if self.root is None:
+            return
+        self._ui_post(self._open_credentials_dialog)
+
+    def on_clear_credentials(self, icon=None, item=None):
+        """清除凭据（F11）。"""
+        if self.root is None:
+            return
+        self._ui_post(self._clear_credentials_dialog)
+
+    def on_open_log(self, icon=None, item=None):
         log_file = LOG_DIR / "campus_reconnect.log"
         if log_file.exists():
             try:
@@ -377,20 +890,44 @@ class TrayApp:
             except OSError:
                 pass
 
-    def on_settings(self, icon, item=None):
+    def on_settings(self, icon=None, item=None):
         if self.root is not None:
-            self.root.after(0, self._open_settings)
+            self._ui_post(self._open_settings)
 
-    def on_quit(self, icon, item=None):
+    def on_quit(self, icon=None, item=None):
         self.log.info("用户退出托盘助手")
         self.stop_event.set()
+        self._cancel.set()
+        try:
+            self._commands.put_nowait(("quit", None))
+        except Exception:
+            pass
+        self._cancel_startup_timer()
+        if self._ui_pump_id is not None and self.root is not None:
+            try:
+                self.root.after_cancel(self._ui_pump_id)
+            except Exception:
+                pass
+            self._ui_pump_id = None
         if self.icon is not None:
             try:
                 self.icon.stop()
             except Exception:
                 pass
         if self.root is not None:
-            self.root.after(0, self.root.destroy)
+            try:
+                self.root.after(0, self.root.destroy)
+            except Exception:
+                pass
+        self._join_worker(3.0)
+
+    def _join_worker(self, timeout: float) -> None:
+        thread = self._worker
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout)
+        if thread.is_alive():
+            self.log.warning("网络工作线程在 %.1f 秒内未退出（可能在等待网络超时）", timeout)
 
     def build_menu(self):
         return pystray.Menu(
@@ -400,15 +937,43 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("开机自启", self.on_toggle_autostart,
                              checked=lambda item: get_autostart()),
-            pystray.MenuItem("重连后自动开启 Clash 系统代理", self.on_toggle_proxy,
-                             checked=lambda item: bool(self.config.get("clash_auto_proxy"))),
+            pystray.MenuItem("重连后自动开启系统代理", self.on_toggle_proxy,
+                             checked=lambda item: self.config.get("clash_auto_proxy") is True),
             pystray.MenuItem("失败时 Edge 兜底", self.on_toggle_fallback,
                              checked=lambda item: bool(self.config.get("browser_fallback"))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("设置面板", self.on_settings),
+            pystray.MenuItem("更新账号/密码", self.on_update_credentials),
+            pystray.MenuItem("清除凭据", self.on_clear_credentials),
+            pystray.MenuItem("重启监测", self.restart_monitor),
             pystray.MenuItem("打开日志", self.on_open_log),
             pystray.MenuItem("退出", self.on_quit),
         )
+
+    # ---------- 凭据面板（F11）----------
+    def _open_credentials_dialog(self):
+        loaded = load_credentials()
+        if loaded.error_code == E_CRED_BACKEND:
+            messagebox.showerror("凭据库不可用", loaded.detail)
+            return
+        initial_user = loaded.username if loaded.ok else ""
+        creds = prompt_credentials_dialog(self.root, initial_user=initial_user)
+        if not creds:
+            return
+        result = save_credentials(*creds)
+        if result.ok:
+            self.notify("凭据已更新", "新的账号密码已保存到 Windows 凭据管理器")
+        else:
+            messagebox.showerror("凭据保存失败", result.detail)
+
+    def _clear_credentials_dialog(self):
+        if not messagebox.askyesno("清除凭据", "确定要删除本程序保存的校园网账号密码吗？"):
+            return
+        result = clear_credentials()
+        if result.ok:
+            self.notify("凭据已清除", "如需继续使用，请重新设置账号密码")
+        else:
+            messagebox.showerror("清除失败", result.detail)
 
     # ---------- 设置面板 ----------
     def _open_settings(self):
@@ -427,43 +992,69 @@ class TrayApp:
         frame = ttk.Frame(win, padding=12)
         frame.grid(sticky="nsew")
 
+        status = self.worker_status()
         ttk.Label(frame, text="运行状态", font=("Microsoft YaHei", 10, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(frame, text=self._status_text()).grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="监测：%s" % status["label"]).grid(
+            row=2, column=0, columnspan=3, sticky="w")
         ttk.Label(frame, text="上次重连成功：%s" % (self.state.get("last_ok") or "—")).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(0, 10))
+            row=3, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
         v_auto = tk.BooleanVar(value=get_autostart())
-        v_proxy = tk.BooleanVar(value=bool(self.config.get("clash_auto_proxy")))
         v_fallback = tk.BooleanVar(value=bool(self.config.get("browser_fallback")))
+        consent_value = self.config.get("clash_auto_proxy")
+        if consent_value not in CONSENT_VALUE_TO_LABEL:
+            consent_value = None
+        v_consent = tk.StringVar(value=CONSENT_VALUE_TO_LABEL[consent_value])
+        v_endpoint = tk.StringVar(value=self.config.get("proxy_endpoint") or "")
+
         ttk.Checkbutton(frame, text="开机自启（登录 Windows 后自动启动）",
-                        variable=v_auto).grid(row=3, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(frame, text="重连成功后自动开启 Clash 系统代理",
-                        variable=v_proxy).grid(row=4, column=0, columnspan=3, sticky="w")
+                        variable=v_auto).grid(row=4, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="重连成功后系统代理").grid(row=5, column=0, sticky="e", padx=4, pady=3)
+        ttk.Combobox(frame, textvariable=v_consent, width=16, state="readonly",
+                     values=CONSENT_LABELS).grid(row=5, column=1, columnspan=2, sticky="w")
+        ttk.Label(frame, text="代理端点 host:port").grid(row=6, column=0, sticky="e",
+                                                     padx=4, pady=3)
+        ttk.Entry(frame, textvariable=v_endpoint, width=18).grid(
+            row=6, column=1, columnspan=2, sticky="w")
         ttk.Checkbutton(frame, text="重连失败时自动打开 Edge 兜底",
-                        variable=v_fallback).grid(row=5, column=0, columnspan=3, sticky="w")
+                        variable=v_fallback).grid(row=7, column=0, columnspan=3, sticky="w")
 
         pad = {"padx": 4, "pady": 3}
-        ttk.Label(frame, text="Wi-Fi 名称").grid(row=6, column=0, sticky="e", **pad)
+        ttk.Label(frame, text="Wi-Fi 名称").grid(row=8, column=0, sticky="e", **pad)
         v_ssid = tk.StringVar(value=self.config.get("ssid") or "SNNU")
-        ttk.Entry(frame, textvariable=v_ssid, width=18).grid(row=6, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="运营商").grid(row=7, column=0, sticky="e", **pad)
-        v_yys = tk.StringVar(value=self.config.get("yys") or "mobile")
+        ttk.Entry(frame, textvariable=v_ssid, width=18).grid(row=8, column=1, sticky="w", **pad)
+        ttk.Label(frame, text="运营商").grid(row=9, column=0, sticky="e", **pad)
+        v_yys = tk.StringVar(value=self.config.get("yys", "mobile"))
         ttk.Combobox(frame, textvariable=v_yys, width=15, state="readonly",
                      values=["mobile", "unicom", "telecom", ""]).grid(
-                         row=7, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="检测间隔（秒）").grid(row=8, column=0, sticky="e", **pad)
-        v_interval = tk.IntVar(value=int(self.config.get("interval", 15)))
+                         row=9, column=1, sticky="w", **pad)
+        ttk.Label(frame, text="检测间隔（秒）").grid(row=10, column=0, sticky="e", **pad)
+        v_interval = tk.IntVar(value=self._int_or(self.config.get("interval"), 15))
         ttk.Spinbox(frame, from_=5, to=120, textvariable=v_interval, width=16).grid(
-            row=8, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="连续失败阈值").grid(row=9, column=0, sticky="e", **pad)
-        v_thr = tk.IntVar(value=int(self.config.get("threshold", 3)))
-        ttk.Spinbox(frame, from_=1, to=10, textvariable=v_thr, width=16).grid(
-            row=9, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="重连冷却（秒）").grid(row=10, column=0, sticky="e", **pad)
-        v_cd = tk.IntVar(value=int(self.config.get("cooldown", 180)))
-        ttk.Spinbox(frame, from_=60, to=3600, textvariable=v_cd, width=16).grid(
             row=10, column=1, sticky="w", **pad)
+        ttk.Label(frame, text="连续失败阈值").grid(row=11, column=0, sticky="e", **pad)
+        v_thr = tk.IntVar(value=self._int_or(self.config.get("threshold"), 3))
+        ttk.Spinbox(frame, from_=1, to=10, textvariable=v_thr, width=16).grid(
+            row=11, column=1, sticky="w", **pad)
+        ttk.Label(frame, text="重连冷却（秒）").grid(row=12, column=0, sticky="e", **pad)
+        v_cd = tk.IntVar(value=self._int_or(self.config.get("cooldown"), 180))
+        ttk.Spinbox(frame, from_=60, to=3600, textvariable=v_cd, width=16).grid(
+            row=12, column=1, sticky="w", **pad)
+
+        # 面板打开时的原始值：保存时**只提交用户实际变更的项**（F12/T24）。
+        initial = {
+            "ssid": self.config.get("ssid") or "SNNU",
+            "yys": self.config.get("yys", "mobile"),
+            "interval": self._int_or(self.config.get("interval"), 15),
+            "threshold": self._int_or(self.config.get("threshold"), 3),
+            "cooldown": self._int_or(self.config.get("cooldown"), 180),
+            "browser_fallback": bool(self.config.get("browser_fallback")),
+            "consent": CONSENT_VALUE_TO_LABEL[consent_value],
+            "endpoint": self.config.get("proxy_endpoint") or "",
+            "autostart": bool(get_autostart()),
+        }
 
         def on_save():
             try:
@@ -473,17 +1064,41 @@ class TrayApp:
             except (tk.TclError, ValueError):
                 messagebox.showwarning("输入无效", "间隔/阈值/冷却必须是数字")
                 return
-            self.config.update({
-                "ssid": v_ssid.get().strip() or "SNNU",
-                "yys": v_yys.get(),
-                "interval": interval,
-                "threshold": threshold,
-                "cooldown": cooldown,
-                "clash_auto_proxy": bool(v_proxy.get()),
-                "browser_fallback": bool(v_fallback.get()),
-            })
-            save_config(self.config)
-            set_autostart(bool(v_auto.get()))
+            changes = {}
+            ssid = v_ssid.get().strip() or "SNNU"
+            if ssid != initial["ssid"]:
+                changes["ssid"] = ssid
+            if v_yys.get() != initial["yys"]:
+                changes["yys"] = v_yys.get()
+            if interval != initial["interval"]:
+                changes["interval"] = interval
+            if threshold != initial["threshold"]:
+                changes["threshold"] = threshold
+            if cooldown != initial["cooldown"]:
+                changes["cooldown"] = cooldown
+            if bool(v_fallback.get()) != initial["browser_fallback"]:
+                changes["browser_fallback"] = bool(v_fallback.get())
+            if v_consent.get() != initial["consent"]:
+                changes["clash_auto_proxy"] = CONSENT_LABEL_TO_VALUE.get(v_consent.get())
+            endpoint = v_endpoint.get().strip()
+            if endpoint != initial["endpoint"]:
+                changes["proxy_endpoint"] = endpoint or None
+
+            if changes:
+                new_cfg = self.get_config()
+                new_cfg.update(changes)
+                if not save_config(new_cfg):
+                    messagebox.showerror("保存失败",
+                                         "配置写入失败，已保留原文件。请检查目录权限后重试。")
+                    return
+                self.update_config(changes)
+                if "clash_auto_proxy" in changes:
+                    with self._config_lock:
+                        self._consent_version += 1
+            if bool(v_auto.get()) != initial["autostart"]:
+                if not set_autostart(bool(v_auto.get())):
+                    messagebox.showerror("设置失败", "无法写入开机自启注册表项")
+                    return
             self.notify("设置已保存", "新参数即时生效")
             win.destroy()
 
@@ -496,33 +1111,63 @@ class TrayApp:
             win.destroy()
             self._open_settings()
 
-        ttk.Button(frame, text="保存", command=on_save).grid(row=11, column=0, pady=(12, 0))
+        ttk.Button(frame, text="保存", command=on_save).grid(row=13, column=0, pady=(12, 0))
         ttk.Button(frame, text="立即重连", command=on_reconnect_click).grid(
-            row=11, column=1, sticky="w", padx=4)
+            row=13, column=1, sticky="w", padx=4)
         ttk.Button(frame, text="暂停/恢复", command=on_pause_click).grid(
-            row=11, column=2, sticky="w")
+            row=13, column=2, sticky="w")
         win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    @staticmethod
+    def _int_or(value, fallback):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
 
     # ---------- 启动 ----------
     def start(self):
         self.icon = pystray.Icon(APP_NAME, self.make_image(), self.tooltip(),
                                  self.build_menu())
         threading.Thread(target=self.icon.run, daemon=True).start()
-        threading.Thread(target=self.monitor_loop, daemon=True).start()
-        threading.Timer(2.0, self._startup_notify).start()
+        self._ensure_worker()
+        self._startup_timer = threading.Timer(2.0, self._startup_notify)
+        self._startup_timer.daemon = True
+        self._startup_timer.start()
+
+    def _cancel_startup_timer(self):
+        timer = self._startup_timer
+        self._startup_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
 
     def _startup_notify(self):
-        ssid, _ = wifi_state()
-        online, _ = internet_ok(self.session)
-        creds = get_credentials()
+        if self.stop_event.is_set():
+            return
+        try:
+            ssid, _ = wifi_state()
+        except Exception:
+            ssid = None
+        online = False
+        if self.session is not None:
+            try:
+                online, _ = internet_ok(self.session)
+            except Exception:
+                online = False
+        loaded = load_credentials()
         body = "Wi-Fi：%s · %s" % (ssid or "未连接", "网络正常" if online else "网络不可用")
-        if not creds:
+        if loaded.error_code == E_CRED_MISSING:
             body += "\n尚未保存凭据：请运行 py campus_reconnect.py configure"
+        elif loaded.error_code == E_CRED_BACKEND:
+            body += "\n凭据库不可访问：%s" % loaded.detail
         self.notify("校园网助手已启动", body)
 
 
-def prompt_credentials_dialog(root):
-    """首次运行且无凭据时弹出图形界面输入账号密码（exe 版自包含所需）。"""
+def prompt_credentials_dialog(root, initial_user=""):
+    """图形界面输入账号密码（exe 版自包含所需）。"""
     result = {"value": None}
     win = tk.Toplevel(root)
     win.title("校园网账号设置")
@@ -530,12 +1175,12 @@ def prompt_credentials_dialog(root):
     win.attributes("-topmost", True)
     f = ttk.Frame(win, padding=14)
     f.grid(sticky="nsew")
-    ttk.Label(f, text="首次使用：请输入校园网账号与密码",
+    ttk.Label(f, text="请输入校园网账号与密码",
               font=("Microsoft YaHei", 10, "bold")).grid(row=0, column=0, columnspan=2)
     ttk.Label(f, text="仅保存在本机 Windows 凭据管理器中").grid(
         row=1, column=0, columnspan=2, pady=(0, 10))
     ttk.Label(f, text="账号").grid(row=2, column=0, sticky="e", padx=4)
-    v_user = tk.StringVar()
+    v_user = tk.StringVar(value=initial_user)
     ttk.Entry(f, textvariable=v_user, width=22).grid(row=2, column=1, sticky="w", padx=4)
     ttk.Label(f, text="密码").grid(row=3, column=0, sticky="e", padx=4, pady=6)
     v_pwd = tk.StringVar()
@@ -568,19 +1213,27 @@ def main():
         return
     root = tk.Tk()
     root.withdraw()
-    if not get_credentials():
+    loaded = load_credentials()
+    if loaded.error_code == E_CRED_BACKEND:
+        log.error("凭据后端不可用：%s", loaded.detail)
+        messagebox.showerror(APP_NAME, "凭据库不可访问：%s\n可在设置面板稍后重试。" % loaded.detail)
+    elif loaded.error_code == E_CRED_MISSING:
         log.warning("尚未保存凭据，弹出账号设置窗口")
         creds = prompt_credentials_dialog(root)
         if creds:
-            keyring.set_password(SERVICE, "username", creds[0])
-            keyring.set_password(SERVICE, "password", creds[1])
-            log.info("凭据已通过界面保存")
+            saved = save_credentials(*creds)
+            if saved.ok:
+                log.info("凭据已通过界面保存")
+            else:
+                log.error("凭据保存失败：%s", saved.detail)
+                messagebox.showerror("凭据保存失败", saved.detail)
         else:
             log.warning("未设置账号，自动重连暂不可用（可在凭据管理器中补存后重启）")
     app = TrayApp(log)
     app.root = root
     log.info("托盘助手启动（autostart=%s, clash_auto_proxy=%s）",
              get_autostart(), app.config.get("clash_auto_proxy"))
+    app._start_ui_pump()
     app.start()
     root.mainloop()
     log.info("托盘助手已退出")

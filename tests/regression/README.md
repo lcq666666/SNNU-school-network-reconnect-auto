@@ -1,7 +1,7 @@
 # 回归用例集合（`regression` 标记）
 
-本目录记录《审查方案》（`docs/main代码审查与修复方案_2026-10-13.md`）**第 10 节已离线复现的缺陷**，
-即阶段 1「任务 1.4」要求转为失败用例的首批回归项。
+本目录记录《审查方案》（`docs/main代码审查与修复方案_2026-10-13.md`）**第 10 节已离线复现、
+但尚未修复**的缺陷用例。修复前**必须失败**，修复后移出 `regression` 标记并并入默认集合。
 
 ## 使用方式
 
@@ -12,8 +12,8 @@
   .venv/Scripts/python.exe -m pytest -m regression
   ```
 
-- 某条缺陷修复后，删除对应 `@pytest.mark.regression`（或整个 `pytestmark`），
-  用例即进入默认集合，必须保持全绿。
+- 某条缺陷修复后，删除对应 `pytestmark = pytest.mark.regression`（或整个 `pytestmark`），
+  并把文件移入 `tests/unit/`，用例即进入默认集合，必须保持全绿。
 
 ## 约定
 
@@ -22,19 +22,26 @@
 - 全部使用 `tests/fakes.py` 的假件与 `tests/conftest.py` 的 fixture；
   零真实网络 / 注册表写入 / 凭据读取 / 浏览器启动 / 真实 sleep。
 
-## 用例索引
+## 当前用例索引（阶段 2 完成后剩余项）
 
-| 用例 | 文件 | 关联问题 | 复现证据 |
-|---|---|---|---|
-| T05 | `test_f03_config.py` | F03 | 未知键被原样并入配置（未隔离） |
-| T06 | `test_f03_config.py` | F03 | `interval="bad"`、bool 充当 int 被原样接受 |
-| T07 | `test_f03_config.py` | F03 | 授权 `"false"`（字符串）被当作真值 |
-| T08 | `test_f04_proxy.py` | F04 | 查询权限拒绝仍写入 `ProxyEnable=1`（部分写入） |
-| T11 | `test_f06_portal_login.py` | F06 | HTTP 500 + 在线文字被判成功 |
-| T12 | `test_f06_portal_login.py` | F06 | 账号子串（123456 vs 1234567）误匹配 |
-| T27 | `test_f15_empty_yys.py` | F15 | 空运营商被改写为 `mobile` |
-| T19 / T20 | `test_f09_cooldown.py` | F09 | 短暂恢复绕过 180s 冷却（0s/30s 各尝试一次） |
-| T01 | `test_f01_concurrency.py` | F01 | 10 次手动点击产生多个并行认证任务 |
-| T23 | `test_f12_consent.py` | F12 | 过期 consent 覆盖新的拒绝 |
-| T24 | `test_f12_consent.py` | F12 | 保存无关设置把未知授权 bool 化并重写自启 |
-| T25 | `test_f13_save.py` | F13 | 保存失败被静默吞掉、仍显示“已保存” |
+| 用例 | 文件 | 关联问题 | 主责阶段 | 复现证据 |
+|---|---|---|---|---|
+| T11 / T12 | `test_f06_portal_login.py` | F06 | 阶段 3 | HTTP 500 + 在线文字被判成功；账号子串（123456 vs 1234567）误匹配 |
+| T19 / T20 | `test_f09_cooldown.py` | F09 | 阶段 3 | 短暂恢复绕过 180s 冷却（0s/30s 各尝试一次） |
+| T27 | `test_f15_empty_yys.py` | F15 | 阶段 3 | 空运营商被改写为 `mobile` |
+
+## 阶段 2 已转绿并移出的用例
+
+以下用例在阶段 2 修复后已并入默认离线集合（现位于 `tests/unit/`）：
+
+| 用例 | 文件 | 关联问题 |
+|---|---|---|
+| T01 | `tests/unit/test_f01_concurrency.py` | F01（重连排他 / 单网络工作线程） |
+| T05 / T06 / T07 | `tests/unit/test_f03_config.py` | F03（配置校验与授权三态） |
+| T08 | `tests/unit/test_f04_proxy.py` | F04（代理权限与部分写入） |
+| T23 / T24 | `tests/unit/test_f12_consent.py` | F12（授权版本 / 只保存变更项） |
+| T25 | `tests/unit/test_f13_save.py` | F13（原子持久化与保存反馈） |
+
+阶段 2 另新增（同样位于 `tests/unit/`）：`test_proxy_controller.py`（T08/T09/T10）、
+`test_credential_store.py`（T22/T34）、`test_autostart_controller.py`、
+`test_tray_worker.py`（T01/T02/T03/T04/T10/T21）。

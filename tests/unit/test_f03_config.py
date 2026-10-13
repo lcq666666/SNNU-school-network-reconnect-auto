@@ -5,19 +5,15 @@
 ``invalid_config_survives= bad 'false' True`` —— 原 ``load_config()`` 原样接受
 非法配置（``interval="bad"``、``clash_auto_proxy="false"``）。
 
-**本文件在修复前必须失败**（阶段 2 修复后转绿）。默认集合通过
-``-m "not regression"`` 排除，用 ``pytest -m regression`` 单独运行。
+**阶段 2 已修复**：``load_config()`` 改走 ``campus_core`` 验证器（类型 / 范围 /
+授权三态 / 未知键隔离），本用例已并入默认离线集合。
 """
 from __future__ import annotations
 
 import json
 import logging
 
-import pytest
-
 import campus_reconnect_tray as tray
-
-pytestmark = pytest.mark.regression
 
 LOG = logging.getLogger("campus")
 
@@ -41,6 +37,15 @@ def test_t05_unknown_key_must_not_leak_into_config(tmp_path, monkeypatch):
     _write(tmp_path, monkeypatch, json.dumps({"mystery": "SECRET-VALUE"}))
     cfg = tray.load_config()
     assert "mystery" not in cfg, "未知配置键被原样并入配置，未隔离"
+
+
+def test_t05_unknown_key_value_is_never_logged(tmp_path, monkeypatch, caplog):
+    """T05：未知键的**原始值**不得出现在日志里（脱敏告警）。"""
+    _write(tmp_path, monkeypatch, json.dumps({"mystery": "SECRET-VALUE"}))
+    with caplog.at_level(logging.WARNING, logger="campus"):
+        cfg = tray.load_config()
+    assert "mystery" not in cfg
+    assert "SECRET-VALUE" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #
