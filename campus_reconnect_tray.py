@@ -30,7 +30,7 @@ import pystray
 import winreg
 from PIL import Image, ImageDraw
 
-from campus_reconnect import (edge_fallback, ensure_single_instance,
+from campus_reconnect import (SERVICE, edge_fallback, ensure_single_instance,
                               get_credentials, internet_ok, portal_login,
                               portal_reachable, resolve_port, setup_logging,
                               wifi_state)
