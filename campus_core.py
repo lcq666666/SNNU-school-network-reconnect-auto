@@ -16,10 +16,15 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
+                    Tuple)
+from urllib.parse import urljoin, urlsplit
 
 __all__ = [
     "SCHEMA_VERSION", "OPERATORS", "ACCOUNT_FORMATS",
@@ -34,6 +39,13 @@ __all__ = [
     "BrowserLaunchResult", "ProxyApplyResult", "CredentialLoad",
     "CredentialSave", "CredentialClear", "Scheduler",
     "validate_config", "load_config_text", "load_config_file", "default_config",
+    # ---- 阶段 3：共享重连服务、状态页解析、重定向与探测分类 ----
+    "ONLINE_MARKER", "MAX_BODY_BYTES", "PROBE_EXACT", "PROBE_HTML_TITLE",
+    "LoginOutcome", "StatusPageResult", "ProbeSpec", "RepairOptions",
+    "RepairAdapters",
+    "normalize_account", "parse_status_page", "extract_error_hint",
+    "probe_matches", "classify_network", "resolve_url",
+    "check_redirect_target", "repair_service",
 ]
 
 
@@ -278,6 +290,12 @@ class RepairResult:
     elapsed: float = 0.0
     port: Optional[int] = None
     needs_user: bool = False
+    #: 细分类别（F08）；``None`` 表示未分类。
+    status: Optional["PortalStatus"] = None
+    #: 面向用户的说明（不含密码/Cookie）。
+    detail: str = ""
+    #: 是否复用已有会话（``True`` 表示本次**未**验证新凭据，F06）。
+    already_authenticated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -646,3 +664,491 @@ def load_config_file(path: Path) -> ConfigLoadResult:
         issue = ConfigIssue("<root>", E_CONFIG_IO, "读取失败（%s）" % type(exc).__name__)
         return ConfigLoadResult(default_config(), (issue,), (), False)
     return load_config_text(text)
+
+
+# --------------------------------------------------------------------------- #
+# 阶段 3：状态页解析、重定向校验、探测分类与共享重连服务
+# --------------------------------------------------------------------------- #
+#: Portal 状态页里标识「当前登录账号」的标记（两入口共享，F06）。
+ONLINE_MARKER = "当前登录账号"
+
+#: 单次响应体解析上限（字节），避免异常大页面拖垮预算（F16）。
+MAX_BODY_BYTES = 200_000
+
+#: 探测匹配模式：``exact`` = 归一化后完全相等；``html_title`` = 含精确 ``<title>`` 标签。
+PROBE_EXACT = "exact"
+PROBE_HTML_TITLE = "html_title"
+
+#: 状态页账号字段：``当前登录账号：123456`` / ``当前登录账号 123456``。
+_STATUS_ACCOUNT_RE = re.compile(r"当前登录账号\s*[:：]?\s*([^\s<>\"']+)")
+
+#: 错误文字提取：只在「错误/失败/提示」等标记后的短片段里找，避免导航脚本误触发。
+_ERROR_REGION_RE = re.compile(r"(?:错误|失败|提示|异常)\s*[:：]?\s*([^<>]{1,80})")
+
+#: 验证码页特征（命中即需要人工处理，F06/T16）。
+CAPTCHA_HINTS = ("验证码", "captcha", "checkcode", "verifycode", "vcode")
+
+#: 明确的认证拒绝特征（命中 ⇒ ``E_AUTH_REJECTED``，进入需人工处理，禁止自动频繁重试）。
+AUTH_REJECT_HINTS = ("密码错误", "密码不正确", "密码有误", "密码不匹配",
+                     "用户不存在", "账号不存在", "账户不存在", "用户名或密码错误",
+                     "欠费", "冻结", "已停机", "登录失败", "认证失败")
+
+
+def normalize_account(value: Any) -> str:
+    """规范化账号用于**完整比较**：去空白、去包裹引号（不做子串匹配）。"""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
+
+class LoginOutcome(tuple):
+    """登录结果：可解包为 ``(ok, detail)``，同时携带结构化状态（F06/F14）。
+
+    兼容旧的两元组调用（``ok, detail = portal_login(...)``），并额外暴露
+    ``status`` / ``error_code`` / ``already_authenticated``，供共享服务分类。
+    """
+
+    def __new__(cls, ok: bool, detail: str, status: Optional["PortalStatus"] = None,
+                error_code: Optional[str] = None,
+                already_authenticated: bool = False) -> "LoginOutcome":
+        obj = super().__new__(cls, (bool(ok), str(detail)))
+        obj.ok = bool(ok)
+        obj.detail = str(detail)
+        obj.status = status if status is not None else (
+            PortalStatus.ONLINE if ok else PortalStatus.AUTH_REQUIRED)
+        obj.error_code = error_code
+        obj.already_authenticated = bool(already_authenticated)
+        return obj
+
+    def __repr__(self) -> str:  # pragma: no cover - 便于调试，不含秘密
+        return "LoginOutcome(ok=%r, status=%s, detail=%r)" % (
+            self.ok, getattr(self.status, "value", self.status), self.detail)
+
+
+@dataclass(frozen=True)
+class StatusPageResult:
+    """只读状态页解析结果（F06/F08）。
+
+    - ``status``：解析出的 Portal 状态；
+    - ``account``：状态页声明的登录账号（**仅内部精确比较**，对外脱敏）；
+    - ``error_code`` / ``detail``：失败原因；
+    - ``marker_found``：是否出现「当前登录账号」标记。
+    """
+
+    status: "PortalStatus"
+    account: Optional[str] = None
+    error_code: Optional[str] = None
+    detail: str = ""
+    marker_found: bool = False
+
+
+def parse_status_page(body: str, expected_account: Optional[str] = None) -> StatusPageResult:
+    """解析 Portal 状态页（**纯函数**）。
+
+    规则（F06）：
+    - 命中验证码特征 ⇒ ``NEEDS_USER``（``E_AUTH_CAPTCHA``）；
+    - 解析出明确的账号字段后**完整比较**（不是子串）：一致 ⇒ ``ONLINE``，
+      不一致 ⇒ ``NEEDS_USER``（其他账号）；
+    - 出现标记但无法解析账号 ⇒ 结构未知 ⇒ ``NEEDS_USER``；
+    - 无标记 ⇒ 需要认证（``AUTH_REQUIRED``）。
+    """
+    text = body or ""
+    low = text.lower()
+    if any(h.lower() in low for h in CAPTCHA_HINTS):
+        return StatusPageResult(PortalStatus.NEEDS_USER, error_code=E_AUTH_CAPTCHA,
+                                detail="Portal 要求验证码，需要人工处理")
+    marker = ONLINE_MARKER in text
+    match = _STATUS_ACCOUNT_RE.search(text)
+    if match:
+        account = normalize_account(match.group(1))
+        if expected_account is not None:
+            if account and account == normalize_account(expected_account):
+                return StatusPageResult(PortalStatus.ONLINE, account=account,
+                                        detail="状态页账号与本次提交完整一致",
+                                        marker_found=True)
+            return StatusPageResult(
+                PortalStatus.NEEDS_USER, account=account, error_code=E_AUTH_REJECTED,
+                detail="状态页显示的账号与本次提交不一致（不视为本次认证成功）",
+                marker_found=True)
+        return StatusPageResult(PortalStatus.ONLINE, account=account,
+                                detail="状态页已登录账号", marker_found=True)
+    if marker:
+        return StatusPageResult(PortalStatus.NEEDS_USER, marker_found=True,
+                                error_code=E_PORTAL_STRUCTURE_UNKNOWN,
+                                detail="出现登录标记但无法解析账号字段（疑似改版）")
+    return StatusPageResult(PortalStatus.AUTH_REQUIRED, marker_found=False,
+                            detail="状态页未显示登录账号，判定需要认证")
+
+
+def extract_error_hint(body: str) -> Optional[str]:
+    """仅在已识别的错误区域提取失败文字（避免导航脚本中的“失败/绑定”误触发）。"""
+    text = body or ""
+    hints: List[str] = []
+    for match in _ERROR_REGION_RE.finditer(text):
+        fragment = match.group(1).strip()
+        for hint in AUTH_REJECT_HINTS:
+            if hint in fragment and hint not in hints:
+                hints.append(hint)
+    return ", ".join(hints) if hints else None
+
+
+def probe_matches(spec: "ProbeSpec", status_code: int, body: str,
+                  redirected: bool = False) -> bool:
+    """严格匹配探测响应结构（F08/T18）。
+
+    - 必须是 200 且未发生跳转；
+    - ``exact``：归一化后**完全相等**；
+    - ``html_title``：正文包含精确的 ``<title>期望值</title>`` 标签。
+
+    任意 200 正文里只是「含有 Success」不再视为通过。
+    """
+    if redirected or status_code != 200:
+        return False
+    text = (body or "").strip()
+    if spec.mode == PROBE_EXACT:
+        return text == spec.expect.strip()
+    if spec.mode == PROBE_HTML_TITLE:
+        pattern = r"<title>\s*%s\s*</title>" % re.escape(spec.expect.strip())
+        return re.search(pattern, body or "", re.IGNORECASE) is not None
+    return False
+
+
+@dataclass(frozen=True)
+class ProbeSpec:
+    """一个连通性探测点：地址 + 期望结构 + 匹配模式。"""
+
+    url: str
+    expect: str = ""
+    mode: str = PROBE_EXACT
+
+
+def classify_network(wifi_ssid: Optional[str], target_ssid: Optional[str],
+                     probe_results: Sequence[ProbeResult],
+                     portal: Optional[StatusPageResult] = None,
+                     wifi_present: bool = True) -> PortalStatus:
+    """把探测/状态页信息归类为 :class:`PortalStatus`（F08）。
+
+    先区分非目标网络 / Wi-Fi 断开；有任一探测通过即 ``ONLINE``；全部失败时结合
+    只读状态页区分「已认证但公网异常 / 需要认证 / 需人工处理 / 探测不可信」。
+    """
+    target = (target_ssid or "").strip()
+    if target:
+        if not wifi_present or not wifi_ssid:
+            return PortalStatus.WIFI_DISCONNECTED
+        if wifi_ssid.strip().casefold() != target.casefold():
+            return PortalStatus.NON_TARGET
+    if any(r.ok for r in probe_results):
+        return PortalStatus.ONLINE
+    if portal is not None:
+        if portal.status is PortalStatus.ONLINE:
+            return PortalStatus.AUTHENTICATED_DEGRADED
+        if portal.status is PortalStatus.AUTH_REQUIRED:
+            return PortalStatus.AUTH_REQUIRED
+        if portal.status is PortalStatus.NEEDS_USER:
+            return PortalStatus.NEEDS_USER
+    return PortalStatus.SUSPECT
+
+
+def resolve_url(base: str, location: str) -> Optional[str]:
+    """把（可能是相对的）``Location`` 归一化为绝对 URL；缺失返回 ``None``。"""
+    if not location:
+        return None
+    try:
+        return urljoin(base.rstrip("/") + "/", location.strip())
+    except ValueError:
+        return None
+
+
+def check_redirect_target(location: str, base: str,
+                          allowed_paths: Optional[Sequence[str]] = None
+                          ) -> Tuple[bool, Optional[str], str]:
+    """校验重定向目标是否被允许（F07）。
+
+    仅允许与 ``base`` 同 scheme / host / port 的 http(s) 目标，且路径在
+    ``allowed_paths`` 之内；跨源、非 http(s)、越界路径一律拒绝。
+    返回 ``(ok, target_url, detail)``。
+    """
+    target = resolve_url(base, location)
+    if target is None:
+        return False, None, "重定向缺少 Location"
+    try:
+        parsed = urlsplit(target)
+        base_parsed = urlsplit(base)
+    except ValueError:
+        return False, None, "重定向 URL 无法解析"
+    if parsed.scheme not in ("http", "https"):
+        return False, None, "重定向 scheme 不被允许：%s" % (parsed.scheme or "?")
+    if parsed.hostname != base_parsed.hostname:
+        return False, None, "重定向跨 host（%s）不被允许" % (parsed.hostname or "?")
+    if parsed.port != base_parsed.port:
+        return False, None, "重定向跨 port（%s）不被允许" % (parsed.port,)
+    if allowed_paths:
+        path = parsed.path or "/"
+        if not any(path == p or path.endswith(p) for p in allowed_paths):
+            return False, None, "重定向路径 %s 不在允许范围" % path
+    return True, target, ""
+
+
+# --------------------------------------------------------------------------- #
+# 重连选项与适配器（CLI / 托盘共用，F14）
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class RepairOptions:
+    """一次重连请求的**不可变选项快照**（不含密码）。
+
+    由 CLI 的 ``Namespace`` 或托盘的配置 dict / :class:`Config` 转换而来，
+    保证两入口在同一输入下产生相同请求载荷（F14）。空运营商是**合法值**。
+    """
+
+    ssid: str = ""
+    operator: str = "mobile"
+    account_format: str = "plain"
+    port: Optional[int] = None
+    reconnect_wifi: bool = False
+    browser_fallback: bool = True
+    force: bool = False
+
+    @classmethod
+    def from_config(cls, config: Config) -> "RepairOptions":
+        return cls(ssid=config.ssid or "", operator=config.operator,
+                   account_format=config.account_format, port=None,
+                   reconnect_wifi=False, browser_fallback=config.browser_fallback,
+                   force=False)
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, Any]) -> "RepairOptions":
+        """从托盘内部 dict 转换；**仅缺失键**用默认值，空串原样保留（F15）。"""
+        raw_op = mapping["yys"] if "yys" in mapping else mapping.get("operator", "mobile")
+        if raw_op is None or not isinstance(raw_op, str):
+            raw_op = "mobile"
+        return cls(
+            ssid=(mapping.get("ssid") or "").strip() if isinstance(
+                mapping.get("ssid"), str) else "",
+            operator=raw_op,
+            account_format=mapping.get("account_format", "plain")
+            if isinstance(mapping.get("account_format"), str) else "plain",
+            port=mapping.get("port") if isinstance(mapping.get("port"), int) else None,
+            reconnect_wifi=bool(mapping.get("reconnect_wifi", False)),
+            browser_fallback=bool(mapping.get("browser_fallback", True)),
+            force=bool(mapping.get("force", False)),
+        )
+
+    @classmethod
+    def from_namespace(cls, ns: Any) -> "RepairOptions":
+        """从 argparse ``Namespace`` 转换（CLI 入口）。"""
+        return cls(
+            ssid=(getattr(ns, "ssid", "") or ""),
+            operator=getattr(ns, "yys", "mobile"),
+            account_format=getattr(ns, "account_format", "plain"),
+            port=getattr(ns, "port", None),
+            reconnect_wifi=bool(getattr(ns, "reconnect_wifi", False)),
+            browser_fallback=bool(getattr(ns, "browser_fallback", False)),
+            force=bool(getattr(ns, "force", False)),
+        )
+
+
+@dataclass
+class RepairAdapters:
+    """注入式适配器：把网络副作用抽象出来，便于两入口共用与离线测试（F14）。
+
+    约定签名（与引擎现状保持一致）：
+    - ``wifi_state() -> (ssid|None, state)``
+    - ``wifi_reconnect(ssid) -> bool``
+    - ``resolve_port(session, requested) -> (port|None, source)``
+    - ``portal_reachable(session, port) -> bool``
+    - ``probe_online(session) -> (bool, url)``
+    - ``login(session, account, password, operator, port, log) -> LoginOutcome|(bool, str)``
+    """
+
+    wifi_state: Callable[[], Tuple[Optional[str], str]]
+    wifi_reconnect: Callable[[str], bool]
+    resolve_port: Callable[[Any, Optional[int]], Tuple[Optional[int], str]]
+    portal_reachable: Callable[[Any, int], bool]
+    probe_online: Callable[[Any], Tuple[bool, str]]
+    login: Callable[..., Any]
+
+
+def _as_login_outcome(raw: Any) -> LoginOutcome:
+    """把适配器返回值规范为 :class:`LoginOutcome`（兼容旧的两元组）。"""
+    if isinstance(raw, LoginOutcome):
+        return raw
+    if isinstance(raw, tuple) and len(raw) == 2:
+        ok, detail = raw
+        return LoginOutcome(ok, detail)
+    return LoginOutcome(False, "登录适配器返回了无法识别的结果")
+
+
+def _ssid_matches(ssid: Optional[str], target: str) -> bool:
+    """目标网络匹配（大小写不敏感；SSID 精确化留待阶段 4 的 F17）。"""
+    if not ssid:
+        return False
+    return ssid.strip().casefold() == target.strip().casefold()
+
+
+def repair_service(session: Any, options: RepairOptions, clock: Callable[[], float],
+                   adapters: RepairAdapters,
+                   credential_provider: Callable[[], Optional[Tuple[str, str]]],
+                   cancelled: Optional[Callable[[], bool]] = None,
+                   sleep: Optional[Callable[[float], None]] = None,
+                   log: Optional[logging.Logger] = None) -> RepairResult:
+    """CLI 与托盘共用的重连服务（F14）。
+
+    只做「目标网络判定 → 端口解析 → Portal 可达 → 只读预检 → 认证 → 公网复核」，
+    **不含** Edge / 系统代理 / UI —— 这些副作用由上层根据返回的
+    :class:`RepairResult`（含 ``status`` / ``needs_user``）决定是否执行。
+    """
+    cancelled = cancelled or (lambda: False)
+    sleep = sleep if sleep is not None else time.sleep
+    log = log or logging.getLogger("campus")
+    start = clock()
+
+    def _result(**kw: Any) -> RepairResult:
+        kw.setdefault("elapsed", clock() - start)
+        return RepairResult(**kw)
+
+    if cancelled():
+        return _result(status=PortalStatus.STOPPING, error_code=E_CANCELLED,
+                       retryable=False, detail="已退出或取消，未发起认证")
+
+    # 1) 目标网络判定
+    try:
+        ssid, _state = adapters.wifi_state()
+    except Exception as exc:  # 探测 Wi-Fi 失败按未连接处理，不静默失效
+        log.warning("读取 Wi-Fi 状态异常：%s", type(exc).__name__)
+        ssid = None
+    target = (options.ssid or "").strip()
+    if target and not _ssid_matches(ssid, target):
+        if options.reconnect_wifi and not cancelled():
+            log.warning("当前未连接 Wi-Fi，尝试重连 %s ...", target)
+            try:
+                adapters.wifi_reconnect(target)
+            except Exception as exc:
+                log.warning("Wi-Fi 重连异常：%s", type(exc).__name__)
+            for _ in range(6):
+                sleep(5)
+                if cancelled():
+                    break
+                try:
+                    ssid, _state = adapters.wifi_state()
+                except Exception:
+                    ssid = None
+                if _ssid_matches(ssid, target):
+                    break
+        if cancelled():
+            return _result(status=PortalStatus.STOPPING, error_code=E_CANCELLED,
+                           retryable=False, detail="已取消，未发起认证")
+        if not ssid:
+            return _result(network_ok=False, status=PortalStatus.WIFI_DISCONNECTED,
+                           error_code=E_NETS_FAILED, retryable=True,
+                           detail="未检测到目标 Wi-Fi（%s）" % target)
+        if not _ssid_matches(ssid, target):
+            return _result(network_ok=False, status=PortalStatus.NON_TARGET,
+                           error_code=E_NETS_FAILED, retryable=True,
+                           detail="当前 Wi-Fi 为 %s，非目标 %s" % (ssid, target))
+
+    # 2) 只读预检：已在线则不 POST（F06/F08；--force 时跳过）
+    if not options.force:
+        online = False
+        try:
+            online, _via = adapters.probe_online(session)
+        except Exception as exc:
+            log.warning("预检探测异常，按未在线处理：%s", type(exc).__name__)
+        if online:
+            return _result(network_ok=True, status=PortalStatus.ONLINE,
+                           detail="公网已连通，无需认证")
+        if cancelled():
+            return _result(status=PortalStatus.STOPPING, error_code=E_CANCELLED,
+                           retryable=False, detail="已取消，未发起认证")
+
+    # 3) 端口解析
+    try:
+        port, source = adapters.resolve_port(session, options.port)
+    except Exception as exc:
+        return _result(error_code=E_PORTAL_UNREACHABLE, retryable=True,
+                       status=PortalStatus.SUSPECT,
+                       detail="端口解析异常：%s" % type(exc).__name__)
+    if port is None:
+        return _result(error_code=E_PORTAL_UNREACHABLE, retryable=True,
+                       status=PortalStatus.SUSPECT,
+                       detail="无法确定 Portal 认证端口：%s" % source)
+
+    # 4) Portal 可达性（未验证可达前不取凭据、不提交）
+    try:
+        reachable = bool(adapters.portal_reachable(session, port))
+    except Exception as exc:
+        log.warning("Portal 可达性检查异常：%s", type(exc).__name__)
+        reachable = False
+    if not reachable:
+        return _result(port=port, network_ok=False, retryable=True,
+                       status=PortalStatus.SUSPECT, error_code=E_PORTAL_UNREACHABLE,
+                       detail="Portal 登录页不可达（端口 %d）" % port)
+    if cancelled():
+        return _result(port=port, status=PortalStatus.STOPPING, error_code=E_CANCELLED,
+                       retryable=False, detail="已取消，未提交认证")
+
+    # 5) 凭据
+    try:
+        creds = credential_provider()
+    except Exception as exc:
+        return _result(port=port, error_code=E_CRED_BACKEND, retryable=False,
+                       needs_user=True, status=PortalStatus.NEEDS_USER,
+                       detail="凭据后端不可用：%s" % type(exc).__name__)
+    if not creds:
+        return _result(port=port, error_code=E_CRED_MISSING, retryable=False,
+                       needs_user=True, status=PortalStatus.NEEDS_USER,
+                       detail="尚未保存校园网凭据（请先运行 configure）")
+
+    account, password = creds
+    # isp 格式：运营商为空时**不**拼接尾部 "@"（F20）。
+    if options.account_format == "isp" and options.operator:
+        account_to_send = "%s@%s" % (account, options.operator)
+    else:
+        account_to_send = account
+
+    # 6) 认证
+    try:
+        outcome = _as_login_outcome(adapters.login(
+            session, account_to_send, password, options.operator, port, log))
+    except Exception as exc:
+        return _result(port=port, error_code=E_PORTAL_STRUCTURE_UNKNOWN,
+                       retryable=True, status=PortalStatus.SUSPECT,
+                       detail="认证请求异常：%s" % type(exc).__name__)
+    if not outcome.ok:
+        retryable = outcome.status is not PortalStatus.NEEDS_USER
+        return _result(port=port, network_ok=False, auth_ok=False,
+                       error_code=outcome.error_code or E_AUTH_REJECTED,
+                       retryable=retryable,
+                       needs_user=(outcome.status is PortalStatus.NEEDS_USER),
+                       status=outcome.status, detail=outcome.detail)
+
+    # 7) 公网复核（Portal 已认证但公网可能仍异常，两者独立报告）
+    for delay in (3, 5, 8):
+        if cancelled():
+            return _result(port=port, network_ok=None, auth_ok=True,
+                           error_code=E_CANCELLED, retryable=False,
+                           status=PortalStatus.STOPPING,
+                           detail="已取消，停止等待公网恢复")
+        sleep(delay)
+        if cancelled():
+            return _result(port=port, network_ok=None, auth_ok=True,
+                           error_code=E_CANCELLED, retryable=False,
+                           status=PortalStatus.STOPPING,
+                           detail="已取消，停止等待公网恢复")
+        online = False
+        try:
+            online, _via = adapters.probe_online(session)
+        except Exception as exc:
+            log.warning("复核探测异常：%s", type(exc).__name__)
+        if online:
+            return _result(port=port, network_ok=True, auth_ok=True,
+                           status=PortalStatus.ONLINE,
+                           already_authenticated=outcome.already_authenticated,
+                           detail="Portal 确认在线，公网已恢复（端口 %d · %s）"
+                                  % (port, source))
+    return _result(port=port, network_ok=False, auth_ok=True,
+                   error_code=E_PROBE_UNRELIABLE, retryable=True,
+                   status=PortalStatus.AUTHENTICATED_DEGRADED,
+                   detail="Portal 已在线但公网探测仍未通过（可能是探测地址受限或 DNS 问题）")
