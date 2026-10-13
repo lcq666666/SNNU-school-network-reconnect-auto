@@ -21,6 +21,17 @@
   - **凭据存储**：区分未配置 / 后端不可用 / 读写失败，部分失败尝试恢复旧对（F11）。
   - **授权版本**：过期的授权询问结果不应用，新的拒绝优先；设置只保存实际变更项（F12）。
 
+阶段 3（统一认证、状态识别与调度）后的关键结构:
+  - **共享重连服务**：CLI 与托盘共用 ``campus_core.repair_service``，同输入同结果；
+    Edge / 系统代理 / UI 由上层按结果决定，不混入底层认证流程（F14）。
+  - **登录结构化校验**：状态页账号字段完整比较、区分已有会话与本次成功、
+    重定向目标白名单（F06/F07）。
+  - **状态分类**：探测严格匹配结构，失败后区分非目标/断开/不可达/需认证/
+    已认证但公网异常/需人工处理（F08）。
+  - **统一冷却**：恢复不抹掉最短间隔，冷却只禁新认证；Edge 兜底按故障周期限频、
+    如实通知（F09/F19）。
+  - **空运营商保留**：``yys=""`` 端到端保留，UI 用"默认校园网"标签（F15）。
+
 依赖: py -m pip install pystray pillow
 运行: py campus_reconnect_tray.py   (run_tray.bat 可双击启动)
 """
@@ -48,11 +59,13 @@ from PIL import Image, ImageDraw
 
 from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
                          CredentialClear, CredentialLoad, CredentialSave,
-                         ProxyApplyResult, load_config_text)
+                         ProxyApplyResult, RepairAdapters, RepairOptions,
+                         repair_service, load_config_text)
 from campus_reconnect import (direct_session, edge_fallback,
                               ensure_single_instance, get_credentials,
                               internet_ok, portal_login, portal_reachable,
-                              resolve_port, setup_logging, wifi_state)
+                              resolve_port, setup_logging, wifi_reconnect,
+                              wifi_state)
 from campus_windows import CredentialStore, ProxyController, default_refresh
 
 if getattr(sys, "frozen", False):
@@ -96,6 +109,13 @@ CONSENT_CHOICES = (("每次询问", None), ("自动开启", True), ("不开启",
 CONSENT_LABELS = [label for label, _ in CONSENT_CHOICES]
 CONSENT_LABEL_TO_VALUE = {label: value for label, value in CONSENT_CHOICES}
 CONSENT_VALUE_TO_LABEL = {value: label for label, value in CONSENT_CHOICES}
+
+#: 运营商选择：空串是**合法值**（默认校园网线路），用标签映射便于理解（F15）。
+YYS_CHOICES = (("mobile", "移动"), ("unicom", "联通"),
+               ("telecom", "电信"), ("", "默认校园网"))
+YYS_LABELS = [label for _, label in YYS_CHOICES]
+YYS_LABEL_TO_VALUE = {label: value for value, label in YYS_CHOICES}
+YYS_VALUE_TO_LABEL = {value: label for value, label in YYS_CHOICES}
 
 
 # --------------------------------------------------------------------------- #
@@ -357,6 +377,11 @@ class TrayApp:
         self._repair_override = False
         self._last_error = None
         self._op_seq = 0
+        self._last_result = None
+        #: Edge 兜底：同一故障周期只自动打开一次（F19）；手动按钮可再次打开。
+        self._edge_opened_this_cycle = False
+        #: 下一次允许发起认证的单调时刻（F09：恢复不抹掉最短间隔）。
+        self._next_attempt_at = 0.0
 
         # ---- 取消令牌（F10）----
         self._cancel = threading.Event()
@@ -490,12 +515,25 @@ class TrayApp:
             return None
         return holder["value"]
 
-    # ---------- 重连核心（F01/F10）----------
+    # ---------- 重连核心（F01/F10/F14/F15）----------
+    def _repair_adapters(self) -> RepairAdapters:
+        """构造适配器集合：**在调用时**读取模块级函数，便于测试替换（F14）。"""
+        return RepairAdapters(
+            wifi_state=wifi_state,
+            wifi_reconnect=lambda ssid: wifi_reconnect(ssid, self.log),
+            resolve_port=resolve_port,
+            portal_reachable=portal_reachable,
+            probe_online=internet_ok,
+            login=portal_login,
+        )
+
     def repair_once(self):
         """执行一次完整重连, 返回 (成功?, 详情, 耗时秒)。
 
-        - 入口即对配置做**不可变快照**：任务进行中修改运营商 / 参数不影响本次请求；
-        - 取消令牌（退出 / 暂停）在任何副作用（POST / Edge / 代理写入）前重新校验。
+        - 入口即对配置做**不可变快照**（``RepairOptions``）：任务进行中修改运营商 /
+          参数不影响本次请求（F01）；
+        - 底层走 CLI/托盘共用的 ``repair_service``（F14），空运营商原样保留（F15）；
+        - 取消令牌（退出 / 暂停）在任何副作用（POST / Edge / 代理写入）前重新校验（F10）。
         """
         cfg = self.get_config()
         if self.stop_event.is_set() or self._cancel.is_set():
@@ -504,39 +542,15 @@ class TrayApp:
             return False, "监测已暂停，未发起认证", 0.0
         if self.session is None:
             self.session = direct_session()
-        start = time.monotonic()
-        ssid, _ = wifi_state()
-        target = (cfg.get("ssid") or "").strip()
-        if target and (not ssid or ssid.casefold() != target.casefold()):
-            return False, "当前 Wi-Fi 为 %s，未连接目标 %s" % (ssid or "未连接", target), 0.0
-        if self._cancelled():
-            return False, "已取消，未发起认证", time.monotonic() - start
-        port, source = resolve_port(self.session, None)
-        self.state["port"] = port
-        if self._cancelled():
-            return False, "已取消，未发起认证", time.monotonic() - start
-        if not portal_reachable(self.session, port):
-            return False, "Portal 登录页不可达（端口 %d）" % port, time.monotonic() - start
-        creds = get_credentials()
-        if not creds:
-            return False, "尚未保存校园网凭据（请先运行 configure）", time.monotonic() - start
-        if self._cancelled():   # 提交认证前的最后一道校验
-            return False, "已取消，未提交认证", time.monotonic() - start
-        account, password = creds
-        ok, detail = portal_login(self.session, account, password,
-                                  cfg.get("yys") or "mobile", port, self.log)
-        if not ok:
-            return False, detail, time.monotonic() - start
-        for delay in (3, 5, 8):
-            if self._cancelled():
-                return False, "已取消，停止等待公网恢复", time.monotonic() - start
-            if self.stop_event.wait(delay):   # 可唤醒等待，退出立即返回
-                return False, "已退出，停止等待公网恢复", time.monotonic() - start
-            online, _ = internet_ok(self.session)
-            if online:
-                return True, "Portal 确认在线，公网已恢复（端口 %d · %s）" % (port, source), \
-                    time.monotonic() - start
-        return False, "Portal 已在线但公网探测仍未通过", time.monotonic() - start
+        options = RepairOptions.from_mapping(cfg)
+        result = repair_service(
+            self.session, options, time.monotonic, self._repair_adapters(),
+            get_credentials, cancelled=self._cancelled,
+            sleep=self.stop_event.wait, log=self.log)
+        self._last_result = result
+        if result.port is not None:
+            self.state["port"] = result.port
+        return result.ok, result.detail, result.elapsed
 
     def _after_repair(self, ok, detail, elapsed, op_id=None, config_version=None):
         if config_version is not None and config_version != self._config_version:
@@ -547,6 +561,7 @@ class TrayApp:
         if ok:
             self.state["last_ok"] = datetime.now().strftime("%H:%M:%S")
             self.set_state("online", detail)
+            self._edge_opened_this_cycle = False   # 网络恢复 → 重置 Edge 限频周期
             allow = cfg.get("clash_auto_proxy")
             if allow is None:
                 token = self._consent_version
@@ -570,14 +585,26 @@ class TrayApp:
             self.notify("重连成功", "用时约 %.0f 秒 · %s%s" % (elapsed, detail, proxy_note))
         else:
             self.set_state("offline", detail)
-            extra = ""
-            if cfg.get("browser_fallback"):
-                if self._cancelled():
-                    extra = "\n已取消，未打开 Edge"
-                else:
-                    edge_fallback(self.log)
-                    extra = "\n已打开 Edge 供手动登录"
+            extra = self._edge_note(cfg)
             self.notify("重连失败", "%s%s" % (detail, extra))
+
+    def _edge_note(self, cfg) -> str:
+        """按结果如实报告 Edge 兜底；仅在需人工处理时触发，且同周期限一次（F19）。"""
+        if not cfg.get("browser_fallback"):
+            return ""
+        result = self._last_result
+        needs_user = bool(getattr(result, "needs_user", False))
+        if not needs_user:
+            return ""   # 非人工处理类故障（如探测不可信）不打开浏览器
+        if self._cancelled():
+            return "\n已取消，未打开 Edge"
+        if self._edge_opened_this_cycle:
+            return "\n本故障周期已打开过 Edge，未重复打开"
+        launch = edge_fallback(self.log)
+        self._edge_opened_this_cycle = True
+        if getattr(launch, "launched", False):
+            return "\n已打开 Edge 供手动登录"
+        return "\n未能自动打开 Edge（可手动访问 Portal 登录页）"
 
     def _apply_consent(self, value, save=False):
         """用户显式改变代理授权：提升授权版本，使过期的询问结果失效（F12）。"""
@@ -720,13 +747,22 @@ class TrayApp:
         if kind == "reconnect":
             force = bool(cmd[1]) if len(cmd) > 1 else False
             self._run_repair(force=force)
-            return time.monotonic() + self._cooldown()
+            self._next_attempt_at = time.monotonic() + self._cooldown()
+            return max(time.monotonic() + self._interval(), self._next_attempt_at)
         if kind == "probe":
             return self._probe_tick(next_probe)
         if kind == "quit":
             self.stop_event.set()
             return 0.0
         return next_probe
+
+    def _next_probe_time(self, now: float) -> float:
+        """下一次探测时刻：普通间隔与冷却截止时刻取较晚者（F09）。
+
+        注意：**恢复不抹掉**最短间隔 —— 只要 ``_next_attempt_at`` 仍在未来，
+        下一次探测就至少等到冷却结束。
+        """
+        return max(now + self._interval(), self._next_attempt_at)
 
     def _probe_tick(self, next_probe: float) -> float:
         now = time.monotonic()
@@ -747,20 +783,23 @@ class TrayApp:
             if self.state["mode"] != "online":
                 self.set_state("online", "网络正常")
             self.state["failures"] = 0
-            return now + self._interval()
+            self._edge_opened_this_cycle = False
+            return self._next_probe_time(now)
         self.state["failures"] += 1
         threshold = self._threshold()
         if self.state["failures"] < threshold:
             if self.state["mode"] != "offline":
                 self.set_state("offline", "公网探测失败（%d/%d）"
                                % (self.state["failures"], threshold))
-            return now + self._interval()
+            return self._next_probe_time(now)
         if self.state["mode"] != "reconnecting":
             self.set_state("reconnecting", "正在尝试重新连接",
                            notify=("校园网已断开", "正在尝试重新连接，请稍候…"))
+            self._edge_opened_this_cycle = False   # 新的故障周期
         self._run_repair()
         self.state["failures"] = 0
-        return time.monotonic() + self._cooldown()
+        self._next_attempt_at = time.monotonic() + self._cooldown()
+        return max(time.monotonic() + self._interval(), self._next_attempt_at)
 
     def _run_repair(self, force=False):
         """串行执行一次重连；重复请求合并（F01）。"""
@@ -810,6 +849,7 @@ class TrayApp:
         if self.config.get("paused"):
             self._request_manual_while_paused()
             return
+        self._edge_opened_this_cycle = False   # 手动按钮可再次打开 Edge（F19）
         self._enqueue_repair(force=False)
 
     def _enqueue_repair(self, force=False) -> bool:
@@ -1026,9 +1066,12 @@ class TrayApp:
         v_ssid = tk.StringVar(value=self.config.get("ssid") or "SNNU")
         ttk.Entry(frame, textvariable=v_ssid, width=18).grid(row=8, column=1, sticky="w", **pad)
         ttk.Label(frame, text="运营商").grid(row=9, column=0, sticky="e", **pad)
-        v_yys = tk.StringVar(value=self.config.get("yys", "mobile"))
+        yys_value = self.config.get("yys", "mobile")
+        if yys_value not in YYS_VALUE_TO_LABEL:
+            yys_value = "mobile"
+        v_yys = tk.StringVar(value=YYS_VALUE_TO_LABEL[yys_value])
         ttk.Combobox(frame, textvariable=v_yys, width=15, state="readonly",
-                     values=["mobile", "unicom", "telecom", ""]).grid(
+                     values=YYS_LABELS).grid(
                          row=9, column=1, sticky="w", **pad)
         ttk.Label(frame, text="检测间隔（秒）").grid(row=10, column=0, sticky="e", **pad)
         v_interval = tk.IntVar(value=self._int_or(self.config.get("interval"), 15))
@@ -1046,7 +1089,7 @@ class TrayApp:
         # 面板打开时的原始值：保存时**只提交用户实际变更的项**（F12/T24）。
         initial = {
             "ssid": self.config.get("ssid") or "SNNU",
-            "yys": self.config.get("yys", "mobile"),
+            "yys": YYS_VALUE_TO_LABEL[yys_value],
             "interval": self._int_or(self.config.get("interval"), 15),
             "threshold": self._int_or(self.config.get("threshold"), 3),
             "cooldown": self._int_or(self.config.get("cooldown"), 180),
@@ -1068,8 +1111,9 @@ class TrayApp:
             ssid = v_ssid.get().strip() or "SNNU"
             if ssid != initial["ssid"]:
                 changes["ssid"] = ssid
-            if v_yys.get() != initial["yys"]:
-                changes["yys"] = v_yys.get()
+            yys_label = v_yys.get()
+            if yys_label != initial["yys"]:
+                changes["yys"] = YYS_LABEL_TO_VALUE.get(yys_label, "mobile")
             if interval != initial["interval"]:
                 changes["interval"] = interval
             if threshold != initial["threshold"]:
