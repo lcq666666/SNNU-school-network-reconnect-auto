@@ -9,7 +9,8 @@
   登录字段: sourceurl=null, account, password, yys=mobile|unicom|telecom, issave=
   根页面会在 8601/8602/8603/8605/8609 等端口间轮询跳转, 脚本动态解析该端口;
   登录页当前无验证码; 失败的登录不会影响已有在线会话;
-  成功的判定 = userstatus.jsp 出现"当前登录账号"且包含账号 且 直连公网探测通过。
+  成功的判定 = userstatus.jsp 出现"当前登录账号"且账号字段与本次提交**完整一致**,
+  且直连公网探测通过(严格匹配响应结构, 不再用任意正文子串)。
 
 命令:
   configure   交互式保存账号密码到 Windows 凭据管理器
@@ -34,7 +35,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+from urllib.parse import urlsplit
 
 try:
     import keyring
@@ -43,6 +45,14 @@ except ImportError:
     print("缺少依赖，请先运行: py -m pip install requests keyring")
     raise SystemExit(2)
 
+from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
+                         E_PORTAL_UNREACHABLE, MAX_BODY_BYTES, PROBE_EXACT,
+                         PROBE_HTML_TITLE, BrowserLaunchResult, PortalResolution,
+                         PortalStatus, ProbeResult, ProbeSpec, RepairAdapters,
+                         RepairOptions, RepairResult, LoginOutcome,
+                         check_redirect_target, classify_network,
+                         extract_error_hint, parse_status_page, probe_matches,
+                         repair_service, resolve_url)
 from campus_windows import CredentialStore
 
 if os.name == "nt":
@@ -62,12 +72,15 @@ USERSTATUS_JSP = "/snnuportal/userstatus.jsp"
 LOGIN_ACTION = "/snnuportal/login"
 BYPASS_HOSTS = (PORTAL_IP, "net.snnu.edu.cn")
 KNOWN_PORTS = (8601, 8602, 8603, 8605, 8609)
-ONLINE_MARKER = "当前登录账号"
-FAILURE_HINTS = ("密码错误", "密码不正确", "密码有误", "用户不存在", "账号不存在",
-                 "账户不存在", "欠费", "冻结", "绑定", "验证码", "登录失败", "失败")
+#: Portal 认证端口解析的总预算（秒）；各阶段检查剩余时间，超预算即失败（F16）。
+PORTAL_BUDGET = 20.0
+
+#: 连通性探测点：严格匹配响应结构，不再「任意 200 含 Success 即通过」（F08/T18）。
 DEFAULT_PROBES = (
-    ("http://www.msftconnecttest.com/connecttest.txt", "Microsoft Connect Test"),
-    ("http://captive.apple.com/hotspot-detect.html", "Success"),
+    ProbeSpec("http://www.msftconnecttest.com/connecttest.txt",
+              "Microsoft Connect Test", PROBE_EXACT),
+    ProbeSpec("http://captive.apple.com/hotspot-detect.html",
+              "Success", PROBE_HTML_TITLE),
 )
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
@@ -115,25 +128,65 @@ def direct_session() -> requests.Session:
     return session
 
 
-def decode_body(resp: requests.Response) -> str:
+def decode_body(resp: requests.Response, limit: int = MAX_BODY_BYTES,
+                strict: bool = False) -> Optional[str]:
+    """解码响应正文；``limit`` 限制读取字节数（F16）；``strict=True`` 时无法
+    解码返回 ``None``（供「解码失败 ⇒ 结构未知」路径使用，F06）。"""
+    raw = resp.content
+    if limit and len(raw) > limit:
+        raw = raw[:limit]
     for enc in ("utf-8", "gb18030"):
         try:
-            return resp.content.decode(enc)
+            return raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    return resp.content.decode("utf-8", errors="replace")
+    if strict:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def probe_online(session: requests.Session, probes=None) -> List[ProbeResult]:
+    """逐个探测并返回每个探测点的结构化结果（**不含响应正文**，F08）。"""
+    specs = DEFAULT_PROBES if probes is None else probes
+    results: List[ProbeResult] = []
+    for spec in specs:
+        start = time.monotonic()
+        try:
+            resp = session.get(spec.url, timeout=(2.5, 4), allow_redirects=False)
+        except requests.exceptions.Timeout:
+            results.append(ProbeResult(False, spec.url, error="timeout",
+                                       elapsed=time.monotonic() - start))
+            continue
+        except requests.RequestException as exc:
+            results.append(ProbeResult(False, spec.url, error=_error_kind(exc),
+                                       elapsed=time.monotonic() - start))
+            continue
+        body = decode_body(resp) or ""
+        redirected = resp.status_code in (301, 302, 303, 307, 308)
+        ok = probe_matches(spec, resp.status_code, body, redirected=redirected)
+        results.append(ProbeResult(ok, spec.url, status_code=resp.status_code,
+                                   elapsed=time.monotonic() - start,
+                                   redirected=redirected))
+    return results
+
+
+def _error_kind(exc: Exception) -> str:
+    """把请求异常归类为 dns / timeout / connection（供探测分类）。"""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "name" in name or "dns" in text or "getaddrinfo" in text or "name resolution" in text:
+        return "dns"
+    if "timeout" in name:
+        return "timeout"
+    return "connection"
 
 
 def internet_ok(session: requests.Session,
                 probes=DEFAULT_PROBES) -> Tuple[bool, str]:
-    """直连(不走系统代理)探测公网。任一探测通过即视为在线。"""
-    for url, expect in probes:
-        try:
-            resp = session.get(url, timeout=(2.5, 4), allow_redirects=False)
-            if resp.status_code == 200 and (expect is None or expect in resp.text):
-                return True, url
-        except requests.RequestException:
-            continue
+    """直连(不走系统代理)探测公网。任一探测**严格匹配结构**通过即视为在线。"""
+    for result in probe_online(session, probes):
+        if result.ok:
+            return True, result.source
     return False, ""
 
 
@@ -141,32 +194,88 @@ def portal_base(port: int) -> str:
     return "http://%s:%d" % (PORTAL_IP, port)
 
 
-def detect_portal_port(session: requests.Session) -> Optional[int]:
-    """解析 Portal 根页面 JS 跳转声明的认证端口；识别不到返回 None，不假装成功。"""
+def _port_from_text(text: str) -> Optional[int]:
+    """从 Location 或 JS 片段中提取 ``:端口/snnuportal/login.jsp`` 的端口。"""
+    m = re.search(r":(\d{2,5})/snnuportal/login\.jsp", text or "")
+    if not m:
+        return None
+    port = int(m.group(1))
+    return port if 1 <= port <= 65535 else None
+
+
+def _is_portal_url(url: str) -> bool:
+    """URL 的 host 是否为学校 Portal（不接受任意主机）。"""
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    return host in (PORTAL_IP, "net.snnu.edu.cn")
+
+
+def resolve_portal(session: requests.Session, requested: Optional[int] = None,
+                   budget: float = PORTAL_BUDGET) -> PortalResolution:
+    """解析 Portal 认证端口并返回结构化结果（F16）。
+
+    优先级：用户指定 > 根页面 Location/JS 动态识别 > 已知端口试探。
+    **全失败返回失败**（``port=None``），不假装已选端口；不复用同一无效请求。
+    """
+    deadline = time.monotonic() + max(0.0, budget)
+
+    def remaining() -> float:
+        return deadline - time.monotonic()
+
+    if requested is not None:
+        if not 1 <= requested <= 65535:
+            return PortalResolution(error=E_PORTAL_UNREACHABLE,
+                                    evidence="指定的端口 %s 越界" % requested)
+        if remaining() <= 0:
+            return PortalResolution(error=E_PORTAL_UNREACHABLE, evidence="端口解析预算耗尽")
+        if portal_reachable(session, requested):
+            return PortalResolution(port=requested, source="用户手动指定",
+                                    evidence="手动端口可达")
+        return PortalResolution(error=E_PORTAL_UNREACHABLE,
+                                evidence="用户指定端口 %d 不可达" % requested)
+
+    # 1) 根页面：Location 或 JS 跳转
     try:
         resp = session.get(PORTAL_ROOT, timeout=(3, 6), allow_redirects=False)
-        m = re.search(r":(\d{2,5})/snnuportal/login\.jsp", decode_body(resp))
-        if m:
-            port = int(m.group(1))
-            if 1 <= port <= 65535:
-                return port
-    except requests.RequestException:
-        pass
-    return None
+    except requests.RequestException as exc:
+        root_error = "根页面请求失败（%s）" % type(exc).__name__
+        resp = None
+    else:
+        root_error = ""
+    if resp is not None:
+        if 300 <= resp.status_code < 400:
+            location = resp.headers.get("Location", "")
+            port = _port_from_text(location)
+            if port is not None and _is_portal_url(resolve_url(PORTAL_ROOT, location) or ""):
+                return PortalResolution(port=port, source="根页面 Location",
+                                        evidence="302 Location 指向学校 Portal")
+        body = decode_body(resp) or ""
+        port = _port_from_text(body)
+        if port is not None:
+            return PortalResolution(port=port, source="根页面 JS 跳转",
+                                    evidence="JS 声明 :%d/snnuportal/login.jsp" % port)
+
+    # 2) 已知端口试探（受总预算约束）
+    for port in KNOWN_PORTS:
+        if remaining() <= 0:
+            break
+        if portal_reachable(session, port):
+            return PortalResolution(port=port, source="试探已知端口",
+                                    evidence="已知端口 %d 可用" % port)
+
+    evidence = root_error or "根页面未发现可识别跳转，已知端口均不可达"
+    return PortalResolution(error=E_PORTAL_UNREACHABLE, evidence=evidence)
 
 
 def resolve_port(session: requests.Session,
-                 requested: Optional[int]) -> Tuple[int, str]:
-    """确定认证端口及其来源。优先级: 用户指定 > 首页动态识别 > 已知端口试探 > 8601。"""
-    if requested is not None:
-        return requested, "用户手动指定"
-    detected = detect_portal_port(session)
-    if detected is not None:
-        return detected, "从 Portal 首页动态识别"
-    for port in KNOWN_PORTS:
-        if portal_reachable(session, port):
-            return port, "首页跳转解析失败，试探已知端口 %d 可用" % port
-    return 8601, "无法识别端口且已知端口均不可达，回退 8601（不保证有效）"
+                 requested: Optional[int]) -> Tuple[Optional[int], str]:
+    """兼容层：返回 ``(端口|None, 来源/失败原因)``；失败时端口为 ``None``。"""
+    resolution = resolve_portal(session, requested)
+    if resolution.port is not None:
+        return resolution.port, resolution.source
+    return None, resolution.evidence or (resolution.error or "端口解析失败")
 
 
 def portal_reachable(session: requests.Session, port: int) -> bool:
@@ -300,14 +409,93 @@ def configure() -> None:
     print("运营商由 watch/once 的 --yys 参数指定，默认 mobile（移动）。")
 
 
+def read_status_page(session: requests.Session, port: int,
+                     log: Optional[logging.Logger] = None
+                     ) -> Optional[object]:
+    """只读获取状态页并解析（不发凭据，F06/F08）。不可达/无法解析返回 ``None``。"""
+    try:
+        resp = session.get(portal_base(port) + USERSTATUS_JSP,
+                           timeout=(3, 6), allow_redirects=False)
+    except requests.RequestException:
+        return None
+    if not 200 <= resp.status_code < 300:
+        return None
+    body = decode_body(resp, strict=True)
+    if body is None:
+        return None
+    return parse_status_page(body)
+
+
+def _interpret_auth_response(session: requests.Session, base: str, resp,
+                             log: logging.Logger) -> Tuple[Optional[str], Optional[str]]:
+    """把认证 POST 响应解释为最终状态页正文（F07）。
+
+    返回 ``(body, error)``：``body`` 为状态页正文（成功路径），``error`` 为
+    拒绝原因。规则：
+    - 307/308：默认拒绝（避免凭据被重放）；
+    - 302/303（含 301）：校验 Location 同源且在 Portal 流程内，**不带凭据** GET；
+    - 200：直接作为状态页；
+    - 其余：未确认成功。
+    """
+    code = resp.status_code
+    if code in (307, 308):
+        return None, "Portal 要求 %d 重放请求，已拒绝（避免凭据外发）" % code
+    if code in (301, 302, 303):
+        location = resp.headers.get("Location", "")
+        ok, target, err = check_redirect_target(
+            location, base, allowed_paths=(USERSTATUS_JSP, LOGIN_JSP))
+        if not ok:
+            return None, "重定向目标不被允许：%s" % err
+        try:
+            follow = session.get(target, timeout=(3, 6), allow_redirects=False)
+        except requests.RequestException as exc:
+            return None, "获取状态页失败（%s）" % type(exc).__name__
+        if 300 <= follow.status_code < 400:
+            return None, "状态页再次跳转，判定为循环/非预期重定向"
+        if not 200 <= follow.status_code < 300:
+            return None, "状态页返回 HTTP %d" % follow.status_code
+        body = decode_body(follow, strict=True)
+        if body is None:
+            return None, "状态页解码失败，判定为结构未知"
+        return body, None
+    if code == 200:
+        body = decode_body(resp, strict=True)
+        if body is None:
+            return None, "登录响应解码失败，判定为结构未知"
+        return body, None
+    return None, "登录响应 HTTP %d（未确认成功）" % code
+
+
 def portal_login(session: requests.Session, account: str, password: str,
-                 yys: str, port: int, log: logging.Logger) -> Tuple[bool, str]:
-    """按浏览器真实流程登录：先取登录页建立会话，再 POST 表单。"""
+                 yys: str, port: int, log: logging.Logger):
+    """按浏览器真实流程登录（F06/F07）。
+
+    返回 :class:`LoginOutcome`（可解包为 ``(ok, detail)``）。判定要求：
+    允许的状态码 + 可信目标 + 状态页账号字段**完整比较**；区分「已有会话」
+    与本次认证成功；验证码页 ⇒ 需人工处理。
+    """
+    return portal_login_detailed(session, account, password, yys, port, log)
+
+
+def portal_login_detailed(session: requests.Session, account: str, password: str,
+                          yys: str, port: int, log: logging.Logger) -> LoginOutcome:
     base = portal_base(port)
+    # 1) 打开登录页建立会话
     try:
         session.get(base + LOGIN_JSP, timeout=(3, 6), allow_redirects=False)
     except requests.RequestException as exc:
-        return False, "无法打开登录页: %s" % type(exc).__name__
+        return LoginOutcome(False, "无法打开登录页: %s" % type(exc).__name__,
+                            status=PortalStatus.AUTH_REQUIRED,
+                            error_code=E_PORTAL_UNREACHABLE)
+
+    # 2) 只读预检：已有会话且就是本账号 → 不 POST、不声称验证了新密码
+    pre = read_status_page(session, port, log)
+    if pre is not None and getattr(pre, "status", None) is PortalStatus.ONLINE \
+            and getattr(pre, "account", None) == account.strip():
+        return LoginOutcome(True, "Portal 显示该账号已在线（复用已有会话，未验证新凭据）",
+                            status=PortalStatus.ONLINE, already_authenticated=True)
+
+    # 3) 提交认证（禁止自动重定向）
     payload = {"sourceurl": "null", "account": account, "password": password,
                "yys": yys, "issave": ""}
     headers = {"Referer": base + LOGIN_JSP, "Origin": base,
@@ -315,19 +503,43 @@ def portal_login(session: requests.Session, account: str, password: str,
                "Accept-Language": "zh-CN,zh;q=0.9"}
     try:
         resp = session.post(base + LOGIN_ACTION, data=payload, headers=headers,
-                            timeout=(3, 8), allow_redirects=True)
+                            timeout=(3, 8), allow_redirects=False)
     except requests.RequestException as exc:
-        return False, "登录请求失败: %s" % type(exc).__name__
-    body = decode_body(resp)
-    if ONLINE_MARKER in body and account in body:
-        return True, "Portal 确认已在线（账号出现在状态页）"
-    hints = sorted({h for h in FAILURE_HINTS if h in body})
-    if hints:
-        return False, "Portal 返回失败信息: " + ", ".join(hints)
-    return False, "登录响应未能确认（HTTP %d）" % resp.status_code
+        return LoginOutcome(False, "登录请求失败: %s" % type(exc).__name__,
+                            status=PortalStatus.AUTH_REQUIRED,
+                            error_code=E_PORTAL_UNREACHABLE)
+
+    # 4) 解释响应（重定向控制 + 状态码校验）
+    body, error = _interpret_auth_response(session, base, resp, log)
+    if body is None:
+        status = PortalStatus.NEEDS_USER if "重定向" in error or "重放" in error \
+            else PortalStatus.AUTH_REQUIRED
+        return LoginOutcome(False, error, status=status,
+                            error_code=E_PORTAL_STRUCTURE_UNKNOWN)
+
+    # 5) 状态页结构化校验（完整账号比较）
+    outcome = parse_status_page(body, account)
+    if outcome.status is PortalStatus.ONLINE:
+        return LoginOutcome(True, "Portal 确认已在线（状态页账号完整匹配）",
+                            status=PortalStatus.ONLINE)
+    if outcome.status is PortalStatus.NEEDS_USER:
+        return LoginOutcome(False, outcome.detail, status=PortalStatus.NEEDS_USER,
+                            error_code=outcome.error_code or E_PORTAL_STRUCTURE_UNKNOWN)
+    hint = extract_error_hint(body)
+    if hint:
+        return LoginOutcome(False, "Portal 返回失败信息: " + hint,
+                            status=PortalStatus.NEEDS_USER, error_code=E_AUTH_REJECTED)
+    return LoginOutcome(False, "登录响应未能确认成功（状态页无有效登录账号）",
+                        status=PortalStatus.AUTH_REQUIRED,
+                        error_code=E_PORTAL_STRUCTURE_UNKNOWN)
 
 
-def edge_fallback(log: logging.Logger) -> None:
+def edge_fallback(log: logging.Logger, force: bool = False) -> BrowserLaunchResult:
+    """打开不走系统代理的 Edge 登录页供人工处理（F19）。
+
+    返回 :class:`BrowserLaunchResult`，**如实**反馈是否真的启动成功，
+    不得在找不到/启动失败时谎报「已打开 Edge」。
+    """
     exe = shutil.which("msedge")
     if not exe:
         for base in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES"),
@@ -340,78 +552,85 @@ def edge_fallback(log: logging.Logger) -> None:
                 break
     if not exe:
         log.warning("未找到 Edge，请手动访问 %s", PORTAL_ROOT)
-        return
+        return BrowserLaunchResult(launched=False, error="not_found",
+                                   reason="未找到 Edge 可执行文件")
     profile = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CampusReconnectEdge"
     try:
         subprocess.Popen([exe, "--user-data-dir=%s" % profile,
                           "--no-proxy-server", PORTAL_ROOT],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log.info("已打开 Edge（不走系统代理）的 Portal 登录页，供人工处理。")
     except OSError as exc:
         log.warning("Edge 启动失败: %s", type(exc).__name__)
+        return BrowserLaunchResult(launched=False, executable=exe, error=type(exc).__name__,
+                                   reason="Edge 启动失败")
+    log.info("已打开 Edge（不走系统代理）的 Portal 登录页，供人工处理。")
+    return BrowserLaunchResult(launched=True, executable=exe, reason="已打开 Edge 登录页")
+
+
+def _cli_adapters() -> RepairAdapters:
+    """CLI 侧的适配器集合（全部指向本模块函数，便于测试替换）。"""
+    return RepairAdapters(
+        wifi_state=wifi_state,
+        wifi_reconnect=lambda ssid: wifi_reconnect(ssid, logging.getLogger("campus")),
+        resolve_port=resolve_port,
+        portal_reachable=portal_reachable,
+        probe_online=internet_ok,
+        login=portal_login,
+    )
 
 
 def attempt_repair(session: requests.Session, args: argparse.Namespace,
-                   log: logging.Logger) -> bool:
-    ssid, state = wifi_state()
-    if args.ssid and not ssid and args.reconnect_wifi:
-        log.warning("当前未连接 Wi-Fi，尝试重连 %s ...", args.ssid)
-        wifi_reconnect(args.ssid, log)
-        for _ in range(6):
-            time.sleep(5)
-            ssid, state = wifi_state()
-            if ssid:
-                break
-    if args.ssid and ssid and ssid.casefold() != args.ssid.casefold():
-        log.info("当前 Wi-Fi 为 %r，非目标 %r，跳过认证。", ssid, args.ssid)
-        return False
-    if args.ssid and not ssid:
-        log.info("未检测到已连接的 Wi-Fi，跳过认证。")
-        return False
-    port, port_source = resolve_port(session, args.port)
-    log.info("Portal 认证端口: %d（%s）", port, port_source)
-    if not portal_reachable(session, port):
-        log.warning("Portal 不可达：可能是 Wi-Fi/网关故障，不发送账号密码。")
-        return False
-    creds = get_credentials()
-    if creds is None:
-        log.error("尚未保存凭据，请先执行: py campus_reconnect.py configure")
-        return False
-    account, password = creds
-    account_to_send = "%s@%s" % (account, args.yys) if args.account_format == "isp" else account
-    ok, detail = portal_login(session, account_to_send, password,
-                              args.yys, port, log)
-    log.info("登录结果: %s（%s）", "成功" if ok else "失败", detail)
-    if not ok:
-        if args.browser_fallback:
-            edge_fallback(log)
-        return False
-    for delay in (3, 5, 8):
-        time.sleep(delay)
-        online, via = internet_ok(session)
-        if online:
-            log.info("网络恢复成功（%s）。Clash 系统代理全程未被动过。", via)
-            return True
-    log.warning("Portal 已确认在线，但公网探测仍未通过："
-                "可能是探测地址受限、DNS 或运营商链路问题。")
-    if args.browser_fallback:
+                   log: logging.Logger) -> RepairResult:
+    """执行一次重连（CLI）：调用共享服务并按结果决定是否开 Edge 兜底（F14/F19）。"""
+    options = RepairOptions.from_namespace(args)
+    result = repair_service(session, options, time.monotonic, _cli_adapters(),
+                            get_credentials, log=log)
+    log.info("重连结果: %s（%s）", "成功" if result.ok else "未成功", result.detail)
+    if not result.ok and options.browser_fallback \
+            and result.status is PortalStatus.NEEDS_USER:
         edge_fallback(log)
-    return False
+    return result
+
+
+def diagnose_network(session: requests.Session, target_ssid: str = "",
+                     port: Optional[int] = None):
+    """综合连通性探测与只读状态页，给出网络/认证状态分类（F08）。
+
+    返回 ``(状态, 各探测结果, 状态页解析|None)``；**不发送任何凭据**。
+    """
+    results = probe_online(session)
+    try:
+        ssid, _state = wifi_state()
+    except Exception:
+        ssid = None
+    portal = None
+    if port is not None:
+        try:
+            if portal_reachable(session, port):
+                portal = read_status_page(session, port)
+        except Exception:
+            portal = None
+    status = classify_network(ssid, target_ssid, results, portal)
+    return status, results, portal
 
 
 def status(session: requests.Session, args: argparse.Namespace) -> None:
     ssid, state = wifi_state()
     print("无线网卡状态 : %s（SSID: %s）" % (state, ssid or "未连接"))
     port, port_source = resolve_port(session, args.port)
-    print("Portal 端口  : %d（%s）" % (port, port_source))
-    print("Portal 可达  : %s" % ("是" if portal_reachable(session, port) else "否"))
-    for url, expect in DEFAULT_PROBES:
-        try:
-            resp = session.get(url, timeout=(2.5, 4), allow_redirects=False)
-            ok = resp.status_code == 200 and (expect is None or expect in resp.text)
-            print("公网探测      : %s -> %s" % (url, "通过" if ok else "未通过"))
-        except requests.RequestException as exc:
-            print("公网探测      : %s -> 失败(%s)" % (url, type(exc).__name__))
+    if port is None:
+        print("Portal 端口  : 未解析出（%s）" % port_source)
+        print("Portal 可达  : 否（端口未确定）")
+    else:
+        print("Portal 端口  : %d（%s）" % (port, port_source))
+        print("Portal 可达  : %s" % ("是" if portal_reachable(session, port) else "否"))
+    results = probe_online(session)
+    for result in results:
+        note = "通过" if result.ok else ("失败(%s)" % result.error if result.error else "未通过")
+        print("公网探测      : %s -> %s" % (result.source, note))
+    portal = read_status_page(session, port) if port is not None else None
+    verdict = classify_network(ssid, getattr(args, "ssid", "") or "", results, portal)
+    print("综合判定      : %s" % verdict.value)
     print("凭据已保存    : %s" % ("是" if get_credentials() else "否（先执行 configure）"))
     proxy = read_proxy_settings()
     if proxy:
@@ -449,20 +668,35 @@ def ensure_single_instance(log: logging.Logger) -> bool:
     return True
 
 
+def _mask_account(account: str) -> str:
+    """账号脱敏：仅保留首尾字符（``--dry-run`` 报告用，F20）。"""
+    text = str(account or "")
+    if len(text) <= 2:
+        return "*" * len(text)
+    return "%s%s%s" % (text[0], "*" * (len(text) - 2), text[-1])
+
+
 def dry_run(session: requests.Session, args: argparse.Namespace,
             log: logging.Logger) -> None:
-    """预检：除提交认证外的全部步骤，不发送账号密码。"""
+    """预检：除提交认证外的全部步骤，不发送账号密码（账号脱敏，F20）。"""
     ssid, state = wifi_state()
     print("SSID/状态    : %s / %s" % (ssid or "未连接", state))
     port, source = resolve_port(session, args.port)
-    print("认证端口     : %d（%s）" % (port, source))
-    print("登录页可达   : %s" % ("是" if portal_reachable(session, port) else "否"))
+    if port is None:
+        print("认证端口     : 未解析出（%s）" % source)
+        print("登录页可达   : 否（端口未确定）")
+    else:
+        print("认证端口     : %d（%s）" % (port, source))
+        print("登录页可达   : %s" % ("是" if portal_reachable(session, port) else "否"))
     creds = get_credentials()
     print("凭据已保存   : %s" % ("是" if creds else "否（先执行 configure）"))
     if creds:
         account, _ = creds
-        sent = "%s@%s" % (account, args.yys) if args.account_format == "isp" else account
-        payload = {"sourceurl": "null", "account": sent,
+        if args.account_format == "isp" and args.yys:
+            sent = "%s@%s" % (account, args.yys)
+        else:
+            sent = account
+        payload = {"sourceurl": "null", "account": _mask_account(sent),
                    "password": "***已隐藏***", "yys": args.yys, "issave": ""}
         print("将提交的载荷 : %s" % payload)
     print("dry-run 完成：未发送任何认证请求。")
@@ -470,6 +704,13 @@ def dry_run(session: requests.Session, args: argparse.Namespace,
 
 def watch(session: requests.Session, args: argparse.Namespace,
           log: logging.Logger) -> None:
+    """常驻监测：统一冷却/退避（F09）。
+
+    - ``next_attempt`` 一旦登记，**恢复不抹掉**最短间隔；
+    - 冷却只禁止新的认证，不禁止探测；
+    - 需人工处理（凭据/验证码/结构未知）时停止自动频繁重试；
+    - 全程使用 ``time.monotonic`` 与 ``time.sleep``（测试用虚拟时钟替换）。
+    """
     if not ensure_single_instance(log):
         return
     log.info("开始监测：目标 Wi-Fi=%r，yys=%s，间隔 %d 秒，连续 %d 次失败触发，冷却 %d 秒。",
@@ -477,27 +718,34 @@ def watch(session: requests.Session, args: argparse.Namespace,
              args.threshold, args.cooldown)
     failures = 0
     next_attempt = 0.0
+    needs_user = False
     while True:
         try:
             online, _ = internet_ok(session)
-            if online or args.force:
-                if failures and not args.force:
+            if online:
+                if failures:
                     log.info("公网恢复。")
-                if args.force:
-                    attempt_repair(session, args, log)
-                    return
                 failures = 0
-                next_attempt = 0.0
+                needs_user = False
+                # 注意：**不**重置 next_attempt —— 恢复不抹掉最短重连间隔（F09）
             else:
                 failures += 1
                 if failures < args.threshold:
                     log.info("公网探测失败（%d/%d）。", failures, args.threshold)
                 elif failures == args.threshold:
                     log.warning("连续 %d 次失败，判定疑似掉线。", failures)
-                if failures >= args.threshold and time.monotonic() >= next_attempt:
-                    attempt_repair(session, args, log)
+                if needs_user:
+                    log.warning("需人工处理（凭据/验证码/Portal 结构），暂停自动重连。")
+                elif failures >= args.threshold and time.monotonic() >= next_attempt:
+                    result = attempt_repair(session, args, log)
                     next_attempt = time.monotonic() + args.cooldown
-            time.sleep(args.interval)
+                    if getattr(result, "needs_user", False):
+                        needs_user = True
+            now = time.monotonic()
+            wait = args.interval
+            if now < next_attempt:
+                wait = max(args.interval, next_attempt - now)
+            time.sleep(wait)
         except KeyboardInterrupt:
             log.info("用户终止。")
             return
@@ -506,21 +754,32 @@ def watch(session: requests.Session, args: argparse.Namespace,
             time.sleep(args.interval)
 
 
+def _port_type(value: str) -> int:
+    """CLI 端口参数：接受 1..65535（与动态识别能力一致，F20）。"""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("端口必须是整数")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("端口必须在 1..65535 之间")
+    return port
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SNNU 校园网自动重连助手（Windows）")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("configure", help="把账号密码存入 Windows 凭据管理器")
     p_status = sub.add_parser("status", help="查看 Wi-Fi、Portal、公网与代理绕过状态")
-    p_status.add_argument("--port", type=int, choices=KNOWN_PORTS, default=None,
-                          help="默认动态识别端口；可强制指定已知端口")
+    p_status.add_argument("--port", type=_port_type, default=None,
+                          help="默认动态识别端口；可强制指定 1..65535 的端口")
     sub.add_parser("fix-bypass", help="把 Portal 地址写入系统代理绕过列表")
     for command in ("once", "watch"):
         p = sub.add_parser(command, help="单次尝试" if command == "once" else "常驻自动重连")
         p.add_argument("--ssid", default="SNNU", help="目标校园 Wi-Fi 名称，默认 SNNU")
-        p.add_argument("--port", type=int, choices=KNOWN_PORTS, default=None,
+        p.add_argument("--port", type=_port_type, default=None,
                        help="Portal 认证端口；默认动态识别，失效时可强制指定")
-        p.add_argument("--yys", default="mobile",
+        p.add_argument("--yys", choices=("mobile", "unicom", "telecom", ""), default="mobile",
                        help="运营商: mobile(移动)/unicom(联通)/telecom(电信)/''(默认校园网)")
         p.add_argument("--account-format", choices=("plain", "isp"), default="plain",
                        help="账号提交格式: plain=学号(默认, 同浏览器表单); isp=学号@运营商")
@@ -528,9 +787,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="失败时打开不走系统代理的 Edge 登录页")
         p.add_argument("--reconnect-wifi", action="store_true",
                        help="Wi-Fi 未连接时先用 netsh 尝试重连")
-        p.add_argument("--force", action="store_true",
-                       help="在线也强制执行一次认证（仅 once，会提交真实凭据）")
         if command == "once":
+            p.add_argument("--force", action="store_true",
+                           help="在线也强制执行一次认证（仅 once，会提交真实凭据）")
             p.add_argument("--dry-run", action="store_true",
                            help="只做端口/可达性/凭据预检，不发送认证请求")
         if command == "watch":
@@ -547,11 +806,17 @@ def main() -> None:
     if args.command == "configure":
         configure()
         return
+    # watch 参数校验放在建立会话/任何副作用之前（F20：无效参数无网络/系统副作用）
+    if args.command == "watch":
+        if args.interval < 5 or args.cooldown < 60 or args.threshold < 1:
+            log.error("参数不合法: interval>=5, cooldown>=60, threshold>=1")
+            raise SystemExit(2)
     session = direct_session()
     if args.command == "status":
         status(session, args)
     elif args.command == "fix-bypass":
-        fix_bypass(log)
+        if not fix_bypass(log):
+            raise SystemExit(1)
     elif args.command == "once":
         if args.dry_run:
             dry_run(session, args, log)
@@ -562,12 +827,10 @@ def main() -> None:
         elif online:
             log.info("当前网络正常，无需认证（预检用 --dry-run，强制测试用 --force）。")
             return
-        if not attempt_repair(session, args, log):
+        result = attempt_repair(session, args, log)
+        if not result.ok:
             raise SystemExit(1)
     elif args.command == "watch":
-        if args.interval < 5 or args.cooldown < 60 or args.threshold < 1:
-            log.error("参数不合法: interval>=5, cooldown>=60, threshold>=1")
-            raise SystemExit(2)
         watch(session, args, log)
 
 
