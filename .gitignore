@@ -6,3 +6,15 @@ tray_config.json
 build/
 dist/
 CampusReconnect.exe
+
+# ---- 隔离开发环境（阶段 0 起）----
+.venv/
+venv/
+
+# ---- 测试 / 静态检查缓存 ----
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/

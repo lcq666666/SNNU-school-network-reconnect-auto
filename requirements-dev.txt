@@ -1,0 +1,16 @@
+# 校园网自动重连助手 — 开发/测试/打包依赖清单（骨架）
+#
+# 用法：.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+# 版本锁定在阶段 4（F22）完成。
+
+-r requirements.txt
+
+# ---- 测试 ----
+pytest>=8,<9
+pytest-cov>=5,<7
+
+# ---- 静态检查 ----
+ruff>=0.6,<0.15
+
+# ---- 打包（Windows 可执行文件）----
+pyinstaller>=6,<7

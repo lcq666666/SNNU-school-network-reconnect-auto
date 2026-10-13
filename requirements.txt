@@ -1,0 +1,19 @@
+# 校园网自动重连助手 — 运行依赖清单（骨架）
+#
+# 支持矩阵：
+#   - Python >= 3.10（开发与验证使用 3.13.x）
+#   - 操作系统：Windows 10/11 x64（依赖 winreg / ctypes / tkinter，均为官方 Python 自带）
+#
+# 说明：
+#   - 本文件为阶段 0 的“依赖清单骨架”，版本范围较宽松；
+#     精确版本锁定（lock）在阶段 4（F22）完成，届时以 pyproject.toml / 锁文件为准。
+#   - 安装：.venv/Scripts/python.exe -m pip install -r requirements.txt
+
+# ---- CLI 核心运行依赖（campus_reconnect.py）----
+requests>=2.31,<3
+keyring>=24,<26
+
+# ---- 托盘附加依赖（campus_reconnect_tray.py）----
+# 注意：tkinter 为 Windows 官方 Python 自带的 GUI 库，不属于 pip 依赖，不在此列出。
+pystray>=0.19,<0.20
+pillow>=10,<12
