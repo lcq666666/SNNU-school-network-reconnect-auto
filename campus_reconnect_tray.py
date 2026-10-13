@@ -266,20 +266,21 @@ def save_config(cfg: dict) -> bool:
 # 开机自启（F12 前置：核对命令内容，而非仅判断键是否存在）
 # --------------------------------------------------------------------------- #
 def launcher_command() -> str:
-    """开机自启优先用打包好的 exe；没有 exe 时退回 pythonw + 脚本。"""
-    exe = SCRIPT_DIR / "CampusReconnect.exe"
-    if exe.is_file():
-        return '"%s"' % exe
+    """当前安装对应的自启命令（F21）。
+
+    - **打包模式**：仅启动**当前 exe**（``sys.executable``），不按文件名切换入口，
+      避免调试新分支时点到旁边的旧二进制；
+    - **源码模式**：使用**当前解释器**（``sys.executable`` 同目录的 ``pythonw.exe``）
+      启动本脚本，不再优先相邻 exe。
+    """
+    if getattr(sys, "frozen", False):
+        return '"%s"' % Path(sys.executable).resolve()
     return '"%s" "%s"' % (PYTHONW, SCRIPT_DIR / "campus_reconnect_tray.py")
 
 
-def get_autostart() -> bool:
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH) as key:
-            winreg.QueryValueEx(key, RUN_VALUE_NAME)
-            return True
-    except OSError:
-        return False
+def _normalize_command(text) -> str:
+    """归一化命令文本，用于比较（折叠空白、忽略大小写）。"""
+    return " ".join(str(text or "").strip().split()).lower()
 
 
 def get_autostart_command():
@@ -289,6 +290,28 @@ def get_autostart_command():
             return winreg.QueryValueEx(key, RUN_VALUE_NAME)[0]
     except OSError:
         return None
+
+
+def autostart_matches_current() -> bool:
+    """自启命令是否指向**当前安装**（而非旧路径 / 旧 exe，F21）。"""
+    command = get_autostart_command()
+    return command is not None and \
+        _normalize_command(command) == _normalize_command(launcher_command())
+
+
+def autostart_foreign_command():
+    """存在自启项但指向非当前安装时返回其命令，否则 ``None``。"""
+    command = get_autostart_command()
+    if command is None:
+        return None
+    if _normalize_command(command) == _normalize_command(launcher_command()):
+        return None
+    return command
+
+
+def get_autostart() -> bool:
+    """自启状态：**核对命令内容**，仅当对应当前安装才返回 ``True``（F21）。"""
+    return autostart_matches_current()
 
 
 def set_autostart(enabled: bool) -> bool:
@@ -517,10 +540,17 @@ class TrayApp:
 
     # ---------- 重连核心（F01/F10/F14/F15）----------
     def _repair_adapters(self) -> RepairAdapters:
-        """构造适配器集合：**在调用时**读取模块级函数，便于测试替换（F14）。"""
+        """构造适配器集合：**在调用时**读取模块级函数，便于测试替换（F14）。
+
+        Wi-Fi 重连按配置里的 ``profile`` / ``interface`` 分离指定（F17）：
+        ``netsh wlan connect name=`` 实际按 profile 名操作，profile 未必等于 SSID。
+        """
+        cfg = self.get_config()
         return RepairAdapters(
             wifi_state=wifi_state,
-            wifi_reconnect=lambda ssid: wifi_reconnect(ssid, self.log),
+            wifi_reconnect=lambda ssid: wifi_reconnect(
+                ssid, self.log, profile=cfg.get("profile"),
+                interface=cfg.get("interface")),
             resolve_port=resolve_port,
             portal_reachable=portal_reachable,
             probe_online=internet_ok,
@@ -902,6 +932,18 @@ class TrayApp:
 
     def on_toggle_autostart(self, icon=None, item=None):
         target = not get_autostart()
+        if target:
+            foreign = autostart_foreign_command()
+            if foreign:
+                # 外部旧路径：先确认再接管，不静默覆盖（F21）
+                answer = self._ui_ask(
+                    "开机自启",
+                    "检测到已存在的自启项指向其他位置：\n%s\n\n是否改为当前安装路径？" % foreign)
+                if answer is not True:
+                    self.notify("开机自启未更改", "已保留原有自启项")
+                    if self.icon is not None:
+                        self.icon.update_menu()
+                    return
         if set_autostart(target):
             self.notify("开机自启已%s" % ("开启" if target else "关闭"),
                         "登录 Windows 后自动启动托盘助手" if target else "不再自动启动")
@@ -1139,8 +1181,14 @@ class TrayApp:
                 if "clash_auto_proxy" in changes:
                     with self._config_lock:
                         self._consent_version += 1
-            if bool(v_auto.get()) != initial["autostart"]:
-                if not set_autostart(bool(v_auto.get())):
+            want_autostart = bool(v_auto.get())
+            if want_autostart != initial["autostart"]:
+                foreign = autostart_foreign_command() if want_autostart else None
+                if foreign and not messagebox.askyesno(
+                        "开机自启",
+                        "检测到已存在的自启项指向其他位置：\n%s\n\n是否改为当前安装路径？" % foreign):
+                    messagebox.showinfo("开机自启", "已保留原有自启项")
+                elif not set_autostart(want_autostart):
                     messagebox.showerror("设置失败", "无法写入开机自启注册表项")
                     return
             self.notify("设置已保存", "新参数即时生效")
