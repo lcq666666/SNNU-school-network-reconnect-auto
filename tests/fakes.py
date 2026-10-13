@@ -45,6 +45,8 @@ class FakeRegistry:
     - 句柄按 ``access`` 位判定读写权限：缺少 ``KEY_QUERY_VALUE`` 时
       ``QueryValueEx`` 抛 ``PermissionError``（复现 F04 的权限缺陷）；
     - 可注入 ``deny_open`` / ``deny_query`` / ``deny_set`` 模拟拒绝；
+    - ``set_failures`` 按 ``SetValueEx`` 调用顺序脚本化失败（``True`` 表示该次抛错），
+      用于构造「写入中途失败 / 回滚失败」（F04/T09）；
     - 记录每次写入，便于断言“部分写入”。
     """
 
@@ -57,11 +59,14 @@ class FakeRegistry:
 
     def __init__(self, values: Optional[Dict[str, Any]] = None,
                  deny_open: bool = False, deny_query: bool = False,
-                 deny_set: bool = False) -> None:
+                 deny_set: bool = False,
+                 set_failures: Optional[List[bool]] = None) -> None:
         self.values: Dict[str, Any] = dict(values or {})
         self.deny_open = deny_open
         self.deny_query = deny_query
         self.deny_set = deny_set
+        self.set_failures: List[bool] = list(set_failures or [])
+        self.set_calls = 0
         self.open_access: List[int] = []
         self.writes: List[Tuple[str, Any]] = []
         self.deletes: List[str] = []
@@ -84,8 +89,12 @@ class FakeRegistry:
 
     def SetValueEx(self, key: FakeRegistryKey, name: str, reserved: int,
                    type_: int, value: Any) -> None:
+        self.set_calls += 1
         if self.deny_set or not (key.access & self.KEY_SET_VALUE):
             raise PermissionError("SetValueEx denied")
+        index = self.set_calls - 1
+        if index < len(self.set_failures) and self.set_failures[index]:
+            raise PermissionError("SetValueEx denied (scripted)")
         self.values[name] = value
         self.writes.append((name, value))
 
@@ -106,7 +115,11 @@ class FakeRegistry:
 # 凭据后端
 # --------------------------------------------------------------------------- #
 class FakeKeyring:
-    """模拟 ``keyring``：可注入读取异常与“第二条写入失败”。"""
+    """模拟 ``keyring``：可注入读取异常与「某个键的首次写入失败」。
+
+    ``fail_set_on`` 指定的键**第一次**写入时抛错（之后可正常写入），用于构造
+    「先写 username 成功、再写 password 失败」以及随后的恢复路径（F11/T22）。
+    """
 
     def __init__(self, values: Optional[Dict[Tuple[str, str], str]] = None,
                  fail_set_on: Optional[str] = None, raise_get: bool = False) -> None:
@@ -115,6 +128,7 @@ class FakeKeyring:
         self.raise_get = raise_get
         self.set_calls: List[Tuple[str, str, str]] = []
         self.delete_calls: List[Tuple[str, str]] = []
+        self._failed_keys: set = set()
 
     def get_password(self, service: str, username: str) -> Optional[str]:
         if self.raise_get:
@@ -123,7 +137,9 @@ class FakeKeyring:
 
     def set_password(self, service: str, username: str, password: str) -> None:
         self.set_calls.append((service, username, password))
-        if self.fail_set_on and username == self.fail_set_on:
+        if (self.fail_set_on and username == self.fail_set_on
+                and username not in self._failed_keys):
+            self._failed_keys.add(username)
             raise RuntimeError("write denied")
         self.values[(service, username)] = password
 

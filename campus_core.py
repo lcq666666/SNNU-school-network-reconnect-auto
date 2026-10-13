@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -29,9 +29,10 @@ __all__ = [
     "E_PROBE_UNRELIABLE", "E_PORTAL_UNREACHABLE", "E_AUTH_REJECTED",
     "E_AUTH_CAPTCHA", "E_PORTAL_STRUCTURE_UNKNOWN", "E_PROXY_ENDPOINT_INVALID",
     "E_PROXY_WRITE", "E_NETS_FAILED", "E_CANCELLED",
-    "Secret", "Config", "ConfigIssue", "ConfigLoadResult",
+    "MISSING", "Secret", "Config", "ConfigIssue", "ConfigLoadResult",
     "ProbeResult", "PortalStatus", "RepairResult", "PortalResolution",
-    "BrowserLaunchResult", "Scheduler",
+    "BrowserLaunchResult", "ProxyApplyResult", "CredentialLoad",
+    "CredentialSave", "CredentialClear", "Scheduler",
     "validate_config", "load_config_text", "load_config_file", "default_config",
 ]
 
@@ -201,6 +202,22 @@ class ConfigLoadResult:
 # --------------------------------------------------------------------------- #
 # 结果模型
 # --------------------------------------------------------------------------- #
+class _Missing:
+    """「原本不存在」哨兵：用于区分「注册表值缺失」与「值为 None」。"""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<missing>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+#: 哨兵实例：表示某个注册表值在修改前**不存在**（回滚时应删除）。
+MISSING = _Missing()
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     """单个连通性探测结果（**不含响应正文**）。
@@ -295,6 +312,75 @@ class BrowserLaunchResult:
     executable: Optional[str] = None
     error: Optional[str] = None
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class ProxyApplyResult:
+    """系统代理写入结果（F04 / F05）。
+
+    - ``ok``：整个事务（含 Windows 刷新通知）是否成功；
+    - ``changed``：注册表是否实际发生了变更；
+    - ``enabled`` / ``endpoint``：本次目标状态与端点；
+    - ``error_code``：取自 :data:`ERROR_CODES`，失败时给出可区分原因；
+    - ``rollback_ok``：发生失败后是否成功回滚（``None`` = 无需回滚）；
+    - ``refresh_ok``：``InternetSetOptionW`` 等刷新通知是否成功（``None`` = 未尝试）；
+    - ``changes``：本次实际写入的 ``(名称, 旧值, 新值)``，旧值为 :data:`MISSING` 表示原本不存在；
+    - ``before`` / ``after``：修改前后的完整快照（脱敏，仅代理相关值）。
+
+    约定：``ok is True`` 才可对外声称“已成功切换系统代理”；注册表写成功
+    不等于所有应用立即采用，``refresh_ok`` 单独报告。
+    """
+
+    ok: bool = False
+    changed: bool = False
+    enabled: Optional[bool] = None
+    endpoint: Optional[str] = None
+    error_code: Optional[str] = None
+    detail: str = ""
+    rollback_ok: Optional[bool] = None
+    refresh_ok: Optional[bool] = None
+    changes: Tuple[Tuple[str, Any, Any], ...] = ()
+    before: Optional[Dict[str, Any]] = None
+    after: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class CredentialLoad:
+    """凭据读取结果（F11）。
+
+    ``ok`` 为 ``True`` 时 ``username`` 与 ``password`` 有效；失败时
+    ``error_code`` 区分「尚未配置」（``E_CRED_MISSING``）与「后端不可用」
+    （``E_CRED_BACKEND``），不得把两者混同。
+    """
+
+    ok: bool = False
+    username: Optional[str] = None
+    password: Secret = field(default_factory=Secret)
+    error_code: Optional[str] = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class CredentialSave:
+    """凭据写入结果（F11）。
+
+    Windows 凭据管理器没有跨键事务：先写 username 再写 password，第二步失败
+    时尝试恢复旧对。``rolled_back`` 单独报告恢复是否成功（``None`` = 未尝试）。
+    """
+
+    ok: bool = False
+    error_code: Optional[str] = None
+    detail: str = ""
+    rolled_back: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class CredentialClear:
+    """凭据清除结果（F11）。"""
+
+    ok: bool = False
+    error_code: Optional[str] = None
+    detail: str = ""
 
 
 # --------------------------------------------------------------------------- #
