@@ -1,21 +1,14 @@
 # -*- coding: utf-8 -*-
-"""F15 回归用例：空运营商被 mobile 覆盖（对应 T27）。
+"""F15 空运营商端到端保留（对应 T27）。
 
-依据《审查方案》第 10 节离线复现：
-``empty_yys_sent= 'mobile'`` —— 托盘 ``repair_once()`` 里
-``cfg.get("yys") or "mobile"`` 把**合法空串**改写成 mobile。
-
-**本文件在修复前必须失败**（阶段 3 修复后转绿）。
+阶段 3 修复后由回归集合并入默认集合。要点：仅缺失键使用默认值；空串端到端
+保留；托盘 ``repair_once`` 经共享服务把 ``yys=""`` 原样传给 ``portal_login``。
 """
 from __future__ import annotations
 
 import logging
 
-import pytest
-
 import campus_reconnect_tray as tray
-
-pytestmark = pytest.mark.regression
 
 LOG = logging.getLogger("campus")
 
@@ -50,3 +43,17 @@ def test_t27_empty_operator_is_preserved_end_to_end(monkeypatch):
 
     assert captured.get("yys") == "", \
         "空运营商被改写为 %r（应为空串）" % captured.get("yys")
+
+
+def test_t27_missing_operator_falls_back_to_default():
+    """仅**缺失**键使用默认值（mobile）。"""
+    from campus_core import RepairOptions
+    options = RepairOptions.from_mapping({"ssid": "SNNU"})
+    assert options.operator == "mobile"
+
+
+def test_t27_none_operator_falls_back_to_default():
+    """无效 None 按校验规则处理为默认值。"""
+    from campus_core import RepairOptions
+    options = RepairOptions.from_mapping({"yys": None})
+    assert options.operator == "mobile"
