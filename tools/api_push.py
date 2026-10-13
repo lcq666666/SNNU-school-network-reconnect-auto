@@ -106,6 +106,8 @@ def main() -> int:
     print("remote ref", branch, "->", parent)
 
     # 重建本地提交以匹配远端 SHA（GitHub 去掉消息末尾换行）
+    # 注意：必须用 %aI/%cI（保留原始时区偏移），否则本地重建的 committer date
+    # 会变成 +0000，导致 SHA 与远端（+0800 等）不一致。
     p = base
     for c in commits:
         ctree = git("rev-parse", f"{c}^{{tree}}")
@@ -113,10 +115,10 @@ def main() -> int:
         env.update({
             "GIT_AUTHOR_NAME": git("log", "-1", "--format=%an", c),
             "GIT_AUTHOR_EMAIL": git("log", "-1", "--format=%ae", c),
-            "GIT_AUTHOR_DATE": f"{git('log', '-1', '--format=%at', c)} +0000",
+            "GIT_AUTHOR_DATE": git("log", "-1", "--format=%aI", c),
             "GIT_COMMITTER_NAME": git("log", "-1", "--format=%cn", c),
             "GIT_COMMITTER_EMAIL": git("log", "-1", "--format=%ce", c),
-            "GIT_COMMITTER_DATE": f"{git('log', '-1', '--format=%ct', c)} +0000",
+            "GIT_COMMITTER_DATE": git("log", "-1", "--format=%cI", c),
         })
         msg = git("log", "-1", "--format=%B", c).rstrip("\n")
         p = run(["git", "commit-tree", ctree, "-p", p], input=msg.encode("utf-8"),
