@@ -47,8 +47,15 @@
   ```bash
   http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= git push origin fix/reconnect-stability-20261013
   ```
-- 若 `github.com:443` 被网络干扰导致 git 推送失败：本机 PAT 已存入 `~/.git-credentials`（`credential.helper=store`）；
-  网络干扰时可用 `api.github.com`（始终畅通）更新分支 ref 作为替代（见《个人环境备忘》）。
+- **本机实测**：`github.com` 的 git 推送会被网络限速/重置而挂起（`git ls-remote` 可用，但 pack 上传卡死 6 分钟无进展），
+  而 `api.github.com` 始终畅通。因此**推荐直接用仓库内工具完成推送**（`git push` 仅作备用）：
+  ```bash
+  .venv/Scripts/python.exe tools/api_push.py <远端分支当前SHA>
+  ```
+  该工具用 GitHub Git Data API 上传 blob/tree/commit 并更新分支 ref，随后把本地分支重建为与远端一致的 SHA。
+  （原因：GitHub 会去掉提交信息末尾换行，`git push` 与 API 两条路径的 commit SHA 会不同；
+  工具统一采用 API 版本并同步本地，保证 local == remote，后续可快进推送。）
+- 凭据：PAT 已存入 `~/.git-credentials`（`credential.helper=store`），工具自动读取，**不打印、不入库**。
 - **绝不推送 `main`**；不 force push；不覆盖 v0.1 产物。
 
 ---
