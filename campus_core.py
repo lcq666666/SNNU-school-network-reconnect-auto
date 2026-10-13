@@ -27,17 +27,17 @@ from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
 from urllib.parse import urljoin, urlsplit
 
 __all__ = [
-    "SCHEMA_VERSION", "OPERATORS", "ACCOUNT_FORMATS",
+    "__version__", "SCHEMA_VERSION", "OPERATORS", "ACCOUNT_FORMATS",
     "INTERVAL_RANGE", "THRESHOLD_RANGE", "COOLDOWN_RANGE",
     "ERROR_CODES", "ERROR_MESSAGES",
     "E_CONFIG_INVALID", "E_CONFIG_IO", "E_CRED_MISSING", "E_CRED_BACKEND",
     "E_PROBE_UNRELIABLE", "E_PORTAL_UNREACHABLE", "E_AUTH_REJECTED",
     "E_AUTH_CAPTCHA", "E_PORTAL_STRUCTURE_UNKNOWN", "E_PROXY_ENDPOINT_INVALID",
-    "E_PROXY_WRITE", "E_NETS_FAILED", "E_CANCELLED",
+    "E_PROXY_WRITE", "E_NETS_FAILED", "E_CANCELLED", "E_MUTEX_FAILED",
     "MISSING", "Secret", "Config", "ConfigIssue", "ConfigLoadResult",
     "ProbeResult", "PortalStatus", "RepairResult", "PortalResolution",
     "BrowserLaunchResult", "ProxyApplyResult", "CredentialLoad",
-    "CredentialSave", "CredentialClear", "Scheduler",
+    "CredentialSave", "CredentialClear", "SingleInstanceResult", "Scheduler",
     "validate_config", "load_config_text", "load_config_file", "default_config",
     # ---- 阶段 3：共享重连服务、状态页解析、重定向与探测分类 ----
     "ONLINE_MARKER", "MAX_BODY_BYTES", "PROBE_EXACT", "PROBE_HTML_TITLE",
@@ -52,6 +52,9 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # 版本与取值范围
 # --------------------------------------------------------------------------- #
+#: 应用版本（唯一来源；``pyproject.toml`` 与打包版本资源均应与之一致，F22）。
+__version__ = "0.2.0"
+
 SCHEMA_VERSION = 1
 
 #: 运营商（对应 Portal 表单字段 ``yys``）；空串是**合法值**（默认校园网线路）。
@@ -81,6 +84,8 @@ E_PROXY_ENDPOINT_INVALID = "E_PROXY_ENDPOINT_INVALID"
 E_PROXY_WRITE = "E_PROXY_WRITE"
 E_NETS_FAILED = "E_NETS_FAILED"
 E_CANCELLED = "E_CANCELLED"
+#: 单实例互斥体创建失败（fail-closed：拒绝后台认证 / 降级只读，F18）。
+E_MUTEX_FAILED = "E_MUTEX_FAILED"
 
 #: 错误码 -> 面向用户的中文说明（不含任何敏感信息）。
 ERROR_MESSAGES: Dict[str, str] = {
@@ -97,6 +102,7 @@ ERROR_MESSAGES: Dict[str, str] = {
     E_PROXY_WRITE: "写入系统代理设置失败",
     E_NETS_FAILED: "Wi-Fi 重连失败",
     E_CANCELLED: "操作已取消（暂停或退出）",
+    E_MUTEX_FAILED: "单实例互斥体创建失败，已拒绝后台认证（fail-closed）",
 }
 
 ERROR_CODES = frozenset(ERROR_MESSAGES)
@@ -399,6 +405,27 @@ class CredentialClear:
     ok: bool = False
     error_code: Optional[str] = None
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class SingleInstanceResult:
+    """单实例互斥体获取结果（F18）。
+
+    - ``ok=True``：成功持有互斥体（或非 Windows 平台直接放行）；
+    - ``already_running=True``：已有实例在运行（``ERROR_ALREADY_EXISTS``），
+      调用方应退出；
+    - ``ok=False, already_running=False``：创建失败（fail-closed），调用方应
+      **拒绝后台认证**或降级为只读，而不是继续。
+    """
+
+    ok: bool = False
+    already_running: bool = False
+    error_code: Optional[str] = None
+    detail: str = ""
+
+    @property
+    def failed_closed(self) -> bool:
+        return not self.ok and not self.already_running
 
 
 # --------------------------------------------------------------------------- #
@@ -838,7 +865,7 @@ def classify_network(wifi_ssid: Optional[str], target_ssid: Optional[str],
     if target:
         if not wifi_present or not wifi_ssid:
             return PortalStatus.WIFI_DISCONNECTED
-        if wifi_ssid.strip().casefold() != target.casefold():
+        if wifi_ssid.strip() != target:   # F17：完整比较，大小写不同即非目标
             return PortalStatus.NON_TARGET
     if any(r.ok for r in probe_results):
         return PortalStatus.ONLINE
@@ -982,10 +1009,14 @@ def _as_login_outcome(raw: Any) -> LoginOutcome:
 
 
 def _ssid_matches(ssid: Optional[str], target: str) -> bool:
-    """目标网络匹配（大小写不敏感；SSID 精确化留待阶段 4 的 F17）。"""
+    """目标网络匹配（F17：**完整**比较，不做大小写折叠）。
+
+    大小写不同视为**不同**网络，避免把 ``snnu`` 误当成 ``SNNU`` 而在非目标网络上
+    提交凭据；SSID 本身也不是可信的网络身份证明，仅作必要条件。
+    """
     if not ssid:
         return False
-    return ssid.strip().casefold() == target.strip().casefold()
+    return ssid.strip() == target.strip()
 
 
 def repair_service(session: Any, options: RepairOptions, clock: Callable[[], float],

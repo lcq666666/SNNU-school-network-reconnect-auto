@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import getpass
 import logging
 import logging.handlers
@@ -35,7 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 try:
@@ -53,7 +52,9 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          check_redirect_target, classify_network,
                          extract_error_hint, parse_status_page, probe_matches,
                          repair_service, resolve_url)
-from campus_windows import CredentialStore
+from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
+                            parse_ipconfig_ipv4, parse_netsh_interfaces,
+                            wifi_state_from_text)
 
 if os.name == "nt":
     import winreg
@@ -288,51 +289,103 @@ def portal_reachable(session: requests.Session, port: int) -> bool:
         return False
 
 
-def wifi_state() -> Tuple[Optional[str], str]:
-    """返回 (ssid, 状态)。未连接无线时 ssid 为 None。"""
+def _decode_console(data: bytes) -> str:
+    """解码 netsh/ipconfig 控制台输出（UTF-8 → GBK → 本地代码页兜底）。"""
+    for enc in ("utf-8", "gbk"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    try:
+        import locale
+        return data.decode(locale.getpreferredencoding(False), errors="replace")
+    except LookupError:
+        return data.decode("utf-8", errors="replace")
+
+
+def _run_console(args, timeout: float = 5.0) -> Tuple[Optional[int], str]:
+    """运行控制台命令；返回 ``(returncode|None, 文本)``（``None`` 表示启动/超时失败）。"""
+    try:
+        done = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    return done.returncode, _decode_console(done.stdout)
+
+
+def wifi_interfaces() -> List[WifiInterface]:
+    """读取并解析全部无线接口（F17）；无接口 / 命令失败返回空列表。"""
+    if os.name != "nt":
+        return []
+    code, text = _run_console(["netsh", "wlan", "show", "interfaces"])
+    if code != 0:
+        return []
+    return parse_netsh_interfaces(text)
+
+
+def wifi_state(interface: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """返回 ``(当前 SSID|None, 状态)``（F17）。
+
+    - 按接口块解析，SSID 与 BSSID 分开；**检查 netsh 返回码**；
+    - 无无线接口 → ``(None, "no-wireless")``：明确“不支持自动认证”，不误报已连接；
+    - 多网卡 / 有线场景不会凭公网可达推断校园链路。
+    """
     if os.name != "nt":
         return None, "non-windows"
-    try:
-        done = subprocess.run(["netsh", "wlan", "show", "interfaces"],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=5, check=False)
-        data = done.stdout
-        text = None
-        for enc in ("utf-8", "gbk", "locale"):
-            try:
-                if enc == "locale":
-                    import locale
-                    text = data.decode(locale.getpreferredencoding(False), errors="replace")
-                else:
-                    text = data.decode(enc)
-                break
-            except (UnicodeDecodeError, LookupError):
-                continue
-        if text is None:
-            text = data.decode("utf-8", errors="replace")
-        ssid, state = None, "unknown"
-        for line in text.splitlines():
-            low = line.strip().lower()
-            if low.startswith("ssid") and "bssid" not in low and ssid is None:
-                ssid = line.split(":", 1)[1].strip()
-            elif low.startswith("状态") or low.startswith("state"):
-                state = line.split(":", 1)[1].strip()
-        return ssid, state
-    except (OSError, subprocess.TimeoutExpired):
+    code, text = _run_console(["netsh", "wlan", "show", "interfaces"])
+    if code is None or code != 0:
         return None, "error"
+    return wifi_state_from_text(text, interface=interface)
 
 
-def wifi_reconnect(ssid: str, log: logging.Logger) -> bool:
+def _ipv4_ready(interface: Optional[str] = None) -> bool:
+    """本机是否已获得可用 IPv4 地址（连接后等待就绪，F17）。"""
+    code, text = _run_console(["ipconfig"])
+    if code is None:
+        return False
+    return parse_ipconfig_ipv4(text, interface)
+
+
+def wifi_reconnect(ssid: str, log: logging.Logger, profile: Optional[str] = None,
+                   interface: Optional[str] = None,
+                   wait: Optional[Callable[[], bool]] = None,
+                   timeout: float = 30.0) -> bool:
+    """用 netsh 连接目标网络，并等待 IP 就绪（F17）。
+
+    - ``profile`` 给定时按 **profile 名**连接（``netsh wlan connect name=`` 实际按
+      profile 操作，未必等于 SSID）；否则用 SSID 作为 profile 名；
+    - 连接后轮询 ``wait``（默认本机 IPv4 就绪）直到 ``timeout``，避免刚发起就断言成功；
+    - 命令失败 / 超时 / 未就绪均返回 ``False``，由上层如实报告。
+    """
+    name = (profile or ssid or "").strip()
+    if not name:
+        log.warning("Wi-Fi 重连失败：未提供 SSID/profile 名")
+        return False
+    args = ["netsh", "wlan", "connect", "name=%s" % name]
+    if interface:
+        args.append("interface=%s" % interface)
     try:
-        done = subprocess.run(["netsh", "wlan", "connect", "name=%s" % ssid],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        done = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=10, check=False)
-        ok = done.returncode == 0
-        log.info("netsh 重连 Wi-Fi %s: %s", ssid, "已发起" if ok else "失败")
-        return ok
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("netsh 重连 Wi-Fi 异常: %s", type(exc).__name__)
         return False
+    if done.returncode != 0:
+        log.info("netsh 重连 Wi-Fi %s: 失败（返回码 %s）", name, done.returncode)
+        return False
+    log.info("netsh 已发起连接 Wi-Fi %s，等待 IP 就绪…", name)
+    ready = wait or (lambda: _ipv4_ready(interface))
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        try:
+            if ready():
+                log.info("Wi-Fi %s 已获得可用地址。", name)
+                return True
+        except Exception as exc:
+            log.warning("等待 IP 就绪异常: %s", type(exc).__name__)
+        time.sleep(2.0)
+    log.warning("Wi-Fi %s 连接后 %d 秒内未获得可用 IP/路由。", name, int(timeout))
+    return False
 
 
 def get_credentials() -> Optional[Tuple[str, str]]:
@@ -648,23 +701,29 @@ def status(session: requests.Session, args: argparse.Namespace) -> None:
           "以本页 Portal 可达 + 直连探测综合判断。")
 
 
-_MUTEX_HANDLE = None
+_SINGLE_INSTANCE_GUARD: Optional[SingleInstanceGuard] = None
 
 
 def ensure_single_instance(log: logging.Logger) -> bool:
-    """watch 单实例保护：防止 run.bat 重复双击或与任务计划叠加运行。"""
-    global _MUTEX_HANDLE
+    """进程级单实例保护（F18）。
+
+    使用**正确声明 ABI** 的命名互斥体（``CreateMutexW`` 的 ``argtypes``/``restype``
+    已声明，``HANDLE`` 按指针宽度处理）；持有可关闭句柄避免 GC 失效。
+    创建失败时 **fail-closed**：返回 ``False`` 拒绝启动后台认证，不再 fail-open 继续。
+    ``once`` 与 ``watch``/托盘共用同一互斥体，避免 ``watch`` 单实例被 ``once`` 绕过。
+    """
+    global _SINGLE_INSTANCE_GUARD
     if os.name != "nt":
         return True
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    handle = kernel32.CreateMutexW(None, False, "SNNU_CampusReconnect_Watch_Mutex")
-    if not handle:
-        log.warning("无法创建单实例互斥体，继续运行。")
-        return True
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+    guard = SingleInstanceGuard(log=log)
+    result = guard.acquire()
+    if result.already_running:
         log.error("已有一个监控实例在运行，本次退出（互斥体保护）。")
         return False
-    _MUTEX_HANDLE = handle  # 保持引用，避免 GC 关闭句柄导致互斥体失效
+    if not result.ok:
+        log.error("%s（fail-closed，拒绝后台认证）", result.detail)
+        return False
+    _SINGLE_INSTANCE_GUARD = guard   # 持有句柄引用，进程存活期间保持互斥
     return True
 
 
@@ -821,6 +880,9 @@ def main() -> None:
         if args.dry_run:
             dry_run(session, args, log)
             return
+        # F18：once 认证与 watch/托盘共用同一进程级互斥体（fail-closed）
+        if not ensure_single_instance(log):
+            raise SystemExit(1)
         online, _ = internet_ok(session)
         if args.force and online:
             log.warning("--force：当前网络正常，仍将提交一次真实认证（仅用于接口验证）。")

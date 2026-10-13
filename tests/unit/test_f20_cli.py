@@ -67,6 +67,8 @@ def test_t32_help_exits_zero():
 # --------------------------------------------------------------------------- #
 def _stub_logging(monkeypatch):
     monkeypatch.setattr(engine, "setup_logging", lambda verbose: LOG)
+    # F18：once 认证会获取进程级互斥体；测试中替换为直接放行，避免真实系统副作用。
+    monkeypatch.setattr(engine, "ensure_single_instance", lambda log: True)
 
 
 def test_t32_fix_bypass_failure_exits_nonzero(monkeypatch):

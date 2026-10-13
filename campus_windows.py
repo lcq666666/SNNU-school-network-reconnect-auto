@@ -19,17 +19,24 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
-from typing import Any, Callable, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple)
 
-from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, E_PROXY_ENDPOINT_INVALID,
-                         E_PROXY_WRITE, MISSING, CredentialClear, CredentialLoad,
-                         CredentialSave, ProxyApplyResult, Secret)
+from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, E_MUTEX_FAILED,
+                         E_PROXY_ENDPOINT_INVALID, E_PROXY_WRITE, MISSING,
+                         CredentialClear, CredentialLoad, CredentialSave,
+                         ProxyApplyResult, Secret, SingleInstanceResult)
 
 __all__ = [
     "LOCAL_HOSTS", "PROXY_REG_PATH", "parse_endpoint", "tcp_probe",
     "validate_proxy_endpoint", "default_refresh", "ProxyController",
     "CredentialStore", "AutostartController",
+    # ---- 阶段 4：Wi-Fi 解析（F17）与单实例互斥体（F18）----
+    "WifiInterface", "CONNECTED_STATES", "parse_netsh_interfaces",
+    "select_wifi_interface", "wifi_state_from_text", "parse_ipconfig_ipv4",
+    "MUTEX_NAME", "SingleInstanceGuard", "acquire_single_instance",
 ]
 
 PROXY_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -389,3 +396,270 @@ class AutostartController:
             return True
         except OSError:
             return False
+
+
+# --------------------------------------------------------------------------- #
+# Wi-Fi 解析（F17）
+# --------------------------------------------------------------------------- #
+#: netsh 键名（中 / 英）。**SSID 与 BSSID 必须分开匹配**，避免整行子串误判。
+_NAME_KEYS = frozenset({"name", "名称"})
+_SSID_KEYS = frozenset({"ssid"})
+_BSSID_KEYS = frozenset({"bssid"})
+_PROFILE_KEYS = frozenset({"profile", "配置文件"})
+_STATE_KEYS = frozenset({"state", "状态"})
+
+#: 视为“已连接”的状态文本（中 / 英）。
+CONNECTED_STATES = frozenset({"connected", "已连接"})
+
+#: 视为“未连接”的状态文本（用于明确区分，不做无根据推断）。
+DISCONNECTED_STATES = frozenset({"disconnected", "已断开", "未连接"})
+
+
+@dataclass(frozen=True)
+class WifiInterface:
+    """一个无线接口块的结构化结果（F17）。
+
+    ``ssid`` / ``profile`` 分开保存：``netsh wlan connect name=`` 实际按 **profile**
+    名操作，profile 未必等于 SSID（企业/多配置场景）。
+    """
+
+    name: str = ""
+    ssid: Optional[str] = None
+    bssid: Optional[str] = None
+    profile: Optional[str] = None
+    state: str = ""
+
+    @property
+    def connected(self) -> bool:
+        return self.state.strip().lower() in CONNECTED_STATES
+
+    @property
+    def disconnected(self) -> bool:
+        return self.state.strip().lower() in DISCONNECTED_STATES
+
+    def matches_ssid(self, target: str) -> bool:
+        """**完整**匹配 SSID（不做大小写折叠，见 F17）。"""
+        return bool(self.ssid) and self.ssid.strip() == (target or "").strip()
+
+
+def _iter_blocks(text: str) -> List[str]:
+    """按空行切分接口块（netsh / ipconfig 的通用分块方式）。"""
+    return [block for block in re.split(r"\r?\n\s*\r?\n", text or "") if block.strip()]
+
+
+def _parse_interface_block(block: str) -> Optional[WifiInterface]:
+    """解析单个接口块；每行按**第一个冒号**切分键值，无法识别的块返回 ``None``。"""
+    name = ssid = bssid = profile = state = None
+    for line in block.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key_l = key.strip().lower()
+        value = value.strip()
+        if key_l in _NAME_KEYS:
+            name = value
+        elif key_l in _BSSID_KEYS:      # 先判 BSSID，避免被 SSID 规则吞掉
+            bssid = value
+        elif key_l in _SSID_KEYS:
+            ssid = value
+        elif key_l in _PROFILE_KEYS:
+            profile = value
+        elif key_l in _STATE_KEYS:
+            state = value
+    if name is None and ssid is None and profile is None and state is None:
+        return None
+    return WifiInterface(name=name or "", ssid=ssid, bssid=bssid,
+                         profile=profile, state=state or "")
+
+
+def parse_netsh_interfaces(text: str) -> List[WifiInterface]:
+    """按**接口块**解析 ``netsh wlan show interfaces`` 输出（F17）。
+
+    修正原实现的三处缺陷：整行 ``"bssid" not in low`` 会误杀 SSID 含 "BSSID" 的行；
+    多接口时把“第一个 SSID”与“最后一个状态”错配；不检查返回码 / 假设冒号存在。
+    无有效接口时返回空列表（由调用方明确“不支持自动认证”，不误报）。
+    """
+    interfaces: List[WifiInterface] = []
+    for block in _iter_blocks(text):
+        iface = _parse_interface_block(block)
+        if iface is not None:
+            interfaces.append(iface)
+    return interfaces
+
+
+def select_wifi_interface(interfaces: Sequence[WifiInterface], ssid: str = "",
+                          interface: Optional[str] = None,
+                          ) -> Optional[WifiInterface]:
+    """在接口集合里选择目标接口（F17）。
+
+    优先级：名称过滤（若给定）→ SSID **完整**匹配 → 第一个“已连接且有 SSID”的接口
+    → 第一个接口。找不到任何接口时返回 ``None``。
+    """
+    pool = list(interfaces)
+    if interface:
+        want = interface.strip().casefold()
+        pool = [i for i in pool if i.name.strip().casefold() == want]
+    if not pool:
+        return None
+    target = (ssid or "").strip()
+    if target:
+        for iface in pool:
+            if iface.matches_ssid(target):
+                return iface
+    for iface in pool:
+        if iface.connected and iface.ssid:
+            return iface
+    return pool[0]
+
+
+def wifi_state_from_text(text: str, ssid: str = "",
+                         interface: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """从 netsh 文本得到 ``(当前 SSID|None, 状态)``（F17）。
+
+    - 无任何无线接口 → ``(None, "no-wireless")``，供上层明确“不支持自动认证”；
+    - 仅返回**已连接接口**的 SSID，不再混用不同接口的 SSID/状态。
+    """
+    interfaces = parse_netsh_interfaces(text)
+    if not interfaces:
+        return None, "no-wireless"
+    iface = select_wifi_interface(interfaces, ssid, interface)
+    if iface is None:
+        return None, "unknown"
+    if iface.disconnected:        # 明确断开：不返回 SSID，避免误判为已连接
+        return None, (iface.state or "disconnected")
+    return (iface.ssid or None), (iface.state or "unknown")
+
+
+_IPV4_KEY_HINTS = ("ipv4", "ip 地址", "ip address")
+
+
+def _valid_ipv4(addr: str) -> bool:
+    """是否为可用（非 link-local / 非 0.0.0.0）的 IPv4 地址。"""
+    addr = addr.split("(")[0].strip()
+    parts = addr.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return False
+    if not all(0 <= int(p) <= 255 for p in parts):
+        return False
+    return addr != "0.0.0.0" and not addr.startswith("169.254.")
+
+
+def parse_ipconfig_ipv4(text: str, interface: Optional[str] = None) -> bool:
+    """判断 ``ipconfig`` 输出里是否已有可用 IPv4 地址（F17）。
+
+    ``interface`` 给定时仅检查包含该名称的适配器块。用于“连接后等待 IP 就绪再判定”，
+    避免刚发起连接就断言成功。
+    """
+    for block in _iter_blocks(text or ""):
+        if interface and interface.strip().casefold() not in block.casefold():
+            continue
+        for line in block.splitlines():
+            low = line.lower()
+            if any(hint in low for hint in _IPV4_KEY_HINTS):
+                _, _, value = line.partition(":")
+                if _valid_ipv4(value):
+                    return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# 单实例互斥体（F18）
+# --------------------------------------------------------------------------- #
+#: 互斥体名。**不加 ``Global\`` 前缀** ⇒ 位于当前登录会话的命名空间，
+#: 作用域为「每 Windows 会话」；同一用户不同会话 / 不同用户互不阻塞。
+MUTEX_NAME = "SNNU_CampusReconnect_Watch_Mutex"
+
+ERROR_ALREADY_EXISTS = 183
+ERROR_ACCESS_DENIED = 5
+
+
+class SingleInstanceGuard:
+    """基于命名互斥体的进程级排他（F18）。
+
+    关键修正：
+
+    - 显式声明 ``CreateMutexW`` 的 ``argtypes`` / ``restype``（``HANDLE`` 为指针
+      宽度，不能依赖 ctypes 默认的 ``c_int`` 判存在性）；
+    - 保存**可关闭**的句柄；重复实例路径及时 ``CloseHandle``，不泄漏句柄；
+    - 创建失败 **fail-closed**：返回失败结果，由调用方拒绝后台认证 / 降级只读；
+    - 不使用 ownership 语义，因此**不**调用 ``ReleaseMutex``（仅 CloseHandle）。
+    """
+
+    def __init__(self, kernel32: Any = None, name: str = MUTEX_NAME,
+                 get_last_error: Optional[Callable[[], int]] = None,
+                 log: Any = None) -> None:
+        self._kernel32 = kernel32
+        self.name = name
+        self._get_last_error = get_last_error
+        self.log = log
+        self._handle: Any = None
+
+    def _kernel(self) -> Any:
+        if self._kernel32 is not None:
+            return self._kernel32
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL,
+                                          wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32 = kernel32
+        return kernel32
+
+    def _last_error(self) -> int:
+        if self._get_last_error is not None:
+            return int(self._get_last_error())
+        import ctypes
+        return int(ctypes.get_last_error())
+
+    @property
+    def handle(self) -> Any:
+        return self._handle
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
+
+    def _close(self, handle: Any) -> bool:
+        try:
+            return bool(self._kernel().CloseHandle(handle))
+        except Exception:
+            return False
+
+    def acquire(self) -> SingleInstanceResult:
+        """创建 / 打开命名互斥体并返回结构化结果。"""
+        try:
+            kernel32 = self._kernel()
+            handle = kernel32.CreateMutexW(None, False, self.name)
+        except Exception as exc:      # 平台不支持 / DLL 加载失败 ⇒ fail-closed
+            return SingleInstanceResult(
+                error_code=E_MUTEX_FAILED,
+                detail="无法创建单实例互斥体（%s），已拒绝后台认证"
+                       % type(exc).__name__)
+        if not handle:
+            err = self._last_error()
+            return SingleInstanceResult(
+                error_code=E_MUTEX_FAILED,
+                detail="CreateMutexW 失败（last_error=%s），已拒绝后台认证" % err)
+        if self._last_error() == ERROR_ALREADY_EXISTS:
+            self._close(handle)       # 重复实例：及时关闭新句柄，避免泄漏
+            return SingleInstanceResult(already_running=True,
+                                        detail="已有一个实例在运行")
+        self._handle = handle
+        return SingleInstanceResult(ok=True, detail="已持有单实例互斥体")
+
+    def release(self) -> None:
+        """关闭句柄（不使用 ownership，故无需 ReleaseMutex）。"""
+        handle, self._handle = self._handle, None
+        if handle:
+            self._close(handle)
+
+
+def acquire_single_instance(log: Any = None, kernel32: Any = None,
+                            get_last_error: Optional[Callable[[], int]] = None
+                            ) -> bool:
+    """兼容层：获取成功返回 ``True``；已有实例 / 创建失败均返回 ``False``。"""
+    return SingleInstanceGuard(kernel32=kernel32, get_last_error=get_last_error,
+                               log=log).acquire().ok
