@@ -920,6 +920,89 @@ def _build_composite_executor(session: requests.Session, observer: Any,
                              log=lambda message: log.info("%s", message))
 
 
+def _build_remote_guard(log: logging.Logger, *, defer_failback: bool = True,
+                        probe_interval: float = 30.0):
+    """构造 P7 远程保障守卫（读经 P0 ``netdiag`` 只读管道，零写命令）。"""
+    from campus_remote import RemoteSafetyGuard, build_windows_remote_ops
+    from tools import netdiag
+
+    ops = build_windows_remote_ops(netdiag.PowerShellRunner())
+    return RemoteSafetyGuard(ops=ops, probe_interval=probe_interval,
+                             defer_failback=defer_failback,
+                             log=lambda message: log.info("%s", message))
+
+
+def _route_journal_pending() -> Optional[dict]:
+    """读取路由变更日志中的未完成事务（只读；无日志/无待恢复项返回 ``None``）。"""
+    from campus_route_guard import RouteJournal
+
+    try:
+        return RouteJournal(LOG_DIR / "route_journal.json").pending()
+    except Exception:
+        return None
+
+
+def remote(session: requests.Session, args: argparse.Namespace,
+           log: logging.Logger) -> int:
+    """V0.3 P7 远程保障（默认**只读**）。
+
+    复用 P0 ``netdiag`` 只读管道（已含 ``remote_control``：进程/端口/UDP/睡眠/
+    自动登录/自启项）完成三件事：
+
+    1. **远控探测与敏感期判定**（方案 §7.3）——是否存在已建立的远控会话；
+    2. **无人值守就绪自检**（方案 §7.3）——睡眠/休眠、自动登录、远控与托盘自启、
+       凭据在位、远控自动重连（人工项）；
+    3. **崩溃恢复可见性**（方案 §7.2）——报告路由变更日志中是否有未完成事务
+       （处置仍由 ``route --recover`` 或托盘启动时自动执行）。
+
+    本命令**不切换路由、不认证、不触碰远控进程**，默认也不写任何文件
+    （``--log`` 才追加关联事件日志）。
+    """
+    from campus_remote import (MonitorWatchdog, RemoteEventLog, RemoteProbe,
+                               format_remote_status)
+    from tools import netdiag
+
+    runner = netdiag.PowerShellRunner()
+    observer = NetworkObserver(runner)
+    report = observer.observe(target_ssid=args.ssid)
+    probe = RemoteProbe.from_report(report)
+    guard = _build_remote_guard(log,
+                                probe_interval=float(max(5, args.probe_interval)))
+    now = time.monotonic()
+    status = guard.observe(probe, now)
+    readiness = guard.readiness(probe)
+    watchdog = MonitorWatchdog()
+    decision = watchdog.check(now, alive=True)
+
+    events = None
+    if args.log:
+        events = RemoteEventLog(LOG_DIR / "remote_guard.jsonl")
+        correlation = events.new_correlation_id()
+        events.record("remote", "远控探测：%s" % status.reason,
+                      correlation_id=correlation)
+        for warning in readiness.warnings:
+            events.record("system", "无人值守缺口：%s" % warning,
+                          correlation_id=correlation)
+    print(format_remote_status(status, readiness=readiness, events=events,
+                               watchdog=decision))
+    pending = _route_journal_pending()
+    if pending:
+        print("崩溃恢复：检测到未完成的路由变更事务 %s（目标=%s）—— 请执行 "
+              "route --recover（托盘启动时也会自动恢复）。"
+              % (pending.get("operation_id"), pending.get("target")))
+    else:
+        print("崩溃恢复：未发现未完成的路由变更事务。")
+    if args.json:
+        print(json.dumps({"status": status.to_dict(),
+                          "readiness": readiness.to_dict(),
+                          "watchdog": decision.to_dict(),
+                          "pending_transaction": pending},
+                         ensure_ascii=False, indent=2))
+    log.info("remote 完成（只读）：远控=%s，敏感期=%s，就绪缺口=%d 项",
+             status.activity, status.sensitive, len(readiness.warnings))
+    return 0
+
+
 def route(session: requests.Session, args: argparse.Namespace,
           log: logging.Logger) -> int:
     """V0.3 P5 受控路由切换与路由卫士（快照 / 崩溃恢复 / 受控切换 / 受控 AUTO）。
@@ -989,12 +1072,20 @@ def route(session: requests.Session, args: argparse.Namespace,
             print(format_route_change(recovered))
         executor = _build_composite_executor(session, observer, report, wifi,
                                              args, log, guard)
+        # V0.3 P7：远程会话敏感期推迟自动切回（方案 §4.3）。受控 CLI 入口要求
+        # **显式**加 --defer-failback 才接入门禁（默认不接入，行为与 P5 一致）；
+        # 托盘侧默认开启（见 campus_tray_failover / 托盘配置 remote_defer_failback）。
+        defer_failback = bool(getattr(args, "defer_failback", False))
+        remote = (_build_remote_guard(log) if defer_failback else None)
         manager = NetworkFailoverManager(
             policy=guard.policy, mode=FailoverMode.AUTO, executor=executor,
+            failback_gate=(remote.failback_gate if remote is not None else None),
             log=lambda message: log.info("%s", message))
         frames = max(1, int(args.frames))
         now = time.monotonic()
         for index in range(frames):
+            if remote is not None:
+                remote.poll(now)    # 每轮刷新远控状态（按 probe_interval 节流）
             report = observer.observe(target_ssid=args.ssid)
             snapshot = evaluate(report, engine=WindowsProbeEngine(),
                                 system_probe=lambda: internet_ok(session),
@@ -1266,8 +1357,22 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Portal 认证冷却秒数（只限制认证），默认 180")
     p_route.add_argument("--switch-min-interval", type=int, default=300,
                          help="链路切换最短间隔秒数（只限制路由变更），默认 300")
+    p_route.add_argument("--defer-failback", action="store_true",
+                         help="--auto 时接入 P7「远程会话敏感期推迟切回」门禁"
+                              "（受控入口默认不接入；托盘侧默认开启）")
     p_route.add_argument("--json", action="store_true",
                          help="额外输出机器可读 JSON（路由快照/变更记录契约）")
+    p_remote = sub.add_parser(
+        "remote",
+        help="V0.3 P7 远程保障（远控探测 / 敏感期 / 无人值守就绪自检，默认只读）")
+    p_remote.add_argument("--ssid", default="SNNU",
+                          help="目标校园 Wi-Fi 名称，默认 SNNU")
+    p_remote.add_argument("--probe-interval", type=int, default=30,
+                          help="远控探测最小间隔秒数（节流），默认 30")
+    p_remote.add_argument("--log", action="store_true",
+                          help="把本次事件追加到 logs/remote_guard.jsonl（默认不写文件）")
+    p_remote.add_argument("--json", action="store_true",
+                          help="额外输出机器可读 JSON（远程保障契约）")
     for command in ("once", "watch"):
         p = sub.add_parser(command, help="单次尝试" if command == "once" else "常驻自动重连")
         p.add_argument("--ssid", default="SNNU", help="目标校园 Wi-Fi 名称，默认 SNNU")
@@ -1316,6 +1421,8 @@ def main() -> None:
         raise SystemExit(snnu(session, args, log))
     elif args.command == "route":
         raise SystemExit(route(session, args, log))
+    elif args.command == "remote":
+        raise SystemExit(remote(session, args, log))
     elif args.command == "fix-bypass":
         if not fix_bypass(log):
             raise SystemExit(1)

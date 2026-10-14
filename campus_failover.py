@@ -26,7 +26,11 @@
    二者都由 :class:`campus_core.TimerTable` 承载；**任何冷却都不得推迟网络检测**；
 4. 有线恢复判据 = 连续稳定 ≥120s 且 ≥5 次成功探测，且距上次切换 ≥300s；
 5. 一轮检测最多安排 **1 个**副作用动作（四类动作互斥串行）；
-6. 双断时不在两张网卡之间来回切换，恢复尝试按冷却限频。
+6. 双断时不在两张网卡之间来回切换，恢复尝试按冷却限频；
+7. **切回门禁（V0.3 P7 扩展）**：可选注入 ``failback_gate(now) -> (allowed, reason)``，
+   只在「有线已满足恢复判据、准备切回」时被调用，用于实现远程会话敏感期推迟切回
+   （方案 §4.3）。默认 ``None`` 时行为与 P3 完全一致；门禁**不影响**网络检测节奏，
+   也**不影响** Wi-Fi 接管方向，异常时保守推迟（fail-closed）。
 """
 from __future__ import annotations
 
@@ -395,9 +399,17 @@ class NetworkFailoverManager:
                  timer_table: Optional[TimerTable] = None,
                  executor: Optional[Any] = None,
                  lock_target: Optional[str] = None,
+                 failback_gate: Optional[Callable[[float], Tuple[bool, str]]] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.policy = policy or FailoverPolicy()
         self.mode = mode
+        #: 切回门禁（V0.3 P7）：``gate(now) -> (allowed, reason)``。仅在
+        #: ``ETHERNET_RECOVERY_CHECK`` 通过恢复判据、准备切回有线时调用；
+        #: **不影响网络检测节奏，也不影响 Wi-Fi 接管方向**。默认 ``None`` =
+        #: 不做任何推迟（P3 原有语义完全不变）。P7 用它实现「远程会话敏感期
+        #: 推迟自动切回」（方案 §4.3）。门禁异常时**保守推迟**（fail-closed）。
+        self.failback_gate = failback_gate
+        self.failback_deferred = 0
         #: 手动锁定目标（P6）：仅 ``FailoverMode.LOCKED`` 下生效；非 ``None`` 时
         #: 优先路径固定为该目标，**绝不**执行任何路由变更，也不自动禁用另一网卡。
         self.lock_target = lock_target if lock_target in LOCK_TARGETS else None
@@ -520,6 +532,8 @@ class NetworkFailoverManager:
             "state_elapsed": max(0.0, now - self.state_since),
             "lock_target": self.lock_target,
             "locked": bool(self.mode is FailoverMode.LOCKED and self.lock_target),
+            # V0.3 P7：因远程会话敏感期被推迟的切回次数（0 表示门禁从未拦下）
+            "failback_deferred": self.failback_deferred,
         }
 
     def _enter(self, state: FailoverState, now: float,
@@ -807,6 +821,14 @@ class NetworkFailoverManager:
                     notes.append("有线已满足恢复判据，但切换冷却未过（剩余 %.0fs）"
                                  "：推迟切回" % (self.timers.switch_ready_at - now))
                     return state
+                if self.failback_gate is not None:
+                    allowed, why = self._gate(now)
+                    if not allowed:
+                        self.failback_deferred += 1
+                        notes.append("推迟自动切回（%s）；本轮不产生任何路由变更"
+                                     % (why or "未说明"))
+                        return state
+                    notes.append("切回门禁已放行：%s" % (why or "未说明"))
                 outcome = self._submit(
                     plan, OpKind.METRIC_WRITE,
                     "有线已连续稳定 %d 次/≥%.0fs：切回以太网优先"
@@ -880,6 +902,19 @@ class NetworkFailoverManager:
         self.manual_reason = reason
         notes.append("需人工处理：%s（停止自动调度，等待人工确认）" % reason)
         return FailoverState.MANUAL_REQUIRED
+
+    def _gate(self, now: float) -> Tuple[bool, str]:
+        """调用切回门禁（V0.3 P7）：**门禁异常一律保守推迟**（fail-closed）。
+
+        远程会话安全优先：门禁失效时宁可暂不切回（Wi-Fi 仍可用），也不在可能的
+        远程会话中被误切（方案 §7.3）。
+        """
+        try:
+            allowed, why = self.failback_gate(now)
+        except Exception as exc:
+            return False, ("切回门禁异常（%s: %s）：保守推迟切回"
+                           % (type(exc).__name__, exc))
+        return bool(allowed), str(why or "")
 
     def _note_switch(self, now: float) -> None:
         self.last_switch_at = now

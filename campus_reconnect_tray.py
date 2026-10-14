@@ -62,6 +62,7 @@ from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
                          CredentialClear, CredentialLoad, CredentialSave,
                          ProxyApplyResult, RepairAdapters, RepairOptions,
                          TimerTable, repair_service, load_config_text)
+import campus_reconnect as engine
 from campus_reconnect import (direct_session, edge_fallback,
                               ensure_single_instance, get_credentials,
                               internet_ok, portal_login, portal_reachable,
@@ -71,6 +72,8 @@ from campus_windows import CredentialStore, ProxyController, default_refresh
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
                                   parse_lock, parse_mode, tray_mode_label)
 from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
+from campus_remote import (MonitorWatchdog, RemoteSafetyGuard,
+                           apply_watchdog_decision, build_windows_remote_ops)
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
@@ -83,6 +86,13 @@ PYTHONW = str(Path(sys.executable).with_name("pythonw.exe"))
 CLASH_SERVER_DEFAULT = "127.0.0.1:7897"   # 仅在用户显式确认时作为**建议值**展示
 APP_NAME = "校园网自动重连助手"
 UI_POLL_MS = 120
+
+#: V0.3 P7 看门狗：巡检间隔与心跳容忍窗口（秒）。
+WATCHDOG_INTERVAL = 30.0
+WATCHDOG_HEARTBEAT_TIMEOUT = 90.0
+#: V0.3 P7 看门狗：重启频次上限（窗口内），超过转人工处理。
+WATCHDOG_MAX_RESTARTS = 3
+WATCHDOG_RESTART_WINDOW = 1800.0
 
 #: 托盘配置的完整键集合（保存时只写这些键，未知键永不落盘）。
 DEFAULT_CONFIG = {
@@ -104,6 +114,10 @@ DEFAULT_CONFIG = {
     "failover_lock": None,          # LOCKED 下的锁定目标: "ethernet" / "wifi" / None
     "clash_keep": True,             # 网络切换期间保持 Clash 原样（默认开启）
     "auto_switch_authorized": False,  # 智能自动接入真实执行器的显式授权（默认关闭）
+    # ---- V0.3 P7：远程保障（方案 §7.3 / §4.3）----
+    "remote_guard": True,             # 远控探测与远程会话敏感期（只读，默认开启）
+    "remote_defer_failback": True,    # 远程会话敏感期推迟自动切回（默认开启）
+    "remote_probe_interval": 30,      # 远控探测最小间隔秒数（节流）
 }
 CONFIG_KEYS = tuple(DEFAULT_CONFIG)
 
@@ -218,6 +232,27 @@ def _read_failover_keys(text: str) -> dict:
             "clash_keep": clash_keep, "auto_switch_authorized": authorized}
 
 
+def _read_remote_keys(text: str) -> dict:
+    """读取 P7 远程保障三键（非法值一律回退安全默认）。
+
+    与 P6 的 ``_read_failover_keys`` 分开实现，保持既有读取器返回值稳定
+    （P6 测试按整字典断言）；探测间隔限幅 5..600s，防止配置把轮询压到过密。
+    """
+    raw = _raw_config(text)
+    remote_guard = raw.get("remote_guard")
+    if not isinstance(remote_guard, bool):
+        remote_guard = DEFAULT_CONFIG["remote_guard"]
+    defer_failback = raw.get("remote_defer_failback")
+    if not isinstance(defer_failback, bool):
+        defer_failback = DEFAULT_CONFIG["remote_defer_failback"]
+    probe_interval = raw.get("remote_probe_interval")
+    if not isinstance(probe_interval, int) or isinstance(probe_interval, bool):
+        probe_interval = DEFAULT_CONFIG["remote_probe_interval"]
+    return {"remote_guard": remote_guard,
+            "remote_defer_failback": defer_failback,
+            "remote_probe_interval": max(5, min(600, int(probe_interval)))}
+
+
 def config_to_dict(config) -> dict:
     """把 :class:`campus_core.Config` 转成托盘内部 dict。"""
     return {
@@ -248,6 +283,7 @@ def load_config() -> dict:
     cfg = config_to_dict(result.config)
     cfg["paused"] = _read_paused_flag(text)
     cfg.update(_read_failover_keys(text))
+    cfg.update(_read_remote_keys(text))
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
@@ -471,6 +507,21 @@ class TrayApp:
         self._failover_snapshot_provider = None
         #: 最近一次故障切换展示状态（由 :meth:`_failover_tick` 更新）。
         self.failover_status = None
+
+        # ---- V0.3 P7 远程保障（默认未接线；由 :meth:`enable_remote_guard` 接入）----
+        #: 远控只读探测能力（``None`` = 未接线：不产生任何子进程/文件 I/O）。
+        self._remote_ops = None
+        #: 远程保障守卫（接线后非 ``None``）。
+        self.remote = None
+        #: 后台监控看门狗（纯逻辑；巡检线程由 :meth:`start_supervisor` 启动）。
+        self._watchdog = MonitorWatchdog(
+            heartbeat_timeout=WATCHDOG_HEARTBEAT_TIMEOUT,
+            max_restarts=WATCHDOG_MAX_RESTARTS,
+            restart_window=WATCHDOG_RESTART_WINDOW,
+            log=lambda message: self.log.info("[watchdog] %s", message))
+        self._supervisor_thread = None
+        self.last_watchdog = None
+
         self.failover = self._build_failover_bridge()
 
     # ---------- 故障切换桥接（V0.3 P6）----------
@@ -494,6 +545,8 @@ class TrayApp:
             authorized=bool(cfg.get("auto_switch_authorized", False)),
             executor_factory=self._build_auto_executor,
             policy=policy, timer_table=self._timers,
+            remote_guard=getattr(self, "remote", None),
+            defer_failback=bool(cfg.get("remote_defer_failback", True)),
             log=lambda message: self.log.info("[failover] %s", message))
 
     def _build_auto_executor(self):
@@ -554,11 +607,219 @@ class TrayApp:
         bridge = getattr(self, "failover", None)
         if bridge is None:
             return
+        self._remote_poll(now)      # V0.3 P7：先刷新远控状态（按间隔节流）
         result = bridge.tick(now, self._build_failover_snapshot(online))
         self.failover_status = bridge.status()
         if result.executed:
             self.log.info("故障切换已执行动作：%s",
                           ", ".join(o.kind.value for o in result.executed))
+
+    # ---------- 远程保障（V0.3 P7）----------
+    def enable_remote_guard(self, ops=None) -> Optional[RemoteSafetyGuard]:
+        """接线远程保障（生产入口；``ops`` 可注入假件用于测试）。
+
+        构造守卫**不做任何 I/O**；真正的远控探测发生在 :meth:`_remote_poll`
+        （按 ``remote_probe_interval`` 节流）。未调用本方法时（例如单元测试
+        直接构造 ``TrayApp``），``_remote_ops`` 为 ``None``，托盘**零子进程**。
+        """
+        if ops is None:
+            from tools import netdiag
+
+            ops = build_windows_remote_ops(netdiag.PowerShellRunner())
+        self._remote_ops = ops
+        cfg = self.get_config()
+        self.remote = RemoteSafetyGuard(
+            ops=ops,
+            probe_interval=float(cfg.get("remote_probe_interval", 30)),
+            defer_failback=bool(cfg.get("remote_defer_failback", True)),
+            log=lambda message: self.log.info("[remote] %s", message))
+        bridge = getattr(self, "failover", None)
+        if bridge is not None:
+            bridge.set_remote_guard(
+                self.remote, bool(cfg.get("remote_defer_failback", True)))
+        self.log.info("远程保障已接线：探测间隔 %.0fs，敏感期推迟切回=%s",
+                      self.remote.probe_interval, self.remote.defer_failback)
+        return self.remote
+
+    def _remote_poll(self, now: float) -> None:
+        """刷新远控状态（未接线或配置关闭时直接返回，零 I/O）。"""
+        if self._remote_ops is None or self.remote is None:
+            return
+        if not bool(self.config.get("remote_guard", True)):
+            return
+        try:
+            self.remote.poll(now)
+        except Exception as exc:                     # 远控探测故障不得影响主流程
+            self.log.warning("远控探测异常：%s", type(exc).__name__)
+
+    def apply_remote_guard(self, enabled: bool) -> bool:
+        """开关远控探测（方案 §7.3；关闭后不再探测，也不推迟切回）。"""
+        value = bool(enabled)
+        self.update_config({"remote_guard": value})
+        if not save_config(self.config):
+            self.notify("保存失败", "远程保障设置未能写入配置（已保留原文件）")
+        self.notify("远控探测已%s" % ("开启" if value else "关闭"),
+                    "关闭后不再检测远程会话，也不会因敏感期推迟切回")
+        if self.icon is not None:
+            self.icon.update_menu()
+        return value
+
+    def on_toggle_remote_guard(self, icon=None, item=None):
+        self.apply_remote_guard(not bool(self.config.get("remote_guard", True)))
+
+    def apply_defer_failback(self, enabled: bool) -> bool:
+        """开关「远程会话敏感期推迟自动切回」（方案 §4.3）。"""
+        value = bool(enabled)
+        self.update_config({"remote_defer_failback": value})
+        if not save_config(self.config):
+            self.notify("保存失败", "延迟切回设置未能写入配置（已保留原文件）")
+        bridge = getattr(self, "failover", None)
+        if bridge is not None:
+            bridge.set_remote_guard(getattr(self, "remote", None), value)
+        self.notify("远程会话敏感期推迟切回已%s" % ("开启" if value else "关闭"),
+                    "远程会话进行中时%s自动切回有线"
+                    % ("推迟" if value else "不再推迟"))
+        if self.icon is not None:
+            self.icon.update_menu()
+        return value
+
+    def on_toggle_defer_failback(self, icon=None, item=None):
+        self.apply_defer_failback(
+            not bool(self.config.get("remote_defer_failback", True)))
+
+    def _remote_text(self, item=None):
+        """菜单中的远程保障摘要（只读）。"""
+        status = getattr(self, "remote", None)
+        if status is None or self._remote_ops is None:
+            return "远程保障：未接线"
+        if not bool(self.config.get("remote_guard", True)):
+            return "远程保障：已关闭"
+        current = status.status()
+        suffix = "（远程会话中，推迟切回）" if current.sensitive else ""
+        return "远程保障：%s · 远控 %s%s" % (
+            "探测中", current.activity, suffix)
+
+    # ---------- 崩溃恢复看门狗（V0.3 P7）----------
+    def _route_transaction_pending(self) -> bool:
+        """是否存在未完成的路由变更事务（只读检查；无日志文件即无）。"""
+        try:
+            return bool(engine._route_journal_pending())
+        except Exception:
+            return False
+
+    def _build_recovery_guard(self):
+        """构造路由卫士用于**崩溃恢复**（授权 ``False``；``recover()`` 不受其限制）。
+
+        与 :meth:`_build_auto_executor` 复用同一套构件；构造过程含一次只读观察
+        （解析网卡角色），属只读、无副作用。
+        """
+        from types import SimpleNamespace
+        from tools import netdiag
+        from campus_network import NetworkObserver, resolve_roles
+
+        cfg = self.get_config()
+        runner = netdiag.PowerShellRunner()
+        observer = NetworkObserver(runner)
+        ssid = cfg.get("ssid") or "SNNU"
+        report = observer.observe(target_ssid=ssid)
+        roles = resolve_roles(report, engine._load_adapters_config())
+        args = SimpleNamespace(ssid=ssid, interval=int(self._interval()),
+                               threshold=int(self._threshold()),
+                               auth_cooldown=int(self._cooldown()),
+                               switch_min_interval=300, yes=False)
+        return engine._build_route_guard(observer, runner, roles.get("ethernet"),
+                                         roles.get("wifi"), args, self.log,
+                                         timers=self._timers)
+
+    def _recover_route_transaction(self):
+        """路由崩溃恢复（独立于主监控线程；仅回滚日志中已记录的变更）。"""
+        guard = self._build_recovery_guard()
+        record = guard.recover()
+        if record is not None:
+            self.log.warning("路由崩溃恢复：状态=%s，说明=%s",
+                             record.status.value, record.detail)
+            self.notify("已恢复未完成的路由变更", record.detail)
+        return record
+
+    def _watchdog_check(self, now: float, status=None):
+        """巡检一次看门狗并按决策执行恢复动作（纯逻辑 + 注入回调）。"""
+        status = status or self.worker_status()
+        decision = self._watchdog.check(
+            now, alive=bool(status["alive"]),
+            heartbeat_age=status.get("heartbeat_age"),
+            pending_transaction=self._route_transaction_pending)
+        self.last_watchdog = decision
+        if decision.action == "OK":
+            return decision
+        if decision.action == "RESUME_RECHECK":
+            self.log.info("看门狗：%s；立即重新检测路径", decision.reason)
+            self._commands.put(("probe", None))
+            return decision
+        if decision.action == "MANUAL_REQUIRED":
+            self._report_worker_error("监测线程反复退出", RuntimeError(decision.reason))
+            self.notify("监测需人工处理", decision.reason)
+            return decision
+        result = apply_watchdog_decision(
+            decision, restart=self._restart_worker_if_needed,
+            recover=self._recover_route_transaction, watchdog=self._watchdog,
+            now=now, log=lambda message: self.log.info("[watchdog] %s", message))
+        self.log.warning("看门狗恢复：%s", result)
+        return decision
+
+    def _restart_worker_if_needed(self) -> bool:
+        self.stop_event.clear()
+        self._cancel.clear()
+        return bool(self._ensure_worker())
+
+    def start_supervisor(self) -> None:
+        """启动独立巡检线程（方案 §7.2：独立于主监控线程的恢复机制）。"""
+        if self._supervisor_thread is not None and self._supervisor_thread.is_alive():
+            return
+        self._supervisor_thread = threading.Thread(
+            target=self._supervisor_loop, name="campus-watchdog", daemon=True)
+        self._supervisor_thread.start()
+
+    def _supervisor_loop(self) -> None:
+        while not self.stop_event.wait(WATCHDOG_INTERVAL):
+            try:
+                self._watchdog_check(time.monotonic())
+            except Exception as exc:
+                self.log.warning("看门狗巡检异常：%s", type(exc).__name__)
+
+    def startup_route_recovery(self):
+        """启动时的路由崩溃恢复（方案 §7.2：Windows 重启/崩溃后的安全兜底）。
+
+        **仅在**路由变更日志存在未完成事务时才构造卫士；无待恢复项时零写入、
+        零重型观察。构造与恢复过程可能耗时数十秒，调用方应在后台线程执行。
+        """
+        if not self._route_transaction_pending():
+            self.log.info("启动检查：无未完成的路由变更事务（零写入）")
+            return None
+        try:
+            return self._recover_route_transaction()
+        except Exception as exc:
+            self.log.warning("启动路由恢复失败：%s: %s", type(exc).__name__, exc)
+            return None
+
+    def startup_readiness_check(self):
+        """启动时的无人值守就绪自检（只读；把缺口写入日志与气泡通知）。"""
+        guard = getattr(self, "remote", None)
+        if guard is None or self._remote_ops is None:
+            return None
+        if not bool(self.config.get("remote_guard", True)):
+            return None
+        try:
+            report = guard.readiness()
+        except Exception as exc:
+            self.log.warning("就绪自检失败：%s", type(exc).__name__)
+            return None
+        for warning in report.warnings:
+            self.log.warning("无人值守缺口：%s", warning)
+        if report.warnings:
+            self.notify("无人值守存在缺口", "；".join(report.warnings[:2]))
+        else:
+            self.log.info("无人值守就绪自检通过（人工项除外）")
+        return report
 
     # ---------- 图标与通知 ----------
     def make_image(self):
@@ -1106,6 +1367,8 @@ class TrayApp:
         bridge.set_lock_target(cfg.get("failover_lock"))
         bridge.set_clash_keep(bool(cfg.get("clash_keep", True)))
         bridge.set_authorized(bool(cfg.get("auto_switch_authorized", False)))
+        bridge.set_remote_guard(getattr(self, "remote", None),
+                                bool(cfg.get("remote_defer_failback", True)))
 
     def apply_mode(self, mode) -> FailoverMode:
         """设置运行模式（纯逻辑；菜单、设置面板与测试共用）。"""
@@ -1299,11 +1562,17 @@ class TrayApp:
         return pystray.Menu(
             pystray.MenuItem(self._status_text, None, enabled=False),
             pystray.MenuItem(self._failover_text, None, enabled=False),
+            pystray.MenuItem(self._remote_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("运行模式", mode_menu),
             pystray.MenuItem("手动锁定目标", lock_menu),
             pystray.MenuItem("网络切换期间保持 Clash 原样", self.on_toggle_clash_keep,
                              checked=lambda item: bool(self.config.get("clash_keep", True))),
+            pystray.MenuItem("远控探测（远程保障）", self.on_toggle_remote_guard,
+                             checked=lambda item: bool(self.config.get("remote_guard", True))),
+            pystray.MenuItem("远程会话中推迟切回", self.on_toggle_defer_failback,
+                             checked=lambda item: bool(
+                                 self.config.get("remote_defer_failback", True))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("立即重连", self.on_reconnect),
             pystray.MenuItem(self._pause_text, self.on_toggle_pause),
@@ -1386,6 +1655,10 @@ class TrayApp:
         lock_label = PATH_LABEL.get(self._current_lock(), "不锁定")
         v_flock = tk.StringVar(value=lock_label)
         v_clash_keep = tk.BooleanVar(value=bool(self.config.get("clash_keep", True)))
+        # V0.3 P7：远程保障（远控探测 / 敏感期推迟切回）。
+        v_remote = tk.BooleanVar(value=bool(self.config.get("remote_guard", True)))
+        v_defer = tk.BooleanVar(
+            value=bool(self.config.get("remote_defer_failback", True)))
 
         ttk.Checkbutton(frame, text="开机自启（登录 Windows 后自动启动）",
                         variable=v_auto).grid(row=4, column=0, columnspan=3, sticky="w")
@@ -1438,6 +1711,9 @@ class TrayApp:
             "failover_mode": tray_mode_label(self._current_mode()),
             "failover_lock": lock_label,
             "clash_keep": bool(self.config.get("clash_keep", True)),
+            "remote_guard": bool(self.config.get("remote_guard", True)),
+            "remote_defer_failback": bool(
+                self.config.get("remote_defer_failback", True)),
         }
 
         # V0.3 P6：三模式 / 手动锁定 / Clash 保持原样 + 故障切换状态（只读展示）。
@@ -1458,12 +1734,18 @@ class TrayApp:
         ttk.Checkbutton(frame, text="网络切换期间保持 Clash 原样（默认）",
                         variable=v_clash_keep).grid(
             row=17, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(frame, text="远控探测（远程保障，只读）",
+                        variable=v_remote).grid(
+            row=18, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(frame, text="远程会话进行中推迟自动切回",
+                        variable=v_defer).grid(
+            row=19, column=0, columnspan=3, sticky="w")
         failover_status = getattr(self, "failover_status", None)
         failover_text = ("\n".join(failover_status.lines()) if failover_status
                          is not None else "故障切换：等待首次观测（模式 %s）"
                          % tray_mode_label(self._current_mode()))
         ttk.Label(frame, text=failover_text, justify="left").grid(
-            row=18, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=20, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         def on_save():
             try:
@@ -1518,6 +1800,11 @@ class TrayApp:
                     changes["failover_lock"] = "wifi"
             if bool(v_clash_keep.get()) != initial["clash_keep"]:
                 changes["clash_keep"] = bool(v_clash_keep.get())
+            # V0.3 P7：远程保障两键（远控探测 / 敏感期推迟切回）。
+            if bool(v_remote.get()) != initial["remote_guard"]:
+                changes["remote_guard"] = bool(v_remote.get())
+            if bool(v_defer.get()) != initial["remote_defer_failback"]:
+                changes["remote_defer_failback"] = bool(v_defer.get())
 
             if changes:
                 new_cfg = self.get_config()
@@ -1673,8 +1960,21 @@ def main():
             log.warning("未设置账号，自动重连暂不可用（可在凭据管理器中补存后重启）")
     app = TrayApp(log)
     app.root = root
-    log.info("托盘助手启动（autostart=%s, clash_auto_proxy=%s）",
-             get_autostart(), app.config.get("clash_auto_proxy"))
+    log.info("托盘助手启动（autostart=%s, clash_auto_proxy=%s, remote_guard=%s）",
+             get_autostart(), app.config.get("clash_auto_proxy"),
+             app.config.get("remote_guard", True))
+    # V0.3 P7：远程保障接线（只读探测）+ 独立看门狗线程。
+    if app.config.get("remote_guard", True):
+        try:
+            app.enable_remote_guard()
+        except Exception:
+            log.warning("远程保障接线失败：\n%s", traceback.format_exc())
+    app.start_supervisor()
+    # V0.3 P7：启动时的崩溃恢复与就绪自检放到后台线程（含只读观察，可能耗时数十秒）。
+    threading.Thread(target=app.startup_route_recovery,
+                     name="campus-recovery", daemon=True).start()
+    threading.Thread(target=app.startup_readiness_check,
+                     name="campus-readiness", daemon=True).start()
     app._start_ui_pump()
     app.start()
     root.mainloop()

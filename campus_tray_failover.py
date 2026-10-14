@@ -37,9 +37,9 @@ from campus_network import (HealthState, InterfaceHealth,
 __all__ = [
     "CONTRACT_VERSION", "MODE_ORDER", "DEFAULT_MODE", "DEFAULT_CLASH_KEEP",
     "REMOTE_ENABLED", "REMOTE_PAUSED", "REMOTE_MANUAL", "REMOTE_OFF",
-    "STATE_LABEL", "TRAY_MODE_LABEL", "parse_mode", "parse_lock",
-    "tray_mode_label", "light_snapshot", "FailoverStatus", "TrayFailoverBridge",
-    "format_status",
+    "REMOTE_SENSITIVE", "STATE_LABEL", "TRAY_MODE_LABEL", "parse_mode",
+    "parse_lock", "tray_mode_label", "light_snapshot", "FailoverStatus",
+    "TrayFailoverBridge", "format_status",
 ]
 
 CONTRACT_VERSION = "v03-p6-tray-1"
@@ -61,11 +61,13 @@ DEFAULT_MODE = FailoverMode.MONITOR
 #: Clash 保持原样默认值（方案 §9：作为默认值）。
 DEFAULT_CLASH_KEEP = True
 
-#: 远程保障状态文案（方案 §11）。
+#: 远程保障状态文案（方案 §11）。前四个由 P6 固化（既有测试看守，不可改名）；
+#: ``REMOTE_SENSITIVE`` 为 V0.3 P7 新增：远程会话进行中（推迟自动切回）。
 REMOTE_ENABLED = "启用"
 REMOTE_PAUSED = "已暂停"
 REMOTE_MANUAL = "需要人工处理"
 REMOTE_OFF = "未启用"
+REMOTE_SENSITIVE = "启用（远程会话敏感期：推迟切回）"
 
 #: 11 个状态的中文标签（托盘展示用；不改动 P3 契约）。
 STATE_LABEL: Dict[FailoverState, str] = {
@@ -218,6 +220,10 @@ class FailoverStatus:
     wifi_status: str = "未解析"
     egress: str = "未识别"
     remote_guard: str = REMOTE_OFF
+    #: V0.3 P7：远控详情单行摘要（``""`` = 未接入远程保障探测）。
+    remote_detail: str = ""
+    #: V0.3 P7：无人值守就绪缺口（来自远程保障的就绪自检；空列表 = 无缺口）。
+    remote_warnings: List[str] = field(default_factory=list)
     lock_target: Optional[str] = None
     locked: bool = False
     readonly: bool = True
@@ -251,6 +257,8 @@ class FailoverStatus:
             "wifi_status": self.wifi_status,
             "egress": self.egress,
             "remote_guard": self.remote_guard,
+            "remote_detail": self.remote_detail,
+            "remote_warnings": list(self.remote_warnings),
             "lock_target": self.lock_target,
             "locked": self.locked,
             "readonly": self.readonly,
@@ -278,6 +286,10 @@ class FailoverStatus:
         add("  Wi-Fi 状态  : %s" % self.wifi_status)
         add("  当前系统出口: %s" % self.egress)
         add("  远程保障    : %s" % self.remote_guard)
+        if self.remote_detail:
+            add("  远控详情    : %s" % self.remote_detail)
+        for warning in self.remote_warnings:
+            add("  无人值守缺口: %s" % warning)
         add("  手动锁定    : %s"
             % (PATH_LABEL.get(self.lock_target, self.lock_target)
                if self.locked else "未锁定"))
@@ -323,6 +335,8 @@ class TrayFailoverBridge:
                  executor_factory: Optional[Callable[[], Any]] = None,
                  policy: Optional[FailoverPolicy] = None,
                  timer_table: Optional[Any] = None,
+                 remote_guard: Optional[Any] = None,
+                 defer_failback: bool = True,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.mode = parse_mode(mode)
         self.lock_target = parse_lock(lock_target)
@@ -331,9 +345,14 @@ class TrayFailoverBridge:
         self.executor_factory = executor_factory
         self.policy = policy or FailoverPolicy()
         self._log = log
+        #: V0.3 P7 远程保障守卫（``campus_remote.RemoteSafetyGuard``）；为 ``None``
+        #: 时不接入远程会话延迟切回，展示层保持 P6 语义（零行为变化）。
+        self.remote_guard = remote_guard
+        self.defer_failback = bool(defer_failback)
         self.manager = NetworkFailoverManager(
             policy=self.policy, mode=self.mode, timer_table=timer_table,
-            executor=None, lock_target=self.lock_target, log=log)
+            executor=None, lock_target=self.lock_target,
+            failback_gate=self._failback_gate(), log=log)
         self.last_switch_at: Optional[float] = None
         self.last_switch_reason: str = ""
         self.last_switch_result: str = ""
@@ -363,6 +382,38 @@ class TrayFailoverBridge:
             self.manager.scheduler.executor = self._executor
         else:
             self.manager.scheduler.executor = None
+
+    # ---- 远程保障接线（V0.3 P7）---- #
+    def _failback_gate(self) -> Optional[Callable[[float], Any]]:
+        """按「守卫在位 + 延迟开关」决定是否把切回门禁接入状态机。"""
+        guard = self.remote_guard
+        if guard is None or not self.defer_failback:
+            return None
+        gate = getattr(guard, "failback_gate", None)
+        return gate if callable(gate) else None
+
+    def set_remote_guard(self, guard: Optional[Any],
+                         defer_failback: Optional[bool] = None) -> Optional[Any]:
+        """接入/摘除远程保障守卫（并同步切回门禁）。"""
+        self.remote_guard = guard
+        if defer_failback is not None:
+            self.defer_failback = bool(defer_failback)
+        self.manager.failback_gate = self._failback_gate()
+        self._note("远程保障守卫：%s（切回门禁 %s）"
+                   % ("已接入" if guard is not None else "未接入",
+                      "开启" if self.manager.failback_gate else "关闭"))
+        return guard
+
+    def remote_status(self) -> Optional[Any]:
+        """远程保障守卫的最近状态（未接入时为 ``None``）。"""
+        guard = self.remote_guard
+        if guard is None:
+            return None
+        getter = getattr(guard, "status", None)
+        try:
+            return getter() if callable(getter) else None
+        except Exception:                        # 守卫故障不得让托盘崩溃
+            return None
 
     # ---- 外部控制 ---- #
     def set_mode(self, mode: Any) -> FailoverMode:
@@ -452,6 +503,8 @@ class TrayFailoverBridge:
             wifi_status=_wifi_status_text(wifi),
             egress=_egress_text(snap, ethernet, wifi),
             remote_guard=self._remote_guard(),
+            remote_detail=self._remote_detail(),
+            remote_warnings=self._remote_warnings(),
             lock_target=manager.lock_target, locked=locked,
             readonly=(result.readonly if result is not None else True),
             clash_keep=self.clash_keep, authorized=self.authorized,
@@ -469,8 +522,32 @@ class TrayFailoverBridge:
             return REMOTE_MANUAL
         if self.manager.mode is FailoverMode.AUTO and self.authorized \
                 and self.executor_attached:
+            status = self.remote_status()
+            if status is not None and getattr(status, "sensitive", False):
+                # P7：远程会话进行中 —— 保障启用但推迟自动切回（方案 §4.3）。
+                return REMOTE_SENSITIVE
             return REMOTE_ENABLED
         return REMOTE_OFF
+
+    def _remote_detail(self) -> str:
+        """远控详情单行摘要（未接入守卫时为 ``""``，展示层保持 P6 语义）。"""
+        status = self.remote_status()
+        if status is None:
+            return ""
+        clients = ", ".join(getattr(status, "clients", None) or []) or "无"
+        return ("远控 %s · 客户端 %s · 已建立 %d 条 · 监听 %s · UDP %d 个"
+                % (getattr(status, "activity", "UNKNOWN"), clients,
+                   int(getattr(status, "established", 0) or 0),
+                   "有" if getattr(status, "listening", False) else "无",
+                   int(getattr(status, "udp_endpoints", 0) or 0)))
+
+    def _remote_warnings(self) -> List[str]:
+        """无人值守就绪缺口（未执行就绪自检时为空）。"""
+        guard = self.remote_guard
+        report = getattr(guard, "last_readiness", None) if guard else None
+        if report is None:
+            return []
+        return list(getattr(report, "warnings", None) or [])
 
     def _note(self, message: str) -> None:
         if self._log is not None:
