@@ -17,6 +17,7 @@
   status      诊断: Wi-Fi / Portal / 公网探测 / 系统代理绕过列表
   once        执行一次重连 (--dry-run 预检; --force 在线强制, 会提交真实凭据)
   watch       常驻监测, 掉线自动重连 (单实例保护, 重复启动自动退出)
+  netcheck    V0.3 P1 只读三轴网络健康检查(有线/无线/系统), 只给决策不切换
   fix-bypass  把 Portal 地址写入系统代理绕过列表(注册表), Edge 无需关代理即可打开登录页
 
 安全边界: 不执行注销(logoff), 不修改 Clash Verge 配置, 不明文保存密码, 日志不含密码。
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import logging
 import logging.handlers
 import os
@@ -52,6 +54,8 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          check_redirect_target, classify_network,
                          extract_error_hint, parse_status_page, probe_matches,
                          repair_service, resolve_url)
+from campus_network import (NetworkObserver, WindowsProbeEngine, evaluate,
+                            format_snapshot)
 from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
                             parse_ipconfig_ipv4, parse_netsh_interfaces,
                             wifi_state_from_text)
@@ -667,6 +671,37 @@ def diagnose_network(session: requests.Session, target_ssid: str = "",
     return status, results, portal
 
 
+def netcheck(session: requests.Session, args: argparse.Namespace,
+             log: logging.Logger) -> int:
+    """V0.3 P1 只读三轴健康检查（netcheck）：不切换、不认证、不写系统。
+
+    复用 P0 ``netdiag`` 只读管道（PowerShellRunner 逐命令 ``assert_read_only``
+    fail-closed）获取网卡/路由观察，再用 ``campus_network`` 的三轴健康检测给出
+    ETHERNET_HEALTH / WIFI_HEALTH / SYSTEM_HEALTH 结论与"如果允许切换，将选择
+    哪条路径"的**只读决策**（方案 §3.2/§3.3）。本命令无任何写入口。
+    """
+    from tools import netdiag
+
+    runner = netdiag.PowerShellRunner()
+    observer = NetworkObserver(runner)
+    report = observer.observe(target_ssid=args.ssid)
+    engine = WindowsProbeEngine()
+    snapshot = evaluate(
+        report, engine=engine,
+        system_probe=lambda: internet_ok(session),
+        route_lookup=observer.route_lookup,
+    )
+    print(format_snapshot(snapshot))
+    if args.json:
+        print(json.dumps(snapshot.to_dict(), ensure_ascii=False, indent=2))
+    log.info("netcheck 完成（只读）：建议=%s，是否切换=%s",
+             snapshot.recommendation.preferred if snapshot.recommendation
+             else None,
+             snapshot.recommendation.would_switch if snapshot.recommendation
+             else None)
+    return 0
+
+
 def status(session: requests.Session, args: argparse.Namespace) -> None:
     ssid, state = wifi_state()
     print("无线网卡状态 : %s（SSID: %s）" % (state, ssid or "未连接"))
@@ -833,6 +868,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--port", type=_port_type, default=None,
                           help="默认动态识别端口；可强制指定 1..65535 的端口")
     sub.add_parser("fix-bypass", help="把 Portal 地址写入系统代理绕过列表")
+    p_netcheck = sub.add_parser(
+        "netcheck",
+        help="V0.3 P1 只读三轴网络健康检查（不切换路由、不发认证）")
+    p_netcheck.add_argument("--ssid", default="SNNU",
+                            help="目标校园 Wi-Fi 名称，默认 SNNU")
+    p_netcheck.add_argument("--json", action="store_true",
+                            help="额外输出机器可读 JSON（三轴快照契约）")
     for command in ("once", "watch"):
         p = sub.add_parser(command, help="单次尝试" if command == "once" else "常驻自动重连")
         p.add_argument("--ssid", default="SNNU", help="目标校园 Wi-Fi 名称，默认 SNNU")
@@ -873,6 +915,8 @@ def main() -> None:
     session = direct_session()
     if args.command == "status":
         status(session, args)
+    elif args.command == "netcheck":
+        raise SystemExit(netcheck(session, args, log))
     elif args.command == "fix-bypass":
         if not fix_bypass(log):
             raise SystemExit(1)
