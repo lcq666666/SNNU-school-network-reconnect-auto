@@ -327,3 +327,53 @@ def test_t10_proxy_skip_note_is_honest(monkeypatch):
     assert "已自动开启系统代理" not in notes[0][1]
     assert "系统代理未开启" in notes[0][1]
 
+
+
+# --------------------------------------------------------------------------- #
+# T36：UI 事件队列（设置面板实时状态的数据通路）
+# --------------------------------------------------------------------------- #
+class _FakeRoot:
+    """最小 Tk root 替身：记录 ``after`` 重排定时器，不创建真实窗口。"""
+
+    def __init__(self):
+        self.after_calls = []
+
+    def after(self, ms, func):
+        self.after_calls.append((ms, func))
+        return "after-id"
+
+
+def test_t36_ui_actions_are_consumed_on_pump(monkeypatch):
+    """``_ui_post`` 只入队；``_pump_ui``（Tk 主线程）按序消费，网络线程不直接调 Tk。"""
+    app = _make_app(monkeypatch)
+    app.root = _FakeRoot()
+    seen = []
+    app._ui_post(lambda: seen.append("a"))
+    app._ui_post(lambda: seen.append("b"))
+    app._pump_ui()
+    assert seen == ["a", "b"]
+    app._pump_ui()               # 空队列不应抛异常
+    assert seen == ["a", "b"]
+
+
+def test_t36_pump_survives_action_exception(monkeypatch):
+    """单个 UI 动作抛异常不得中断后续动作的消费。"""
+    app = _make_app(monkeypatch)
+    app.root = _FakeRoot()
+    seen = []
+
+    def boom():
+        raise RuntimeError("ui action failed")
+
+    app._ui_post(boom)
+    app._ui_post(lambda: seen.append("after"))
+    app._pump_ui()
+    assert seen == ["after"]
+
+
+def test_t36_ui_post_is_thread_safe_enqueue(monkeypatch):
+    """网络线程调用 ``_ui_post`` 只入队（不触碰 Tk）。"""
+    app = _make_app(monkeypatch)
+    app.root = None
+    app._ui_post(lambda: None)
+    assert app._ui_actions.qsize() == 1
