@@ -625,6 +625,12 @@ class NetworkFailoverManager:
                     wifi_metric=policy.wifi_interface_metric)
                 if outcome.attempted:
                     self._note_switch(now)
+                if self.mode.executes and not outcome.executed:
+                    # P5 契约：执行态必须"动作已执行"才能进入（否则会在动作失败时
+                    # 谎报已切换）。此处保持准备状态，由超时/冷却兜底。
+                    notes.append("路由切换动作未执行（%s）：不进入 WIFI_SWITCHING，"
+                                 "保持备用链路准备" % (outcome.detail or "未执行"))
+                    return state
                 return FailoverState.WIFI_SWITCHING
             if wifi_captive:
                 if not self.timers.auth_allowed(now):
@@ -636,6 +642,10 @@ class NetworkFailoverManager:
                 if outcome.attempted:
                     self.auth_attempts += 1
                     self._note_auth(now)
+                if self.mode.executes and not outcome.executed:
+                    notes.append("Portal 认证动作未执行（%s）：不进入 WIFI_AUTHENTICATING，"
+                                 "保持备用链路准备" % (outcome.detail or "未执行"))
+                    return state
                 return FailoverState.WIFI_AUTHENTICATING
             if wifi_fail:
                 if self._reconnect_due(now):
@@ -755,6 +765,10 @@ class NetworkFailoverManager:
                     wifi_metric=policy.wifi_interface_metric)
                 if outcome.attempted:
                     self._note_switch(now)
+                if self.mode.executes and not outcome.executed:
+                    notes.append("切回动作未执行（%s）：不进入 ETHERNET_FAILBACK，"
+                                 "保持恢复观察" % (outcome.detail or "未执行"))
+                    return state
                 return FailoverState.ETHERNET_FAILBACK
             if wifi_fail:
                 notes.append("恢复观察期无线中断且有线未恢复 → 两条路径均不可用")
