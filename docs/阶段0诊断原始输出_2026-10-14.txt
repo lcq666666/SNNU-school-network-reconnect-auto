@@ -1,0 +1,153 @@
+adapters.json 草案已写入: C:\Users\33809\WorkBuddy AI\校园网自动重连助手\adapters.json
+警告: 4 个诊断项采集失败（详见报告错误节）。
+========================================================================
+V0.3 P0 双网卡与路由基线报告（只读诊断，零写入）
+契约版本: v03-p0-diag-1    生成时间: 2026-10-14T12:34:19+08:00
+主机: chiqiangli    系统: Windows-11-10.0.26200-SP0
+========================================================================
+
+[1] 网卡清单
+  物理网卡（2 张）：
+    - 以太网 [以太网] ifIndex=10 状态=Up MAC=98-8F-E0-6B-B2-78
+      InterfaceGuid={53352EF9-2FE7-4730-9A94-D951A69BF111}
+      PNPDeviceID=PCI\VEN_8086&DEV_1A1F&SUBSYS_380317AA&REV_01\3&11583659&0&FE
+      描述=Intel(R) Ethernet Connection (16) I219-V 速率=1 Gbps
+    - WLAN [Wi-Fi] ifIndex=5 状态=Disconnected MAC=10-B1-DF-EA-EB-B1
+      InterfaceGuid={2F5F4616-6624-46E8-BD62-84A44A9C4E0A}
+      PNPDeviceID=PCI\VEN_14C3&DEV_7961&SUBSYS_E0BC17AA&REV_00\4&38B8AF01&0&00E0
+      描述=MediaTek Wi-Fi 6 MT7921 Wireless LAN Card 速率=573.5 Mbps
+  虚拟/软件网卡（16 张，已排除自动优先级修改，仅保留诊断）：
+    - 本地连接* 6 ifIndex=21 状态=Disconnected 描述=WAN Miniport (PPPOE)
+    - 本地连接* 9 ifIndex=20 状态=Up 描述=WAN Miniport (Network Monitor)
+    - 以太网(内核调试器) ifIndex=19 状态=Not Present 描述=Microsoft Kernel Debug Network Adapter
+    - 本地连接* 7 ifIndex=17 状态=Up 描述=WAN Miniport (IP)
+    - 本地连接* 1 ifIndex=16 状态=Disconnected 描述=Microsoft Wi-Fi Direct Virtual Adapter
+    - 本地连接* 10 ifIndex=15 状态=Disconnected 描述=Microsoft Wi-Fi Direct Virtual Adapter #2
+    - 本地连接* 3 ifIndex=14 状态=Disconnected 描述=WAN Miniport (IKEv2)
+    - Teredo Tunneling Pseudo-Interface ifIndex=13 状态=Not Present 描述=
+    - 本地连接* 8 ifIndex=12 状态=Up 描述=WAN Miniport (IPv6)
+    - 本地连接* 5 ifIndex=9 状态=Disconnected 描述=WAN Miniport (PPTP)
+    - 蓝牙网络连接 ifIndex=8 状态=Disconnected 描述=Bluetooth Device (Personal Area Network)
+    - 本地连接* 2 ifIndex=7 状态=Disconnected 描述=WAN Miniport (SSTP)
+    - Tailscale ifIndex=6 状态=Up 描述=Tailscale Tunnel
+    - 本地连接* 4 ifIndex=4 状态=Disconnected 描述=WAN Miniport (L2TP)
+    - Microsoft IP-HTTPS Platform Interface ifIndex=3 状态=Not Present 描述=
+    - 6to4 Adapter ifIndex=2 状态=Not Present 描述=
+
+[2] 接口汇总（IP / 网关 / Metric）
+  以太网 (ifIndex=10, 状态=Up)
+    IPv4=192.168.124.9 网关=192.168.124.1 Metric=25(自动=Enabled)
+    IPv6=fe80::ddcf:c9cb:ccb9:2740%10 网关=- Metric=25(自动=Enabled)
+  WLAN (ifIndex=5, 状态=Disconnected)
+    IPv4=169.254.196.157 网关=10.138.0.1 Metric=35(自动=Enabled)
+    IPv6=fe80::d38e:a3fe:a3ac:93e6%5,240c:c28f:1011:dbbe:d958:8ed1:4010:54cc,240c:c28f:1011:dbbe:d1d5:4dd4:9843:f0f8 网关=- Metric=35(自动=Enabled)
+
+[3] 默认路由
+    0.0.0.0/0 via 192.168.124.1   ifIndex=10   RouteMetric=0 InterfaceMetric=25 (以太网)
+    0.0.0.0/0 via 10.138.0.1      ifIndex=5    RouteMetric=0 InterfaceMetric=35 (WLAN)
+
+[4] 当前公网出口（Find-NetRoute 路由表查询，不发包）
+    目标 8.8.8.8 (IPv4): 源地址=192.168.124.9 出口 ifIndex=10（以太网）InterfaceMetric=None
+    目标 2606:4700:4700::1111 (IPv6): 识别失败 —— 命令返回码 1
+
+[5] Wi-Fi
+    接口=WLAN SSID=None Profile=None 状态=disconnected 匹配目标=False
+
+[6] 双网卡并存判定（P0-T3）
+    结论: 暂不能确定
+    依据: 未发现阻断策略，但当前无法同时观测到两网卡在线（以太网 Up=True，WLAN 关联=False），需人工插拔网线/Wi-Fi 验证（R-0-02）后给出最终结论。
+    证据明细:
+      [网卡高级属性]以太网=Flow Control「Auto Negotiation」
+      [网卡高级属性]以太网=Interrupt Moderation「Enabled」
+      [网卡高级属性]以太网=IPv4 Checksum Offload「Rx & Tx Enabled」
+      [网卡高级属性]以太网=Jumbo Packet「1514」
+      [网卡高级属性]以太网=Large Send Offload V2 (IPv4)「Enabled」
+      [网卡高级属性]以太网=Large Send Offload V2 (IPv6)「Enabled」
+      [网卡高级属性]以太网=Wake from S0ix on Magic Packet「Enabled」
+      [网卡高级属性]以太网=Protocol ARP Offload「Enabled」
+      [网卡高级属性]以太网=Protocol NS Offload「Enabled」
+      [网卡高级属性]以太网=Packet Priority & VLAN「Packet Priority & VLAN Enabled」
+      [网卡高级属性]以太网=PTP Hardware Timestamp「Disabled」
+      [网卡高级属性]以太网=Receive Buffers「256」
+      [网卡高级属性]以太网=Selective Suspend「Enabled」
+      [网卡高级属性]以太网=Software Timestamp「Disabled」
+      [网卡高级属性]以太网=Speed & Duplex「Auto Negotiation」
+      [网卡高级属性]以太网=Selective Suspend Idle Timeout「20」
+      [网卡高级属性]以太网=TCP Checksum Offload (IPv4)「Rx & Tx Enabled」
+      [网卡高级属性]以太网=TCP Checksum Offload (IPv6)「Rx & Tx Enabled」
+      [网卡高级属性]以太网=Transmit Buffers「512」
+      [网卡高级属性]以太网=UDP Checksum Offload (IPv4)「Rx & Tx Enabled」
+      [网卡高级属性]以太网=UDP Checksum Offload (IPv6)「Rx & Tx Enabled」
+      [网卡高级属性]以太网=Wake on Magic Packet「Enabled」
+      [网卡高级属性]以太网=Wake on Pattern Match「Enabled」
+      [网卡高级属性]以太网=Adaptive Inter-Frame Spacing「Disabled」
+      [网卡高级属性]以太网=Link Speed Battery Saver「Disabled」
+      [网卡高级属性]以太网=Energy Efficient Ethernet「On」
+      [网卡高级属性]以太网=Enable PME「Enabled」
+      [网卡高级属性]以太网=Interrupt Moderation Rate「Adaptive」
+      [网卡高级属性]以太网=Legacy Switch Compatibility Mode「Disabled」
+      [网卡高级属性]以太网=Log Link State Event「Enabled」
+      [网卡高级属性]以太网=Gigabit Master Slave Mode「Auto Detect」
+      [网卡高级属性]以太网=Locally Administered Address「」
+      [网卡高级属性]以太网=Reduce Speed On Power Down「Enabled」
+      [网卡高级属性]以太网=System Idle Power Saver「Disabled」
+      [网卡高级属性]以太网=Ultra Low Power Mode「Enabled」
+      [网卡高级属性]以太网=Wait for Link「Auto Detect」
+      [网卡高级属性]以太网=Wake on Link Settings「Disabled」
+      [网卡高级属性]WLAN=Band Selection「1. Dual Band」
+      [网卡高级属性]WLAN=2.4GHz channel bandwidth「1. Auto」
+      [网卡高级属性]WLAN=5GHz channel bandwidth「1. Auto」
+      [网卡高级属性]WLAN=802.11ax/ac/n/abg「1. 802.11ax」
+      [网卡高级属性]WLAN=ARP Offload for WOWLAN「Enabled」
+      [网卡高级属性]WLAN=GTK Rekey for WOWLAN「Enabled」
+      [网卡高级属性]WLAN=Wake on Magic Packet「Enabled」
+      [网卡高级属性]WLAN=Wake on Pattern Match「Enabled」
+      [网卡高级属性]WLAN=Preferred Band「1. No Preference」
+      [网卡高级属性]WLAN=Transmit Power Level「1. Highest」
+      [网卡高级属性]WLAN=U-APSD Support「Disabled」
+      [网卡高级属性]WLAN=Miracast prefer band「Auto」
+
+[7] 远控路径与无人值守设置（P0-T5）
+    远控客户端进程: tailscaled(pid=6864), tailscaled(pid=7832)
+    远控相关端口: 监听 2 个（443, 443）；已建立 0 条
+    UDP 端点: :::41641(pid=7832), 0.0.0.0:41641(pid=7832)
+    睡眠状态: Standby 可用=True 休眠可用=True（无人值守需在电源选项中关闭睡眠/休眠）
+    自动登录: AutoAdminLogon=None 用户=None
+    自启项 Run（26 个）:
+      [HKLM] SecurityHealth = C:\WINDOWS\system32\SecurityHealthSystray.exe
+      [HKLM] RtkAudUService = "C:\WINDOWS\System32\DriverStore\FileRepository\realtekservice.inf_amd64_04ff63d068f8c626\RtkAudUService64.exe" -background
+      [HKLM] sysdiag = "C:\_Software\Huorong\Sysdiag\bin\hipstray.exe"
+      [HKLM] AweSun = "C:\_Software\Oray\AweSun\AweSun.exe" --cmd=autorun
+      [HKCU] OneDrive = "C:\Users\33809\AppData\Local\Microsoft\OneDrive\OneDrive.exe" /background
+      [HKCU] Thunder = C:\Program Files (x86)\Thunder Network\Thunder\Program\Thunder.exe -silent -StartType:AutoRun
+      [HKCU] BaiduYunDetect = "C:\Users\33809\AppData\Roaming\baidu\BaiduNetdisk\YunDetectService.exe"
+      [HKCU] youkuClient = "C:\_Software\YOUKU\9.2.67.1002\YOUKU.exe" --openAsHidden
+      [HKCU] cloudmusic = "C:\_Software\CloudMusic\cloudmusic.exe" --orpheus-startup=autorun
+      [HKCU] Weixin = "C:\_Software\Weixin\Weixin.exe" -autorun
+      [HKCU] QQNT = "C:\_Software\QQ\QQ.exe" /background
+      [HKCU] QuarkUpdaterTaskUser1.0.0.21 = "C:\Users\33809\AppData\Local\QuarkUpdater\QuarkUpdater\1.0.0.21\updater.exe" --wake --enable-logging --vmodule=*/components/winhttp/*=1,*/components/update_client/*=2,*/chrome/updater/*=2,*/chrome/updater/quark/*=2,*/quark/utils/*=2
+      [HKCU] quark = "C:\_Software\Quark\quark.exe" --launch-from=loginitem
+      [HKCU] com.alicloud.smartdrive = C:\_Software\aDrive\aDrive.exe --openAtLogin
+      [HKCU] GameViewer = "C:\_study\GameViewer\GameViewer.exe" --auto-run
+      [HKCU] Steam = "C:\_Software\Steam\steam.exe" -silent
+      [HKCU] WXWork = "C:\_Software\WXWork\WXWork.exe" -min -autorun
+      [HKCU] Feishu = "C:\_Software\Feishu\Feishu.exe"
+      [HKCU] ctfmon = C:\Windows\system32\ctfmon.exe
+      [HKCU] YoudaoDict = "C:\_Software\Dict\YoudaoDict.exe" -hide -autostart
+      [HKCU] LazyTyper = "C:\Users\33809\Desktop\LazyTyper-Migration2\LazyTyper\LazyTyper.exe" --silent
+      [HKCU] WorkBuddy.WorkBuddyAI = C:\_Software\Workbuddy\WorkBuddyAI\WorkBuddyAI.exe
+      [HKCU] Gemini = "C:\Users\33809\AppData\Local\Google\Gemini\GeminiAppLauncher.exe"
+      [HKCU] MicrosoftEdgeAutoLaunch_A5FF6E1A73D4CA265786E8CA32B0A486 = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --no-startup-window --win-session-start
+      [HKCU] GoogleUpdaterTaskUser157.0.8089.0 = "C:\Users\33809\AppData\Local\Google\GoogleUpdater\157.0.8089.0\updater.exe" --wake
+      [HKCU] CampusReconnectTray = "C:\Users\33809\WorkBuddy AI\校园网自动重连助手\CampusReconnect.exe"
+
+[8] 采集错误（4 项，不影响已采集部分）:
+    - default_routes: 命令返回码 1 但有有效输出（非终止错误，已采用）：
+    - egress_v6: 返回码 1
+    - power_management: 返回码 1
+    - remote_udp: 命令返回码 1 但有有效输出（非终止错误，已采用）：
+
+------------------------------------------------------------------------
+说明: 本报告全部命令只读（已通过 assert_read_only 自检）；
+      --json 输出为 P1 接口契约（v03-p0-diag-1）。
+------------------------------------------------------------------------

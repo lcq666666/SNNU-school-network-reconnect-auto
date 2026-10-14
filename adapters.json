@@ -1,0 +1,49 @@
+{
+  "contract_version": "v03-p0-adapters-1",
+  "generated_at": "2026-10-14T12:34:19+08:00",
+  "host": "chiqiangli",
+  "adapters": {
+    "ethernet": {
+      "name": "以太网",
+      "description": "Intel(R) Ethernet Connection (16) I219-V",
+      "guid": "{53352EF9-2FE7-4730-9A94-D951A69BF111}",
+      "if_index": 10,
+      "mac": "98-8F-E0-6B-B2-78",
+      "pnp_device_id": "PCI\\VEN_8086&DEV_1A1F&SUBSYS_380317AA&REV_01\\3&11583659&0&FE",
+      "status": "Up"
+    },
+    "wifi": {
+      "name": "WLAN",
+      "description": "MediaTek Wi-Fi 6 MT7921 Wireless LAN Card",
+      "guid": "{2F5F4616-6624-46E8-BD62-84A44A9C4E0A}",
+      "if_index": 5,
+      "mac": "10-B1-DF-EA-EB-B1",
+      "pnp_device_id": "PCI\\VEN_14C3&DEV_7961&SUBSYS_E0BC17AA&REV_00\\4&38B8AF01&0&00E0",
+      "status": "Disconnected"
+    },
+    "ethernet_candidates": [
+      {
+        "name": "以太网",
+        "description": "Intel(R) Ethernet Connection (16) I219-V",
+        "guid": "{53352EF9-2FE7-4730-9A94-D951A69BF111}",
+        "if_index": 10,
+        "mac": "98-8F-E0-6B-B2-78",
+        "pnp_device_id": "PCI\\VEN_8086&DEV_1A1F&SUBSYS_380317AA&REV_01\\3&11583659&0&FE",
+        "status": "Up"
+      }
+    ],
+    "wifi_candidates": [
+      {
+        "name": "WLAN",
+        "description": "MediaTek Wi-Fi 6 MT7921 Wireless LAN Card",
+        "guid": "{2F5F4616-6624-46E8-BD62-84A44A9C4E0A}",
+        "if_index": 5,
+        "mac": "10-B1-DF-EA-EB-B1",
+        "pnp_device_id": "PCI\\VEN_14C3&DEV_7961&SUBSYS_E0BC17AA&REV_00\\4&38B8AF01&0&00E0",
+        "status": "Disconnected"
+      }
+    ]
+  },
+  "warnings": [],
+  "notes": "标识优先级：PNPDeviceID > InterfaceGuid > MAC；重启 Wi-Fi/插拔网线后需复测（P0 出口条件 4）。"
+}

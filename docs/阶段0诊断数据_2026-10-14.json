@@ -1,0 +1,1199 @@
+{
+  "contract_version": "v03-p0-diag-1",
+  "generated_at": "2026-10-14T12:34:19+08:00",
+  "host": "chiqiangli",
+  "os_version": "Windows-11-10.0.26200-SP0",
+  "adapters": [
+    {
+      "name": "本地连接* 6",
+      "description": "WAN Miniport (PPPOE)",
+      "guid": "{F3E819B4-A833-4F89-8D37-C6F53D40FAD9}",
+      "if_index": 21,
+      "status": "Disconnected",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Connection Oriented WAN",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "本地连接* 9",
+      "description": "WAN Miniport (Network Monitor)",
+      "guid": "{E9A97A35-B070-4799-BD48-1DBDDA9C204D}",
+      "if_index": 20,
+      "status": "Up",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "802.3",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "以太网(内核调试器)",
+      "description": "Microsoft Kernel Debug Network Adapter",
+      "guid": "{E8AC387C-1C26-4F0D-B32A-E9AD140E53EC}",
+      "if_index": 19,
+      "status": "Not Present",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "802.3",
+      "physical_media_type": "802.3",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "本地连接* 7",
+      "description": "WAN Miniport (IP)",
+      "guid": "{C998E099-2F06-46D9-B185-BC135ABA4FC8}",
+      "if_index": 17,
+      "status": "Up",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "802.3",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "本地连接* 1",
+      "description": "Microsoft Wi-Fi Direct Virtual Adapter",
+      "guid": "{B7420F88-332D-4617-B045-5F297648A03F}",
+      "if_index": 16,
+      "status": "Disconnected",
+      "mac": "12-B1-DF-EA-CB-91",
+      "link_speed": "0 bps",
+      "media_type": "Native 802.11",
+      "physical_media_type": "Native 802.11",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": "{5D624F94-8850-40C3-A3FA-A4FD2080BAF3}\\VWIFIMP_WFD\\5&227D1507&0&11"
+    },
+    {
+      "name": "本地连接* 10",
+      "description": "Microsoft Wi-Fi Direct Virtual Adapter #2",
+      "guid": "{A48340DC-2AFB-43DA-9EDC-AADB4A55A5FE}",
+      "if_index": 15,
+      "status": "Disconnected",
+      "mac": "12-B1-DF-EA-DB-81",
+      "link_speed": "0 bps",
+      "media_type": "Native 802.11",
+      "physical_media_type": "Native 802.11",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": "{5D624F94-8850-40C3-A3FA-A4FD2080BAF3}\\VWIFIMP_WFD\\5&227D1507&0&12"
+    },
+    {
+      "name": "本地连接* 3",
+      "description": "WAN Miniport (IKEv2)",
+      "guid": "{A0FF00EF-59A1-499D-A3E5-9C21149864D1}",
+      "if_index": 14,
+      "status": "Disconnected",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Connection Oriented WAN",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "Teredo Tunneling Pseudo-Interface",
+      "description": "",
+      "guid": "{93123211-9629-4E04-82F0-EA2E4F221468}",
+      "if_index": 13,
+      "status": "Not Present",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Tunnel",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "本地连接* 8",
+      "description": "WAN Miniport (IPv6)",
+      "guid": "{7E0BF42A-5FEB-4F2C-8B99-E4E2F7175BA7}",
+      "if_index": 12,
+      "status": "Up",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "802.3",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "以太网",
+      "description": "Intel(R) Ethernet Connection (16) I219-V",
+      "guid": "{53352EF9-2FE7-4730-9A94-D951A69BF111}",
+      "if_index": 10,
+      "status": "Up",
+      "mac": "98-8F-E0-6B-B2-78",
+      "link_speed": "1 Gbps",
+      "media_type": "802.3",
+      "physical_media_type": "802.3",
+      "virtual": false,
+      "hardware": true,
+      "connector": true,
+      "category": "physical-ethernet",
+      "media": "ethernet",
+      "pnp_device_id": "PCI\\VEN_8086&DEV_1A1F&SUBSYS_380317AA&REV_01\\3&11583659&0&FE"
+    },
+    {
+      "name": "本地连接* 5",
+      "description": "WAN Miniport (PPTP)",
+      "guid": "{519E90C8-FD1E-45B8-B216-E891AC4B60A2}",
+      "if_index": 9,
+      "status": "Disconnected",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Connection Oriented WAN",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "蓝牙网络连接",
+      "description": "Bluetooth Device (Personal Area Network)",
+      "guid": "{3B109E46-BAFC-4A4F-90CB-5583BA34FC5D}",
+      "if_index": 8,
+      "status": "Disconnected",
+      "mac": "10-B1-DF-EA-EB-B2",
+      "link_speed": "3 Mbps",
+      "media_type": "802.3",
+      "physical_media_type": "BlueTooth",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": "BTH\\MS_BTHPAN\\7&6C4828F&0&2"
+    },
+    {
+      "name": "本地连接* 2",
+      "description": "WAN Miniport (SSTP)",
+      "guid": "{38B1253E-B083-4E9E-889B-FBB02C2B267B}",
+      "if_index": 7,
+      "status": "Disconnected",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Connection Oriented WAN",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "Tailscale",
+      "description": "Tailscale Tunnel",
+      "guid": "{37217669-42DA-4657-A55B-0D995D328250}",
+      "if_index": 6,
+      "status": "Up",
+      "mac": "",
+      "link_speed": "100 Gbps",
+      "media_type": "IP",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": "SWD\\WINTUN\\{37217669-42DA-4657-A55B-0D995D328250}"
+    },
+    {
+      "name": "WLAN",
+      "description": "MediaTek Wi-Fi 6 MT7921 Wireless LAN Card",
+      "guid": "{2F5F4616-6624-46E8-BD62-84A44A9C4E0A}",
+      "if_index": 5,
+      "status": "Disconnected",
+      "mac": "10-B1-DF-EA-EB-B1",
+      "link_speed": "573.5 Mbps",
+      "media_type": "Native 802.11",
+      "physical_media_type": "Native 802.11",
+      "virtual": false,
+      "hardware": true,
+      "connector": true,
+      "category": "physical-wifi",
+      "media": "wifi",
+      "pnp_device_id": "PCI\\VEN_14C3&DEV_7961&SUBSYS_E0BC17AA&REV_00\\4&38B8AF01&0&00E0"
+    },
+    {
+      "name": "本地连接* 4",
+      "description": "WAN Miniport (L2TP)",
+      "guid": "{2F357BFA-3C1A-4851-A7CC-E7E53FDC07AC}",
+      "if_index": 4,
+      "status": "Disconnected",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Connection Oriented WAN",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "Microsoft IP-HTTPS Platform Interface",
+      "description": "",
+      "guid": "{2EE2C70C-A092-4D88-A654-98C8D7645CD5}",
+      "if_index": 3,
+      "status": "Not Present",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Tunnel",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    },
+    {
+      "name": "6to4 Adapter",
+      "description": "",
+      "guid": "{07374750-E68B-490E-9330-9FD785CD71B6}",
+      "if_index": 2,
+      "status": "Not Present",
+      "mac": "",
+      "link_speed": "0 bps",
+      "media_type": "Tunnel",
+      "physical_media_type": "Unspecified",
+      "virtual": true,
+      "hardware": false,
+      "connector": false,
+      "category": "virtual",
+      "media": "virtual",
+      "pnp_device_id": ""
+    }
+  ],
+  "ip_interfaces": [
+    {
+      "if_index": 15,
+      "interface_alias": "本地连接* 10",
+      "address_family": "IPv6",
+      "interface_metric": 25,
+      "automatic_metric": "Enabled",
+      "dhcp": "",
+      "connection_state": ""
+    },
+    {
+      "if_index": 8,
+      "interface_alias": "蓝牙网络连接",
+      "address_family": "IPv6",
+      "interface_metric": 65,
+      "automatic_metric": "Enabled",
+      "dhcp": "",
+      "connection_state": ""
+    },
+    {
+      "if_index": 16,
+      "interface_alias": "本地连接* 1",
+      "address_family": "IPv6",
+      "interface_metric": 25,
+      "automatic_metric": "Enabled",
+      "dhcp": "",
+      "connection_state": ""
+    },
+    {
+      "if_index": 6,
+      "interface_alias": "Tailscale",
+      "address_family": "IPv6",
+      "interface_metric": 5,
+      "automatic_metric": "Enabled",
+      "dhcp": "",
+      "connection_state": "1"
+    },
+    {
+      "if_index": 10,
+      "interface_alias": "以太网",
+      "address_family": "IPv6",
+      "interface_metric": 25,
+      "automatic_metric": "Enabled",
+      "dhcp": "1",
+      "connection_state": "1"
+    },
+    {
+      "if_index": 5,
+      "interface_alias": "WLAN",
+      "address_family": "IPv6",
+      "interface_metric": 35,
+      "automatic_metric": "Enabled",
+      "dhcp": "1",
+      "connection_state": ""
+    },
+    {
+      "if_index": 1,
+      "interface_alias": "Loopback Pseudo-Interface 1",
+      "address_family": "IPv6",
+      "interface_metric": 75,
+      "automatic_metric": "Enabled",
+      "dhcp": "",
+      "connection_state": "1"
+    },
+    {
+      "if_index": 15,
+      "interface_alias": "本地连接* 10",
+      "address_family": "IPv4",
+      "interface_metric": 25,
+      "automatic_metric": "Enabled",
+      "dhcp": "1",
+      "connection_state": ""
+    },
+    {
+      "if_index": 8,
+      "interface_alias": "蓝牙网络连接",
+      "address_family": "IPv4",
+      "interface_metric": 65,
+      "automatic_metric": "Enabled",
+      "dhcp": "1",
+      "connection_state": ""
+    },
+    {
+      "if_index": 16,
+      "interface_alias": "本地连接* 1",
+      "address_family": "IPv4",
+      "interface_metric": 25,
+      "automatic_metric": "Enabled",
+      "dhcp": "1",
+      "connection_state": ""
+    },
+    {
+      "if_index": 6,
+      "interface_alias": "Tailscale",
+      "address_family": "IPv4",
+      "interface_metric": 5,
+      "automatic_metric": "Enabled",
+      "dhcp": "",
+      "connection_state": "1"
+    },
+    {
+      "if_index": 10,
+      "interface_alias": "以太网",
+      "address_family": "IPv4",
+      "interface_metric": 25,
+      "automatic_metric": "Enabled",
+      "dhcp": "1",
+      "connection_state": "1"
+    },
+    {
+      "if_index": 5,
+      "interface_alias": "WLAN",
+      "address_family": "IPv4",
+      "interface_metric": 35,
+      "automatic_metric": "Enabled",
+      "dhcp": "1",
+      "connection_state": ""
+    },
+    {
+      "if_index": 1,
+      "interface_alias": "Loopback Pseudo-Interface 1",
+      "address_family": "IPv4",
+      "interface_metric": 75,
+      "automatic_metric": "Enabled",
+      "dhcp": "",
+      "connection_state": "1"
+    }
+  ],
+  "ip_addresses": [
+    {
+      "if_index": 15,
+      "interface_alias": "本地连接* 10",
+      "address_family": "IPv6",
+      "ip_address": "fe80::8ff2:29dd:ee69:66f1%15",
+      "prefix_length": 64,
+      "address_state": "3"
+    },
+    {
+      "if_index": 8,
+      "interface_alias": "蓝牙网络连接",
+      "address_family": "IPv6",
+      "ip_address": "fe80::2421:1fa8:3911:f6d3%8",
+      "prefix_length": 64,
+      "address_state": "3"
+    },
+    {
+      "if_index": 16,
+      "interface_alias": "本地连接* 1",
+      "address_family": "IPv6",
+      "ip_address": "fe80::6b55:4880:d8c5:ad74%16",
+      "prefix_length": 64,
+      "address_state": "3"
+    },
+    {
+      "if_index": 6,
+      "interface_alias": "Tailscale",
+      "address_family": "IPv6",
+      "ip_address": "fe80::bc:2eb2:7272:6218%6",
+      "prefix_length": 64,
+      "address_state": "4"
+    },
+    {
+      "if_index": 10,
+      "interface_alias": "以太网",
+      "address_family": "IPv6",
+      "ip_address": "fe80::ddcf:c9cb:ccb9:2740%10",
+      "prefix_length": 64,
+      "address_state": "4"
+    },
+    {
+      "if_index": 5,
+      "interface_alias": "WLAN",
+      "address_family": "IPv6",
+      "ip_address": "fe80::d38e:a3fe:a3ac:93e6%5",
+      "prefix_length": 64,
+      "address_state": "3"
+    },
+    {
+      "if_index": 5,
+      "interface_alias": "WLAN",
+      "address_family": "IPv6",
+      "ip_address": "240c:c28f:1011:dbbe:d958:8ed1:4010:54cc",
+      "prefix_length": 64,
+      "address_state": "3"
+    },
+    {
+      "if_index": 5,
+      "interface_alias": "WLAN",
+      "address_family": "IPv6",
+      "ip_address": "240c:c28f:1011:dbbe:d1d5:4dd4:9843:f0f8",
+      "prefix_length": 128,
+      "address_state": "3"
+    },
+    {
+      "if_index": 1,
+      "interface_alias": "Loopback Pseudo-Interface 1",
+      "address_family": "IPv6",
+      "ip_address": "::1",
+      "prefix_length": 128,
+      "address_state": "4"
+    },
+    {
+      "if_index": 15,
+      "interface_alias": "本地连接* 10",
+      "address_family": "IPv4",
+      "ip_address": "169.254.212.249",
+      "prefix_length": 16,
+      "address_state": "1"
+    },
+    {
+      "if_index": 8,
+      "interface_alias": "蓝牙网络连接",
+      "address_family": "IPv4",
+      "ip_address": "169.254.159.253",
+      "prefix_length": 16,
+      "address_state": "1"
+    },
+    {
+      "if_index": 16,
+      "interface_alias": "本地连接* 1",
+      "address_family": "IPv4",
+      "ip_address": "169.254.189.4",
+      "prefix_length": 16,
+      "address_state": "1"
+    },
+    {
+      "if_index": 6,
+      "interface_alias": "Tailscale",
+      "address_family": "IPv4",
+      "ip_address": "169.254.83.107",
+      "prefix_length": 16,
+      "address_state": "4"
+    },
+    {
+      "if_index": 10,
+      "interface_alias": "以太网",
+      "address_family": "IPv4",
+      "ip_address": "192.168.124.9",
+      "prefix_length": 24,
+      "address_state": "4"
+    },
+    {
+      "if_index": 5,
+      "interface_alias": "WLAN",
+      "address_family": "IPv4",
+      "ip_address": "169.254.196.157",
+      "prefix_length": 16,
+      "address_state": "1"
+    },
+    {
+      "if_index": 1,
+      "interface_alias": "Loopback Pseudo-Interface 1",
+      "address_family": "IPv4",
+      "ip_address": "127.0.0.1",
+      "prefix_length": 8,
+      "address_state": "4"
+    }
+  ],
+  "default_routes": [
+    {
+      "if_index": 10,
+      "interface_alias": "以太网",
+      "destination_prefix": "0.0.0.0/0",
+      "address_family": "IPv4",
+      "next_hop": "192.168.124.1",
+      "route_metric": 0,
+      "interface_metric": 25,
+      "protocol": "NetMgmt",
+      "policy_store": null
+    },
+    {
+      "if_index": 5,
+      "interface_alias": "WLAN",
+      "destination_prefix": "0.0.0.0/0",
+      "address_family": "IPv4",
+      "next_hop": "10.138.0.1",
+      "route_metric": 0,
+      "interface_metric": 35,
+      "protocol": "NetMgmt",
+      "policy_store": null
+    }
+  ],
+  "egress": {
+    "public_ipv4": {
+      "target": "8.8.8.8",
+      "source_ip": "192.168.124.9",
+      "if_index": 10,
+      "interface_alias": "以太网",
+      "interface_metric": null,
+      "error": null
+    },
+    "public_ipv6": {
+      "target": "2606:4700:4700::1111",
+      "source_ip": null,
+      "if_index": null,
+      "interface_alias": null,
+      "interface_metric": null,
+      "error": "命令返回码 1"
+    }
+  },
+  "wifi": {
+    "available": true,
+    "interfaces": [
+      {
+        "name": "WLAN",
+        "ssid": null,
+        "profile": null,
+        "bssid": null,
+        "state": "disconnected",
+        "connected": false,
+        "matches_target": false
+      }
+    ],
+    "note": null,
+    "target_ssid": "SNNU"
+  },
+  "connection_profiles": [
+    {
+      "interface_alias": "以太网",
+      "if_index": 10,
+      "network_category": "",
+      "ipv4_connectivity": "4",
+      "ipv6_connectivity": "3"
+    },
+    {
+      "interface_alias": "Tailscale",
+      "if_index": 6,
+      "network_category": "1",
+      "ipv4_connectivity": "1",
+      "ipv6_connectivity": "1"
+    }
+  ],
+  "coexistence": {
+    "verdict": "undetermined",
+    "reason": "未发现阻断策略，但当前无法同时观测到两网卡在线（以太网 Up=True，WLAN 关联=False），需人工插拔网线/Wi-Fi 验证（R-0-02）后给出最终结论。",
+    "evidence": [
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Flow Control「Auto Negotiation」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Interrupt Moderation「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=IPv4 Checksum Offload「Rx & Tx Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Jumbo Packet「1514」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Large Send Offload V2 (IPv4)「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Large Send Offload V2 (IPv6)「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Wake from S0ix on Magic Packet「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Protocol ARP Offload「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Protocol NS Offload「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Packet Priority & VLAN「Packet Priority & VLAN Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=PTP Hardware Timestamp「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Receive Buffers「256」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Selective Suspend「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Software Timestamp「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Speed & Duplex「Auto Negotiation」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Selective Suspend Idle Timeout「20」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=TCP Checksum Offload (IPv4)「Rx & Tx Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=TCP Checksum Offload (IPv6)「Rx & Tx Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Transmit Buffers「512」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=UDP Checksum Offload (IPv4)「Rx & Tx Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=UDP Checksum Offload (IPv6)「Rx & Tx Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Wake on Magic Packet「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Wake on Pattern Match「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Adaptive Inter-Frame Spacing「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Link Speed Battery Saver「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Energy Efficient Ethernet「On」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Enable PME「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Interrupt Moderation Rate「Adaptive」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Legacy Switch Compatibility Mode「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Log Link State Event「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Gigabit Master Slave Mode「Auto Detect」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Locally Administered Address「」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Reduce Speed On Power Down「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=System Idle Power Saver「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Ultra Low Power Mode「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Wait for Link「Auto Detect」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "以太网=Wake on Link Settings「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=Band Selection「1. Dual Band」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=2.4GHz channel bandwidth「1. Auto」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=5GHz channel bandwidth「1. Auto」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=802.11ax/ac/n/abg「1. 802.11ax」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=ARP Offload for WOWLAN「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=GTK Rekey for WOWLAN「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=Wake on Magic Packet「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=Wake on Pattern Match「Enabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=Preferred Band「1. No Preference」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=Transmit Power Level「1. Highest」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=U-APSD Support「Disabled」",
+        "blocks": false
+      },
+      {
+        "source": "网卡高级属性",
+        "detail": "WLAN=Miracast prefer band「Auto」",
+        "blocks": false
+      }
+    ],
+    "observed_both_up": false,
+    "observed": {
+      "ethernet_up": true,
+      "wifi_connected": false,
+      "wifi_has_ipv4": false
+    }
+  },
+  "interface_summary": [
+    {
+      "name": "以太网",
+      "if_index": 10,
+      "status": "Up",
+      "ipv4": [
+        "192.168.124.9"
+      ],
+      "ipv6": [
+        "fe80::ddcf:c9cb:ccb9:2740%10"
+      ],
+      "gateway_v4": "192.168.124.1",
+      "gateway_v6": null,
+      "interface_metric_v4": 25,
+      "interface_metric_v6": 25,
+      "automatic_metric_v4": "Enabled",
+      "automatic_metric_v6": "Enabled"
+    },
+    {
+      "name": "WLAN",
+      "if_index": 5,
+      "status": "Disconnected",
+      "ipv4": [
+        "169.254.196.157"
+      ],
+      "ipv6": [
+        "fe80::d38e:a3fe:a3ac:93e6%5",
+        "240c:c28f:1011:dbbe:d958:8ed1:4010:54cc",
+        "240c:c28f:1011:dbbe:d1d5:4dd4:9843:f0f8"
+      ],
+      "gateway_v4": "10.138.0.1",
+      "gateway_v6": null,
+      "interface_metric_v4": 35,
+      "interface_metric_v6": 35,
+      "automatic_metric_v4": "Enabled",
+      "automatic_metric_v6": "Enabled"
+    }
+  ],
+  "remote_control": {
+    "clients": [
+      {
+        "pid": 6864,
+        "process_name": "tailscaled",
+        "path": null
+      },
+      {
+        "pid": 7832,
+        "process_name": "tailscaled",
+        "path": null
+      }
+    ],
+    "ports": [
+      {
+        "local_address": "fd7a:115c:a1e0::fd01:65e1",
+        "local_port": 443,
+        "remote_address": "::",
+        "remote_port": 0,
+        "state": "Listen",
+        "pid": 7832
+      },
+      {
+        "local_address": "0.0.0.0",
+        "local_port": 60984,
+        "remote_address": "0.0.0.0",
+        "remote_port": 0,
+        "state": "100",
+        "pid": 6864
+      },
+      {
+        "local_address": "0.0.0.0",
+        "local_port": 60976,
+        "remote_address": "0.0.0.0",
+        "remote_port": 0,
+        "state": "100",
+        "pid": 6864
+      },
+      {
+        "local_address": "192.168.124.9",
+        "local_port": 60984,
+        "remote_address": "199.165.136.100",
+        "remote_port": 443,
+        "state": "SynSent",
+        "pid": 6864
+      },
+      {
+        "local_address": "192.168.124.9",
+        "local_port": 60976,
+        "remote_address": "46.101.74.201",
+        "remote_port": 443,
+        "state": "SynSent",
+        "pid": 6864
+      },
+      {
+        "local_address": "100.118.101.104",
+        "local_port": 443,
+        "remote_address": "0.0.0.0",
+        "remote_port": 0,
+        "state": "Listen",
+        "pid": 7832
+      }
+    ],
+    "udp_endpoints": [
+      {
+        "local_address": "::",
+        "local_port": 41641,
+        "pid": 7832
+      },
+      {
+        "local_address": "0.0.0.0",
+        "local_port": 41641,
+        "pid": 7832
+      }
+    ],
+    "sleep_states": {
+      "standby_available": true,
+      "hibernate_available": true,
+      "mentions_standby": true,
+      "note": null,
+      "raw": "此系统上有以下睡眠状态:\r\n    待机 (S0 低电量待机) 连接的网络\r\n\r\n此系统上没有以下睡眠状态:\r\n    待机 (S1)\r\n\t系统固件不支持此待机状态。\r\n\t当支持 S0 低电量待机时，禁用此待机状态。\r\n\r\n    待机 (S2)\r\n\t系统固件不支持此待机状态。\r\n\t当支持 S0 低电量待机时，禁用此待机状态。\r\n\r\n    待机 (S3)\r\n\t当支持 S0 低电量待机时，禁用此待机状态。\r\n\r\n    休眠\r\n\t尚未启用休眠。\r\n\r\n    混合睡眠\r\n\t待机(S3)不可用。\r\n\t休眠不可用。\r\n\t虚拟机监控程序不支持此待机状态。\r\n\r\n    快速启动\r\n\t休眠不可用。"
+    },
+    "auto_logon": {
+      "auto_admin_logon": null,
+      "user": null,
+      "domain": null
+    },
+    "run_entries": [
+      {
+        "hive": "HKLM",
+        "name": "SecurityHealth",
+        "command": "C:\\WINDOWS\\system32\\SecurityHealthSystray.exe"
+      },
+      {
+        "hive": "HKLM",
+        "name": "RtkAudUService",
+        "command": "\"C:\\WINDOWS\\System32\\DriverStore\\FileRepository\\realtekservice.inf_amd64_04ff63d068f8c626\\RtkAudUService64.exe\" -background"
+      },
+      {
+        "hive": "HKLM",
+        "name": "sysdiag",
+        "command": "\"C:\\_Software\\Huorong\\Sysdiag\\bin\\hipstray.exe\""
+      },
+      {
+        "hive": "HKLM",
+        "name": "AweSun",
+        "command": "\"C:\\_Software\\Oray\\AweSun\\AweSun.exe\" --cmd=autorun"
+      },
+      {
+        "hive": "HKCU",
+        "name": "OneDrive",
+        "command": "\"C:\\Users\\33809\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe\" /background"
+      },
+      {
+        "hive": "HKCU",
+        "name": "Thunder",
+        "command": "C:\\Program Files (x86)\\Thunder Network\\Thunder\\Program\\Thunder.exe -silent -StartType:AutoRun"
+      },
+      {
+        "hive": "HKCU",
+        "name": "BaiduYunDetect",
+        "command": "\"C:\\Users\\33809\\AppData\\Roaming\\baidu\\BaiduNetdisk\\YunDetectService.exe\""
+      },
+      {
+        "hive": "HKCU",
+        "name": "youkuClient",
+        "command": "\"C:\\_Software\\YOUKU\\9.2.67.1002\\YOUKU.exe\" --openAsHidden"
+      },
+      {
+        "hive": "HKCU",
+        "name": "cloudmusic",
+        "command": "\"C:\\_Software\\CloudMusic\\cloudmusic.exe\" --orpheus-startup=autorun"
+      },
+      {
+        "hive": "HKCU",
+        "name": "Weixin",
+        "command": "\"C:\\_Software\\Weixin\\Weixin.exe\" -autorun"
+      },
+      {
+        "hive": "HKCU",
+        "name": "QQNT",
+        "command": "\"C:\\_Software\\QQ\\QQ.exe\" /background"
+      },
+      {
+        "hive": "HKCU",
+        "name": "QuarkUpdaterTaskUser1.0.0.21",
+        "command": "\"C:\\Users\\33809\\AppData\\Local\\QuarkUpdater\\QuarkUpdater\\1.0.0.21\\updater.exe\" --wake --enable-logging --vmodule=*/components/winhttp/*=1,*/components/update_client/*=2,*/chrome/updater/*=2,*/chrome/updater/quark/*=2,*/quark/utils/*=2"
+      },
+      {
+        "hive": "HKCU",
+        "name": "quark",
+        "command": "\"C:\\_Software\\Quark\\quark.exe\" --launch-from=loginitem"
+      },
+      {
+        "hive": "HKCU",
+        "name": "com.alicloud.smartdrive",
+        "command": "C:\\_Software\\aDrive\\aDrive.exe --openAtLogin"
+      },
+      {
+        "hive": "HKCU",
+        "name": "GameViewer",
+        "command": "\"C:\\_study\\GameViewer\\GameViewer.exe\" --auto-run"
+      },
+      {
+        "hive": "HKCU",
+        "name": "Steam",
+        "command": "\"C:\\_Software\\Steam\\steam.exe\" -silent"
+      },
+      {
+        "hive": "HKCU",
+        "name": "WXWork",
+        "command": "\"C:\\_Software\\WXWork\\WXWork.exe\" -min -autorun"
+      },
+      {
+        "hive": "HKCU",
+        "name": "Feishu",
+        "command": "\"C:\\_Software\\Feishu\\Feishu.exe\""
+      },
+      {
+        "hive": "HKCU",
+        "name": "ctfmon",
+        "command": "C:\\Windows\\system32\\ctfmon.exe"
+      },
+      {
+        "hive": "HKCU",
+        "name": "YoudaoDict",
+        "command": "\"C:\\_Software\\Dict\\YoudaoDict.exe\" -hide -autostart"
+      },
+      {
+        "hive": "HKCU",
+        "name": "LazyTyper",
+        "command": "\"C:\\Users\\33809\\Desktop\\LazyTyper-Migration2\\LazyTyper\\LazyTyper.exe\" --silent"
+      },
+      {
+        "hive": "HKCU",
+        "name": "WorkBuddy.WorkBuddyAI",
+        "command": "C:\\_Software\\Workbuddy\\WorkBuddyAI\\WorkBuddyAI.exe"
+      },
+      {
+        "hive": "HKCU",
+        "name": "Gemini",
+        "command": "\"C:\\Users\\33809\\AppData\\Local\\Google\\Gemini\\GeminiAppLauncher.exe\""
+      },
+      {
+        "hive": "HKCU",
+        "name": "MicrosoftEdgeAutoLaunch_A5FF6E1A73D4CA265786E8CA32B0A486",
+        "command": "\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" --no-startup-window --win-session-start"
+      },
+      {
+        "hive": "HKCU",
+        "name": "GoogleUpdaterTaskUser157.0.8089.0",
+        "command": "\"C:\\Users\\33809\\AppData\\Local\\Google\\GoogleUpdater\\157.0.8089.0\\updater.exe\" --wake"
+      },
+      {
+        "hive": "HKCU",
+        "name": "CampusReconnectTray",
+        "command": "\"C:\\Users\\33809\\WorkBuddy AI\\校园网自动重连助手\\CampusReconnect.exe\""
+      }
+    ]
+  },
+  "errors": [
+    {
+      "command": "default_routes",
+      "error": "命令返回码 1 但有有效输出（非终止错误，已采用）："
+    },
+    {
+      "command": "egress_v6",
+      "error": "返回码 1"
+    },
+    {
+      "command": "power_management",
+      "error": "返回码 1"
+    },
+    {
+      "command": "remote_udp",
+      "error": "命令返回码 1 但有有效输出（非终止错误，已采用）："
+    }
+  ],
+  "commands_executed": [
+    "adapters",
+    "cim_adapters",
+    "ip_interfaces",
+    "ip_addresses",
+    "default_routes",
+    "egress_v4",
+    "egress_v6",
+    "wifi_interfaces",
+    "connection_profiles",
+    "advanced_properties",
+    "power_management",
+    "ip_addresses",
+    "remote_processes",
+    "remote_tcp",
+    "remote_udp",
+    "sleep_states",
+    "winlogon",
+    "run_entries"
+  ]
+}
