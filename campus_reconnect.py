@@ -18,6 +18,7 @@
   once        执行一次重连 (--dry-run 预检; --force 在线强制, 会提交真实凭据)
   watch       常驻监测, 掉线自动重连 (单实例保护, 重复启动自动退出)
   netcheck    V0.3 P1 只读三轴网络健康检查(有线/无线/系统), 只给决策不切换
+  failover    V0.3 P3 只读故障切换监测(运行 11 态状态机, 不执行任何动作)
   fix-bypass  把 Portal 地址写入系统代理绕过列表(注册表), Edge 无需关代理即可打开登录页
 
 安全边界: 不执行注销(logoff), 不修改 Clash Verge 配置, 不明文保存密码, 日志不含密码。
@@ -54,6 +55,8 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          check_redirect_target, classify_network,
                          extract_error_hint, parse_status_page, probe_matches,
                          repair_service, resolve_url)
+from campus_failover import (FailoverMode, FailoverPolicy,
+                             NetworkFailoverManager, format_tick)
 from campus_network import (NetworkObserver, WindowsProbeEngine, evaluate,
                             format_snapshot)
 from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
@@ -702,6 +705,55 @@ def netcheck(session: requests.Session, args: argparse.Namespace,
     return 0
 
 
+def failover(session: requests.Session, args: argparse.Namespace,
+             log: logging.Logger) -> int:
+    """V0.3 P3 只读故障切换监测（failover）：运行状态机，不执行任何动作。
+
+    复用 P0 ``netdiag`` 只读管道 + P1 三轴健康评估，把每帧观测喂给
+    :class:`campus_failover.NetworkFailoverManager`（**MONITOR 只读监测模式**），
+    输出 11 态状态机的当前状态、优先出口、滞回计数与本轮计划。
+
+    本命令**没有执行器**，且 MONITOR 模式不允许执行任何动作：不切换路由、
+    不发 Portal 认证、不写 Metric、不触碰 Clash、不重连 Wi-Fi。
+    """
+    from tools import netdiag
+
+    runner = netdiag.PowerShellRunner()
+    observer = NetworkObserver(runner)
+    engine = WindowsProbeEngine()
+    policy = FailoverPolicy(
+        detection_interval=float(max(1, args.interval)),
+        failure_threshold=int(max(1, args.threshold)),
+        auth_cooldown=float(max(0, args.auth_cooldown)),
+        switch_min_interval=float(max(0, args.switch_min_interval)),
+    )
+    for issue in policy.validate():
+        log.warning("策略参数告警：%s", issue)
+    manager = NetworkFailoverManager(policy=policy, mode=FailoverMode.MONITOR,
+                                     log=lambda message: log.info("%s", message))
+    frames = max(1, int(args.frames))
+    results: List[dict] = []
+    now = time.monotonic()
+    for index in range(frames):
+        report = observer.observe(target_ssid=args.ssid)
+        snapshot = evaluate(report, engine=engine,
+                            system_probe=lambda: internet_ok(session),
+                            route_lookup=observer.route_lookup)
+        result = manager.tick(now, snapshot)
+        results.append(result.to_dict())
+        print(format_tick(result, title="帧 %d/%d" % (index + 1, frames)))
+        if index + 1 < frames and args.interval > 0:
+            time.sleep(args.interval)
+            now += args.interval
+    if args.json:
+        print(json.dumps(results if frames > 1 else results[0],
+                         ensure_ascii=False, indent=2))
+    log.info("failover 完成（只读监测）：状态=%s，计划=%d 项，已执行=%d 项",
+             manager.state.value, len(results[-1]["plan"]),
+             len(results[-1]["executed"]))
+    return 0
+
+
 def status(session: requests.Session, args: argparse.Namespace) -> None:
     ssid, state = wifi_state()
     print("无线网卡状态 : %s（SSID: %s）" % (state, ssid or "未连接"))
@@ -876,6 +928,23 @@ def build_parser() -> argparse.ArgumentParser:
                             help="目标校园 Wi-Fi 名称，默认 SNNU")
     p_netcheck.add_argument("--json", action="store_true",
                             help="额外输出机器可读 JSON（三轴快照契约）")
+    p_failover = sub.add_parser(
+        "failover",
+        help="V0.3 P3 只读故障切换监测（运行 11 态状态机，不执行任何动作）")
+    p_failover.add_argument("--ssid", default="SNNU",
+                            help="目标校园 Wi-Fi 名称，默认 SNNU")
+    p_failover.add_argument("--frames", type=int, default=1,
+                            help="监测帧数（默认 1；观察滞回/冷却需多帧，如 --frames 8）")
+    p_failover.add_argument("--interval", type=int, default=15,
+                            help="检测间隔秒数（同时是多帧之间的等待秒数），默认 15")
+    p_failover.add_argument("--threshold", type=int, default=3,
+                            help="主链路连续可靠失败阈值，默认 3")
+    p_failover.add_argument("--auth-cooldown", type=int, default=180,
+                            help="Portal 认证冷却秒数（只限制认证），默认 180")
+    p_failover.add_argument("--switch-min-interval", type=int, default=300,
+                            help="链路切换最短间隔秒数（只限制路由变更），默认 300")
+    p_failover.add_argument("--json", action="store_true",
+                            help="额外输出机器可读 JSON（TickResult 契约）")
     for command in ("once", "watch"):
         p = sub.add_parser(command, help="单次尝试" if command == "once" else "常驻自动重连")
         p.add_argument("--ssid", default="SNNU", help="目标校园 Wi-Fi 名称，默认 SNNU")
@@ -918,6 +987,8 @@ def main() -> None:
         status(session, args)
     elif args.command == "netcheck":
         raise SystemExit(netcheck(session, args, log))
+    elif args.command == "failover":
+        raise SystemExit(failover(session, args, log))
     elif args.command == "fix-bypass":
         if not fix_bypass(log):
             raise SystemExit(1)
