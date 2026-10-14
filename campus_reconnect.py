@@ -20,6 +20,7 @@
   netcheck    V0.3 P1 只读三轴网络健康检查(有线/无线/系统), 只给决策不切换
   failover    V0.3 P3 只读故障切换监测(运行 11 态状态机, 不执行任何动作)
   snnu        V0.3 P4 SNNU 备用链路与接口绑定认证(默认只读识别; --auth 受控认证)
+  route       V0.3 P5 受控路由切换与路由卫士(默认只读快照; --recover/--apply/--auto 受控)
   fix-bypass  把 Portal 地址写入系统代理绕过列表(注册表), Edge 无需关代理即可打开登录页
 
 安全边界: 不执行注销(logoff), 不修改 Clash Verge 配置, 不明文保存密码, 日志不含密码。
@@ -59,8 +60,12 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
 from campus_failover import (FailoverMode, FailoverPolicy,
                              NetworkFailoverManager, format_tick)
 from campus_network import (NetworkObserver, WindowsProbeEngine, evaluate,
-                            format_snapshot)
-from campus_snnu import SnnuBackupLink, SnnuOps, format_backup_result
+                            format_snapshot, resolve_roles)
+from campus_route_guard import (CompositeExecutor, MetricExecutor, RouteGuard,
+                                RouteJournal, build_windows_route_ops,
+                                format_route_change, format_route_snapshot)
+from campus_snnu import (SnnuBackupExecutor, SnnuBackupLink, SnnuOps,
+                         format_backup_result)
 from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
                             parse_ipconfig_ipv4, parse_netsh_interfaces,
                             wifi_state_from_text)
@@ -831,6 +836,194 @@ def snnu(session: requests.Session, args: argparse.Namespace,
     return 0 if result.ok else 1
 
 
+def _load_adapters_config() -> Optional[dict]:
+    """读取 ``adapters.json``（P0 产物）；缺失/损坏时返回 ``None``（不臆断角色）。"""
+    try:
+        with open(SCRIPT_DIR / "adapters.json", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _route_roles(observer: Any, ssid: str) -> Tuple[Any, Any, Any]:
+    """解析以太网/Wi-Fi 角色与只读诊断报告（配置优先，其次物理分类）。"""
+    report = observer.observe(target_ssid=ssid)
+    roles = resolve_roles(report, _load_adapters_config())
+    return report, roles.get("ethernet"), roles.get("wifi")
+
+
+def _build_route_guard(observer: Any, runner: Any, eth: Any, wifi: Any,
+                       args: argparse.Namespace, log: logging.Logger, *,
+                       timers: Optional[TimerTable] = None) -> RouteGuard:
+    """构造路由卫士（journal 落盘到 ``logs/route_journal.json``，崩溃恢复用）。"""
+    policy = FailoverPolicy(
+        detection_interval=float(max(1, getattr(args, "interval", 15))),
+        failure_threshold=int(max(1, getattr(args, "threshold", 3))),
+        auth_cooldown=float(max(0, getattr(args, "auth_cooldown", 180))),
+        switch_min_interval=float(max(0, getattr(args, "switch_min_interval", 300))))
+    return RouteGuard(
+        ops=build_windows_route_ops(observer, runner),
+        ethernet_if=eth.if_index if eth is not None else None,
+        wifi_if=wifi.if_index if wifi is not None else None,
+        policy=policy,
+        journal=RouteJournal(LOG_DIR / "route_journal.json"),
+        timers=timers,
+        authorized=bool(getattr(args, "yes", False)),
+        log=lambda message: log.info("%s", message))
+
+
+def _wifi_source_ip(report: Any, if_index: Optional[int]) -> Optional[str]:
+    """从只读诊断报告取无线接口的 IPv4 源地址（供 SNNU 会话绑定使用）。"""
+    if if_index is None:
+        return None
+    for row in getattr(report, "ip_addresses", None) or []:
+        if (row.get("if_index") == if_index
+                and row.get("address_family") == "IPv4"):
+            address = row.get("ip_address")
+            if address:
+                return str(address)
+    return None
+
+
+def _build_composite_executor(session: requests.Session, observer: Any,
+                              report: Any, wifi: Any,
+                              args: argparse.Namespace, log: logging.Logger,
+                              guard: RouteGuard) -> CompositeExecutor:
+    """组合 P4（SNNU）与 P5（路由）执行器为单一副作用门背后的唯一执行器。
+
+    角色对象来自 ``resolve_roles``（``netdiag.AdapterRecord``）：接口名取 ``name``，
+    无线 IPv4 源地址从只读报告的 IP 表取得（仅用于会话绑定，不做出口假定）。
+    """
+    interface = (getattr(wifi, "interface", None)
+                 or getattr(wifi, "name", None)) if wifi is not None else None
+    wifi_if = getattr(wifi, "if_index", None) if wifi is not None else None
+    source_ip = _wifi_source_ip(report, wifi_if)
+    ops = _snnu_ops(session, observer, log, interface)
+
+    def _portal_action() -> Any:
+        link = SnnuBackupLink(
+            ops=ops, session=session, target_ssid=args.ssid,
+            interface=interface or "", if_index=wifi_if, source_ip=source_ip,
+            allow_auth=True, reconnect_wifi=False, port=args.port,
+            operator=args.yys, account_format=args.account_format,
+            log=lambda message: log.info("%s", message))
+        return link.run()
+
+    def _wifi_action() -> bool:
+        return wifi_reconnect(args.ssid, log, interface=interface)
+
+    snnu = SnnuBackupExecutor(portal_action=_portal_action,
+                              wifi_action=_wifi_action,
+                              log=lambda message: log.info("%s", message))
+    return CompositeExecutor(snnu=snnu, route=MetricExecutor(guard),
+                             log=lambda message: log.info("%s", message))
+
+
+def route(session: requests.Session, args: argparse.Namespace,
+          log: logging.Logger) -> int:
+    """V0.3 P5 受控路由切换与路由卫士（快照 / 崩溃恢复 / 受控切换 / 受控 AUTO）。
+
+    - **默认只读**：输出路由快照（接口 Metric、默认路由、当前出口）与未完成事务，
+      零写入、零路由变更；
+    - ``--recover``：读取变更日志，处置未完成事务（已生效则提交，否则按快照回滚）；
+    - ``--apply {ethernet,wifi}``：受控执行**一次**事务式切换（快照 → 最小变更 →
+      出口验证 IPv4+IPv6 → 失败回滚）；须 ``--yes`` 显式授权，且取单实例互斥体；
+    - ``--auto``：受控运行 11 态状态机（``FailoverMode.AUTO``）并接入真实组合执行器；
+      须 ``--yes`` 显式授权，且取单实例互斥体。
+
+    危险操作黑名单（AGENTS §3.12）在本命令无任何入口：只允许受限的
+    ``Set-NetIPInterface -InterfaceMetric``（:func:`campus_route_guard.assert_write_allowed`）。
+    """
+    from tools import netdiag
+
+    if (args.apply or args.auto) and not args.yes:
+        log.error("受控路由变更需显式授权：请加 --yes（前台上人、单人值守）。")
+        return 2
+    if args.apply or args.auto:
+        if not ensure_single_instance(log):
+            log.error("已有实例在运行：拒绝并发路由变更。")
+            return 1
+        log.warning("--yes：允许真实路由/Metric 变更（受控、前台上人、单人值守）。")
+
+    runner = netdiag.PowerShellRunner()
+    observer = NetworkObserver(runner)
+    report, eth, wifi = _route_roles(observer, args.ssid)
+    log.info("角色解析：以太网 ifIndex=%s，Wi-Fi ifIndex=%s",
+             eth.if_index if eth is not None else None,
+             wifi.if_index if wifi is not None else None)
+
+    # --recover 用无冷却、无授权的卫士（恢复是安全动作，不受授权门禁约束）。
+    if args.recover:
+        guard = _build_route_guard(observer, runner, eth, wifi, args, log)
+        recovered = guard.recover()
+        if recovered is None:
+            print("崩溃恢复：未发现未完成的路由变更事务（无需恢复）。")
+            if args.json:
+                print(json.dumps({"recovered": None}, ensure_ascii=False,
+                                 indent=2))
+            log.info("route --recover 完成：无未完成事务。")
+            return 0
+        print(format_route_change(recovered))
+        if args.json:
+            print(json.dumps(recovered.to_dict(), ensure_ascii=False, indent=2))
+        log.info("route --recover 完成：状态=%s，已回滚=%s",
+                 recovered.status.value, recovered.rolled_back)
+        return 0
+
+    if args.apply:
+        guard = _build_route_guard(observer, runner, eth, wifi, args, log,
+                                   timers=TimerTable())
+        record = guard.apply(args.apply, "命令行受控切换（--apply）")
+        print(format_route_change(record))
+        if args.json:
+            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2))
+        log.info("route --apply 完成：target=%s，状态=%s，ok=%s",
+                 args.apply, record.status.value, record.ok)
+        return 0 if record.ok else 1
+
+    if args.auto:
+        guard = _build_route_guard(observer, runner, eth, wifi, args, log)
+        recovered = guard.recover()     # AUTO 启动前先做崩溃恢复
+        if recovered is not None:
+            print(format_route_change(recovered))
+        executor = _build_composite_executor(session, observer, report, wifi,
+                                             args, log, guard)
+        manager = NetworkFailoverManager(
+            policy=guard.policy, mode=FailoverMode.AUTO, executor=executor,
+            log=lambda message: log.info("%s", message))
+        frames = max(1, int(args.frames))
+        now = time.monotonic()
+        for index in range(frames):
+            report = observer.observe(target_ssid=args.ssid)
+            snapshot = evaluate(report, engine=WindowsProbeEngine(),
+                                system_probe=lambda: internet_ok(session),
+                                route_lookup=observer.route_lookup)
+            result = manager.tick(now, snapshot)
+            print(format_tick(result, title="AUTO 帧 %d/%d" % (index + 1, frames)))
+            if args.json:
+                print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            if index + 1 < frames and args.interval > 0:
+                time.sleep(args.interval)
+                now += args.interval
+        log.info("route --auto 完成：状态=%s，执行动作=%d 项",
+                 manager.state.value, len(result.executed))
+        return 0
+
+    # 默认：只读快照（零写入）。
+    guard = _build_route_guard(observer, runner, eth, wifi, args, log)
+    snapshot = guard.snapshot()
+    print(format_route_snapshot(snapshot, journal=guard.journal))
+    if args.json:
+        print(json.dumps({"snapshot": snapshot.to_dict(),
+                          "pending": guard.journal.pending()},
+                         ensure_ascii=False, indent=2))
+    log.info("route 快照完成（只读）：以太网 ifIndex=%s，Wi-Fi ifIndex=%s，"
+             "当前出口 ifIndex=%s", guard.ethernet_if, guard.wifi_if,
+             snapshot.primary_egress_if_index)
+    return 0
+
+
 def status(session: requests.Session, args: argparse.Namespace) -> None:
     ssid, state = wifi_state()
     print("无线网卡状态 : %s（SSID: %s）" % (state, ssid or "未连接"))
@@ -1041,6 +1234,40 @@ def build_parser() -> argparse.ArgumentParser:
                         help="受控提交真实凭据（默认关闭；须经用户授权，前台上人）")
     p_snnu.add_argument("--json", action="store_true",
                         help="额外输出机器可读 JSON（BackupLinkResult 契约）")
+    p_route = sub.add_parser(
+        "route",
+        help="V0.3 P5 受控路由切换与路由卫士（默认只读快照；"
+             "--recover 崩溃恢复；--apply/--auto 受控真实变更，需 --yes）")
+    p_route.add_argument("--ssid", default="SNNU",
+                         help="目标校园 Wi-Fi 名称，默认 SNNU")
+    p_route.add_argument("--port", type=_port_type, default=None,
+                         help="Portal 认证端口；默认动态识别，失效时可强制指定")
+    p_route.add_argument("--yys", choices=("mobile", "unicom", "telecom", ""),
+                         default="mobile",
+                         help="运营商: mobile(移动)/unicom(联通)/telecom(电信)/''(默认校园网)")
+    p_route.add_argument("--account-format", choices=("plain", "isp"),
+                         default="plain",
+                         help="账号提交格式: plain=学号(默认); isp=学号@运营商")
+    p_route.add_argument("--apply", choices=("ethernet", "wifi"), default=None,
+                         help="受控执行一次路由切换（快照→最小变更→出口验证→回滚）")
+    p_route.add_argument("--auto", action="store_true",
+                         help="受控运行 AUTO 状态机（接入真实组合执行器）")
+    p_route.add_argument("--recover", action="store_true",
+                         help="崩溃恢复：读取变更日志并处置未完成事务")
+    p_route.add_argument("--yes", action="store_true",
+                         help="显式授权真实路由变更（前台上人、单人值守）")
+    p_route.add_argument("--frames", type=int, default=1,
+                         help="--auto 的监测帧数（默认 1）")
+    p_route.add_argument("--interval", type=int, default=15,
+                         help="--auto 的检测间隔秒数，默认 15")
+    p_route.add_argument("--threshold", type=int, default=3,
+                         help="主链路连续可靠失败阈值，默认 3")
+    p_route.add_argument("--auth-cooldown", type=int, default=180,
+                         help="Portal 认证冷却秒数（只限制认证），默认 180")
+    p_route.add_argument("--switch-min-interval", type=int, default=300,
+                         help="链路切换最短间隔秒数（只限制路由变更），默认 300")
+    p_route.add_argument("--json", action="store_true",
+                         help="额外输出机器可读 JSON（路由快照/变更记录契约）")
     for command in ("once", "watch"):
         p = sub.add_parser(command, help="单次尝试" if command == "once" else "常驻自动重连")
         p.add_argument("--ssid", default="SNNU", help="目标校园 Wi-Fi 名称，默认 SNNU")
@@ -1087,6 +1314,8 @@ def main() -> None:
         raise SystemExit(failover(session, args, log))
     elif args.command == "snnu":
         raise SystemExit(snnu(session, args, log))
+    elif args.command == "route":
+        raise SystemExit(route(session, args, log))
     elif args.command == "fix-bypass":
         if not fix_bypass(log):
             raise SystemExit(1)
