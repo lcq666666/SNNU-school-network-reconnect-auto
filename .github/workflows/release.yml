@@ -1,0 +1,54 @@
+# 受控发布：仅推送 v* 标签时触发（F22 / T34）
+#
+# 设计约定（与 README「CI 与发布」一节一致）：
+# - 仅由受控 tag 触发；仓库级默认只读，**仅本 job** 提升为 contents: write；
+# - 全部第三方 action 锁定到**不可变 commit SHA**；
+# - 产物附 exe、SHA256 校验文件与构建清单（build_info.json）；
+# - 不注入用户凭据、不上传日志 / 配置，不静默覆盖既有版本产物。
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: build and publish release
+    runs-on: windows-latest
+    # 仅发布 job 提权写权限（T34 断言：release 需要 contents: write）。
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-lock.txt
+
+      # 发布前跑完整校验（测试 + ruff），再构建。
+      - name: Build release artifacts
+        run: python tools/build_release.py
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "自动化受控构建；版本与源码 commit 见 build_info.json。" \
+            dist/CampusReconnect.exe \
+            dist/CampusReconnect.exe.sha256 \
+            dist/build_info.json
