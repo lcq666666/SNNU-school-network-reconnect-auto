@@ -50,7 +50,7 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          E_PORTAL_UNREACHABLE, MAX_BODY_BYTES, PROBE_EXACT,
                          PROBE_HTML_TITLE, BrowserLaunchResult, PortalResolution,
                          PortalStatus, ProbeResult, ProbeSpec, RepairAdapters,
-                         RepairOptions, RepairResult, LoginOutcome,
+                         RepairOptions, RepairResult, LoginOutcome, TimerTable,
                          check_redirect_target, classify_network,
                          extract_error_hint, parse_status_page, probe_matches,
                          repair_service, resolve_url)
@@ -798,10 +798,12 @@ def dry_run(session: requests.Session, args: argparse.Namespace,
 
 def watch(session: requests.Session, args: argparse.Namespace,
           log: logging.Logger) -> None:
-    """常驻监测：统一冷却/退避（F09）。
+    """常驻监测：三表分离（V0.3 P2）。
 
-    - ``next_attempt`` 一旦登记，**恢复不抹掉**最短间隔；
-    - 冷却只禁止新的认证，不禁止探测；
+    - **网络检测计时器持续运行**：无论是否处于认证冷却，每个 ``interval``
+      都探测一次公网（修复 P0-T6 取证缺陷 —— 冷却期探测被整体暂停）；
+    - **Portal 认证冷却只限制认证**：由 ``TimerTable.auth_allowed()`` 门控，
+      不参与探测节奏；``next_attempt`` 一旦登记，**恢复不抹掉**最短间隔；
     - 需人工处理（凭据/验证码/结构未知）时停止自动频繁重试；
     - 全程使用 ``time.monotonic`` 与 ``time.sleep``（测试用虚拟时钟替换）。
     """
@@ -811,7 +813,7 @@ def watch(session: requests.Session, args: argparse.Namespace,
              args.ssid, args.yys or "(默认校园网)", args.interval,
              args.threshold, args.cooldown)
     failures = 0
-    next_attempt = 0.0
+    timers = TimerTable()
     needs_user = False
     while True:
         try:
@@ -821,7 +823,7 @@ def watch(session: requests.Session, args: argparse.Namespace,
                     log.info("公网恢复。")
                 failures = 0
                 needs_user = False
-                # 注意：**不**重置 next_attempt —— 恢复不抹掉最短重连间隔（F09）
+                # 注意：**不**重置认证冷却 —— 恢复不抹掉最短重连间隔（F09）
             else:
                 failures += 1
                 if failures < args.threshold:
@@ -830,16 +832,15 @@ def watch(session: requests.Session, args: argparse.Namespace,
                     log.warning("连续 %d 次失败，判定疑似掉线。", failures)
                 if needs_user:
                     log.warning("需人工处理（凭据/验证码/Portal 结构），暂停自动重连。")
-                elif failures >= args.threshold and time.monotonic() >= next_attempt:
+                elif failures >= args.threshold and timers.auth_allowed(time.monotonic()):
                     result = attempt_repair(session, args, log)
-                    next_attempt = time.monotonic() + args.cooldown
+                    timers.note_auth(time.monotonic(), args.cooldown)
                     if getattr(result, "needs_user", False):
                         needs_user = True
-            now = time.monotonic()
-            wait = args.interval
-            if now < next_attempt:
-                wait = max(args.interval, next_attempt - now)
-            time.sleep(wait)
+            # 网络检测计时器：持续运行 —— 探测节奏恒为 interval，认证冷却（auth）
+            # 与切换冷却（switch）都不得推迟它（V0.3 P2 三表分离）。
+            timers.schedule_detection(time.monotonic(), args.interval)
+            time.sleep(args.interval)
         except KeyboardInterrupt:
             log.info("用户终止。")
             return

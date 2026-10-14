@@ -60,7 +60,7 @@ from PIL import Image, ImageDraw
 from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
                          CredentialClear, CredentialLoad, CredentialSave,
                          ProxyApplyResult, RepairAdapters, RepairOptions,
-                         repair_service, load_config_text)
+                         TimerTable, repair_service, load_config_text)
 from campus_reconnect import (direct_session, edge_fallback,
                               ensure_single_instance, get_credentials,
                               internet_ok, portal_login, portal_reachable,
@@ -403,8 +403,9 @@ class TrayApp:
         self._last_result = None
         #: Edge 兜底：同一故障周期只自动打开一次（F19）；手动按钮可再次打开。
         self._edge_opened_this_cycle = False
-        #: 下一次允许发起认证的单调时刻（F09：恢复不抹掉最短间隔）。
-        self._next_attempt_at = 0.0
+        #: 三表分离计时器（V0.3 P2）：网络检测 / Portal 认证冷却 / 网卡切换冷却
+        #: 互不干涉；认证冷却只限制 ``_run_repair``，绝不推迟探测（F09 修复）。
+        self._timers = TimerTable()
 
         # ---- 取消令牌（F10）----
         self._cancel = threading.Event()
@@ -777,8 +778,9 @@ class TrayApp:
         if kind == "reconnect":
             force = bool(cmd[1]) if len(cmd) > 1 else False
             self._run_repair(force=force)
-            self._next_attempt_at = time.monotonic() + self._cooldown()
-            return max(time.monotonic() + self._interval(), self._next_attempt_at)
+            # 手动/强制重连已完成一次认证 → 登记**认证冷却**；但**不**推迟探测（P2）。
+            self._timers.note_auth(time.monotonic(), self._cooldown())
+            return time.monotonic() + self._interval()
         if kind == "probe":
             return self._probe_tick(next_probe)
         if kind == "quit":
@@ -787,12 +789,14 @@ class TrayApp:
         return next_probe
 
     def _next_probe_time(self, now: float) -> float:
-        """下一次探测时刻：普通间隔与冷却截止时刻取较晚者（F09）。
+        """下一次**探测**时刻（V0.3 P2 三表分离）。
 
-        注意：**恢复不抹掉**最短间隔 —— 只要 ``_next_attempt_at`` 仍在未来，
-        下一次探测就至少等到冷却结束。
+        探测节奏只由「网络检测计时器」决定，恒为 ``now + interval``；
+        **认证冷却不得推迟探测** —— 修复 P0-T6 取证缺陷（旧实现取
+        ``max(now + interval, _next_attempt_at)``，使 180s 认证冷却顺带暂停
+        公网探测）。认证冷却只影响 :meth:`_probe_tick` 中是否发起认证。
         """
-        return max(now + self._interval(), self._next_attempt_at)
+        return self._timers.schedule_detection(now, self._interval())
 
     def _probe_tick(self, next_probe: float) -> float:
         now = time.monotonic()
@@ -826,10 +830,15 @@ class TrayApp:
             self.set_state("reconnecting", "正在尝试重新连接",
                            notify=("校园网已断开", "正在尝试重新连接，请稍候…"))
             self._edge_opened_this_cycle = False   # 新的故障周期
+        # 三表分离（P2）：认证冷却**只**门控新的认证，不门控探测 ——
+        # 探测节奏仍由 _next_probe_time 保持为 interval；冷却期内继续探测，
+        # 一旦公网恢复可在下一个 interval 内被发现，而不是等到冷却结束。
+        if not self._timers.auth_allowed(now):
+            return self._next_probe_time(now)
         self._run_repair()
         self.state["failures"] = 0
-        self._next_attempt_at = time.monotonic() + self._cooldown()
-        return max(time.monotonic() + self._interval(), self._next_attempt_at)
+        self._timers.note_auth(now, self._cooldown())
+        return self._next_probe_time(now)
 
     def _run_repair(self, force=False):
         """串行执行一次重连；重复请求合并（F01）。"""
