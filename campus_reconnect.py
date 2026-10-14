@@ -19,6 +19,7 @@
   watch       常驻监测, 掉线自动重连 (单实例保护, 重复启动自动退出)
   netcheck    V0.3 P1 只读三轴网络健康检查(有线/无线/系统), 只给决策不切换
   failover    V0.3 P3 只读故障切换监测(运行 11 态状态机, 不执行任何动作)
+  snnu        V0.3 P4 SNNU 备用链路与接口绑定认证(默认只读识别; --auth 受控认证)
   fix-bypass  把 Portal 地址写入系统代理绕过列表(注册表), Edge 无需关代理即可打开登录页
 
 安全边界: 不执行注销(logoff), 不修改 Clash Verge 配置, 不明文保存密码, 日志不含密码。
@@ -37,7 +38,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 try:
@@ -59,6 +60,7 @@ from campus_failover import (FailoverMode, FailoverPolicy,
                              NetworkFailoverManager, format_tick)
 from campus_network import (NetworkObserver, WindowsProbeEngine, evaluate,
                             format_snapshot)
+from campus_snnu import SnnuBackupLink, SnnuOps, format_backup_result
 from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
                             parse_ipconfig_ipv4, parse_netsh_interfaces,
                             wifi_state_from_text)
@@ -754,6 +756,81 @@ def failover(session: requests.Session, args: argparse.Namespace,
     return 0
 
 
+def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
+              interface: Optional[str]) -> SnnuOps:
+    """P4 CLI 侧的注入式能力集合（指向本模块真实函数，便于测试替换）。
+
+    ``repair`` 封装调用 ``campus_core.repair_service``（**不重写认证引擎**，
+    AGENTS §3.1），并把已绑定源地址的会话传入，使 Portal 解析/状态/认证/验证
+    四步全部经 SNNU 接口（方案 §6.2）。
+    """
+
+    def _repair(bound_session: Any, options: RepairOptions) -> RepairResult:
+        return repair_service(bound_session, options, time.monotonic,
+                              _cli_adapters(), get_credentials, log=log)
+
+    return SnnuOps(
+        wifi_state=lambda: wifi_state(interface),
+        wifi_reconnect=lambda ssid: wifi_reconnect(ssid, log,
+                                                   interface=interface),
+        ip_ready=lambda: _ipv4_ready(interface),
+        route_lookup=observer.route_lookup,
+        resolve_port=resolve_port,
+        portal_reachable=portal_reachable,
+        read_status=lambda sess, port: read_status_page(sess, port, log),
+        repair=_repair,
+    )
+
+
+def snnu(session: requests.Session, args: argparse.Namespace,
+         log: logging.Logger) -> int:
+    """V0.3 P4 SNNU 备用链路与接口绑定认证（受控）。
+
+    - 默认**只读识别**：关联检查/重连、等待 IP 就绪、**出口证明**、Portal 端口
+      解析/可达/状态识别；全程不提交凭据；
+    - ``--auth`` 才在**出口已确认为 SNNU 接口**后经绑定会话提交一次受控认证
+      （须用户显式授权；复用单实例互斥体，避免并发认证）。
+
+    无法证明出口经 SNNU 接口时，返回"无线认证路径未确认"且**不发送真实凭据**
+    （AGENTS §3.6 / 方案 §6.2）。
+    """
+    from tools import netdiag
+
+    # 受控认证前先取进程级互斥体（fail-closed）：拒绝并发认证（F18）。
+    if args.auth and not ensure_single_instance(log):
+        log.error("已有实例在运行：拒绝并发受控认证。")
+        return 1
+    if args.auth:
+        log.warning("--auth：将经 SNNU 接口提交一次真实认证（受控、前台上人）。")
+
+    runner = netdiag.PowerShellRunner()
+    observer = NetworkObserver(runner)
+    report = observer.observe(target_ssid=args.ssid)
+    probe_engine = WindowsProbeEngine()
+    snapshot = evaluate(report, engine=probe_engine,
+                        system_probe=lambda: internet_ok(session),
+                        route_lookup=observer.route_lookup)
+    wifi = snapshot.wifi
+    interface = wifi.interface if wifi is not None else None
+    if_index = wifi.if_index if wifi is not None else None
+    source_ip = wifi.source_ip if wifi is not None else None
+
+    ops = _snnu_ops(session, observer, log, interface)
+    link = SnnuBackupLink(
+        ops=ops, session=session, target_ssid=args.ssid,
+        interface=interface or "", if_index=if_index, source_ip=source_ip,
+        allow_auth=bool(args.auth), reconnect_wifi=not args.no_reconnect,
+        port=args.port, operator=args.yys, account_format=args.account_format,
+        log=lambda message: log.info("%s", message))
+    result = link.run()
+    print(format_backup_result(result))
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    log.info("snnu 完成：ok=%s，stage=%s，提交凭据=%s",
+             result.ok, result.stage.value, result.credentials_sent)
+    return 0 if result.ok else 1
+
+
 def status(session: requests.Session, args: argparse.Namespace) -> None:
     ssid, state = wifi_state()
     print("无线网卡状态 : %s（SSID: %s）" % (state, ssid or "未连接"))
@@ -945,6 +1022,25 @@ def build_parser() -> argparse.ArgumentParser:
                             help="链路切换最短间隔秒数（只限制路由变更），默认 300")
     p_failover.add_argument("--json", action="store_true",
                             help="额外输出机器可读 JSON（TickResult 契约）")
+    p_snnu = sub.add_parser(
+        "snnu",
+        help="V0.3 P4 SNNU 备用链路与接口绑定认证（默认只读识别，--auth 受控认证）")
+    p_snnu.add_argument("--ssid", default="SNNU",
+                        help="目标校园 Wi-Fi 名称，默认 SNNU")
+    p_snnu.add_argument("--port", type=_port_type, default=None,
+                        help="Portal 认证端口；默认动态识别，失效时可强制指定")
+    p_snnu.add_argument("--yys", choices=("mobile", "unicom", "telecom", ""),
+                        default="mobile",
+                        help="运营商: mobile(移动)/unicom(联通)/telecom(电信)/''(默认校园网)")
+    p_snnu.add_argument("--account-format", choices=("plain", "isp"),
+                        default="plain",
+                        help="账号提交格式: plain=学号(默认); isp=学号@运营商")
+    p_snnu.add_argument("--no-reconnect", action="store_true",
+                        help="不主动重连 Wi-Fi（仅观察关联状态）")
+    p_snnu.add_argument("--auth", action="store_true",
+                        help="受控提交真实凭据（默认关闭；须经用户授权，前台上人）")
+    p_snnu.add_argument("--json", action="store_true",
+                        help="额外输出机器可读 JSON（BackupLinkResult 契约）")
     for command in ("once", "watch"):
         p = sub.add_parser(command, help="单次尝试" if command == "once" else "常驻自动重连")
         p.add_argument("--ssid", default="SNNU", help="目标校园 Wi-Fi 名称，默认 SNNU")
@@ -989,6 +1085,8 @@ def main() -> None:
         raise SystemExit(netcheck(session, args, log))
     elif args.command == "failover":
         raise SystemExit(failover(session, args, log))
+    elif args.command == "snnu":
+        raise SystemExit(snnu(session, args, log))
     elif args.command == "fix-bypass":
         if not fix_bypass(log):
             raise SystemExit(1)

@@ -38,8 +38,8 @@ __all__ = [
     "HealthState", "HealthAxis", "ProbeOutcome", "EgressInfo",
     "InterfaceHealth", "SystemHealth", "Recommendation",
     "NetworkHealthSnapshot", "NetworkObserver", "InterfaceHealthChecker",
-    "WindowsProbeEngine", "resolve_roles", "recommend_path", "evaluate",
-    "format_snapshot",
+    "WindowsProbeEngine", "bind_source_address", "resolve_roles",
+    "recommend_path", "evaluate", "format_snapshot",
 ]
 
 CONTRACT_VERSION = "v03-p1-health-1"
@@ -298,6 +298,23 @@ class _SourceAddressAdapter:
 
         session.mount("http://", _Bound(**self._kwargs))
         session.mount("https://", _Bound(**self._kwargs))
+
+
+def bind_source_address(session: Any, source_ip: Optional[str]) -> bool:
+    """把会话出网连接绑定到指定源地址（复用 urllib3 ``source_address``）。
+
+    返回是否成功绑定；``source_ip`` 为空时返回 ``False``。
+
+    **重要**：在 Windows 上"绑定源地址"**不等于**"证明出口" —— 系统仍可能按目标
+    地址把连接路由到其他接口。因此调用方必须另行用 ``Find-NetRoute`` 确认实际出口
+    （方案 §3.2、AGENTS §3.6）；无法确认时**不得**发送真实凭据。
+
+    V0.3 P4 的 SNNU 接口绑定认证（``campus_snnu``）复用本函数。
+    """
+    if not source_ip:
+        return False
+    _SourceAddressAdapter((str(source_ip), 0)).mount(session)
+    return True
 
 
 class WindowsProbeEngine:
