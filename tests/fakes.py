@@ -410,3 +410,49 @@ class FakeProbeEngine:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+# --------------------------------------------------------------------------- #
+# 副作用执行器假件（V0.3 P3 campus_failover 用）
+# --------------------------------------------------------------------------- #
+class FakeOpExecutor:
+    """记录动作请求的假执行器，**零真实副作用**（V0.3 P3）。
+
+    只做两件事：记录每个 :class:`campus_failover.OpRequest`，并按脚本返回结局。
+    不切路由、不写 Metric、不发认证、不触碰 Clash、不重连 Wi-Fi。
+
+    ``results`` 键可为 ``OpKind`` 成员或其 ``value`` 字符串；值语义与
+    :meth:`campus_failover.NetworkOpScheduler._invoke` 一致：
+
+    - ``True`` / ``None``：执行成功；
+    - ``False``：执行失败（``attempted=True``，``executed=False``）；
+    - ``str``：执行成功并携带说明；
+    - ``Exception``：抛出（用于验证调度器捕获异常后转为失败结局）；
+    - ``list``：同一动作多次提交时按序弹出。
+
+    未命中且未设 ``default`` 时按成功处理。``requests`` 记录全部请求，
+    ``calls`` 记录动作类型序列，供断言"互斥串行、一轮一类"。
+    """
+
+    def __init__(self, results: Optional[Dict[Any, Any]] = None,
+                 default: Any = True) -> None:
+        self.results: Dict[Any, Any] = dict(results or {})
+        self.default = default
+        self.requests: List[Any] = []
+        self.calls: List[Any] = []
+
+    def execute(self, request: Any) -> Any:
+        self.requests.append(request)
+        self.calls.append(request.kind)
+        key = getattr(request.kind, "value", request.kind)
+        if request.kind in self.results:
+            value = self.results[request.kind]
+        elif key in self.results:
+            value = self.results[key]
+        else:
+            value = self.default
+        if isinstance(value, list):
+            value = value.pop(0) if value else self.default
+        if isinstance(value, Exception):
+            raise value
+        return value
