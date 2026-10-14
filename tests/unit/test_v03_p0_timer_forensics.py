@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
-"""V0.3 P0-T6 计时器缺陷取证：认证冷却期公网探测被暂停。
+"""V0.3 P0-T6 计时器缺陷取证 → P2 修复后反向断言。
 
-取证对象（现行实现，基线 ``4900ca9``）：
+**P0 取证（基线 ``4900ca9``，2026-10-14）**：V0.2 把「认证冷却」错误地叠加到
+「网络检测」上，认证冷却期（默认 180s）内公网探测被整体暂停：
 
 1. ``campus_reconnect.watch()``：一次认证失败后登记
    ``next_attempt = now + cooldown``，随后
    ``wait = max(interval, next_attempt - now)`` 让本轮探测整体睡到冷却结束
-   —— 冷却期（默认 180s）内**不再探测公网**；
-2. 托盘 ``_probe_tick()``/``_next_probe_time()`` 同款模式：修复后
-   ``_next_attempt_at = now + cooldown``，``_probe_tick`` 见
-   ``now < next_probe`` 直接跳过探测。
+   —— 探测时刻 ``[0, 180, 195]``，冷却期内零探测，公网恢复发现被推迟 170s；
+2. 托盘 ``_probe_tick()``/``_next_probe_time()`` 同款模式：
+   ``_next_attempt_at = now + cooldown``，``now < next_probe`` 时直接跳过探测。
 
-两者与各自 docstring 声称的"冷却只禁止新的认证，不禁止探测"相矛盾。
+**P2 修复后（本文件现为反向断言）**：三表分离（:class:`campus_core.TimerTable`）
+—— 网络检测计时器持续运行、认证冷却只限制认证。P0 取证结论保留于
+``docs/阶段0诊断报告_2026-10-14.md`` §6 与 git 历史。
 
-本文件为**行为特征化记录**（characterization）：用例在 P0 全绿，
-用于给 P2「计时器分离」提供修复前后的时间戳证据。
-**P2 修复通过后，本文件必须改写为断言"冷却期内探测不暂停"。**
+本文件的两个用例断言"冷却期内探测不暂停"，作为该缺陷的常驻回归看守。
 """
 from __future__ import annotations
 
@@ -36,12 +36,12 @@ def _args(threshold=1, interval=INTERVAL, cooldown=COOLDOWN):
                               threshold=threshold, cooldown=cooldown, force=False)
 
 
-def test_forensic_watch_probe_paused_during_auth_cooldown(monkeypatch,
-                                                          virtual_clock):
-    """CLI watch()：修复失败后 180s 冷却内零探测（时间戳证据）。
+def test_watch_probes_continue_during_auth_cooldown(monkeypatch, virtual_clock):
+    """CLI watch()：认证冷却期内公网探测**不暂停**（P2 修复后断言）。
 
-    剧本：t=0 探测失败 → 认证一次；公网在 t=10 恢复（真实世界）；
-    现行实现直到 t=180 才做下一次探测 → 恢复发现被推迟 170 秒。
+    P0 取证（缺陷）：探测时刻 = [0, 180, 195]，冷却 180s 内零探测。
+    P2 修复后：探测时刻 = [0, 15, 30, ...]（每 interval 一次）；
+    公网 t=10 恢复 → 下一个窗口 t=15 即被发现（旧实现要等到 t=180）。
     """
     clock = virtual_clock
     clock.install(monkeypatch, engine)
@@ -49,16 +49,14 @@ def test_forensic_watch_probe_paused_during_auth_cooldown(monkeypatch,
     probes: list = []
     attempts: list = []
     recovered_at = 10.0            # 公网真实恢复时刻（剧本设定）
-    cursor = {"i": 0}
-    sequence = [False, True]       # 第 1 次探测失败；其后公网已恢复
+    max_probes = 20
 
     def fake_internet_ok(session, probes_=None):
-        i = cursor["i"]
-        cursor["i"] += 1
-        probes.append(clock.monotonic())
-        if i < len(sequence):
-            return sequence[i], ""
-        raise KeyboardInterrupt      # 结束 watch 的无限循环
+        if len(probes) >= max_probes:
+            raise KeyboardInterrupt      # 结束 watch 的无限循环
+        t = clock.monotonic()
+        probes.append(t)
+        return (t >= INTERVAL), ""       # t=0 失败；t>=15 公网已恢复
 
     def fake_attempt(session, args, log):
         attempts.append(clock.monotonic())
@@ -68,28 +66,28 @@ def test_forensic_watch_probe_paused_during_auth_cooldown(monkeypatch,
     monkeypatch.setattr(engine, "attempt_repair", fake_attempt)
     engine.watch(object(), _args(), LOG)
 
-    # 取证断言（现行缺陷行为）：
-    assert attempts == [0.0], "认证应发生在 t=0：%r" % attempts
-    # t=0 失败探测 → t=180 冷却结束探测（恢复）→ t=195 恢复后正常间隔探测
-    assert probes == [0.0, 180.0, 195.0], "探测时间表：%r" % probes
-    gap = probes[1] - probes[0]
-    assert gap == COOLDOWN, ("相邻探测间隔 = cooldown(%s) 而非 interval(%s)，"
-                             "即冷却期探测被暂停：%r" % (COOLDOWN, INTERVAL, probes))
-    missed_slots = int((probes[1] - INTERVAL - probes[0]) / INTERVAL)
-    assert missed_slots == 11, "冷却期内漏掉的探测窗口应为 11 个：%r" % probes
+    # 反向断言：探测每 interval 一次，冷却期（0..180）内一次都没被跳过
+    assert probes[0] == 0.0
+    assert all(b - a == INTERVAL for a, b in zip(probes, probes[1:])), probes
+    assert probes[1] == 15.0, probes
     detection_delay = probes[1] - recovered_at
-    assert detection_delay == 170.0
-    # 证据摘要（写入 P0 诊断报告）：
-    #   探测时刻=[0.0, 180.0, 195.0]；认证时刻=[0.0]；漏探测窗口=11；恢复发现延迟=170s
+    assert detection_delay <= INTERVAL, (
+        "恢复发现延迟 %s 超过 interval(%s)：%r" % (detection_delay, INTERVAL, probes))
+    # 认证只发生在 t=0（公网随后恢复，不再认证）
+    assert attempts == [0.0], attempts
+    # 证据摘要（对照 P0 取证）：探测时刻=[0,15,30,...]；认证时刻=[0]
 
 
-def test_forensic_tray_probe_skipped_during_auth_cooldown(monkeypatch,
-                                                          virtual_clock):
-    """托盘 _probe_tick：认证后的下一次 tick 直接跳过探测（时间戳证据）。"""
+def test_tray_probes_continue_during_auth_cooldown(monkeypatch, virtual_clock):
+    """托盘 _probe_tick：认证冷却期内探测**不暂停**（P2 修复后断言）。
+
+    P0 取证（缺陷）：t=0 失败→认证；t=15 的 tick 跳过探测；t=180 才恢复探测。
+    P2 修复后：t=15 照常探测；仅当 ``auth_allowed`` 为假时跳过**认证**。
+    """
     app = _make_app(monkeypatch, interval=INTERVAL, threshold=1,
                     cooldown=COOLDOWN)
     virtual_clock.install(monkeypatch, tray)
-    attempts = []
+    attempts: list = []
     probed: list = []
 
     def fake_internet_ok(session):
@@ -104,14 +102,11 @@ def test_forensic_tray_probe_skipped_during_auth_cooldown(monkeypatch,
     assert attempts == [0.0]
     assert probed == [0.0]
 
-    virtual_clock.advance(INTERVAL)            # t=15：普通间隔到点
-    result = app._probe_tick(nxt)              # 现行实现：跳过探测
-    assert probed == [0.0], ("冷却期内 tick 仍然执行了探测：%r" % probed)
-    assert result >= COOLDOWN, "下一次探测被推迟到冷却结束：%r" % result
-
-    virtual_clock.advance(COOLDOWN - INTERVAL)  # t=180：冷却结束
-    app._probe_tick(result)
-    assert probed == [0.0, 180.0], "冷却结束后才恢复探测：%r" % probed
+    virtual_clock.advance(INTERVAL)            # t=15：探测照常进行
+    result = app._probe_tick(nxt)
+    assert probed == [0.0, 15.0], ("冷却期内探测被暂停：%r" % probed)
+    assert result == 30.0, "下一次探测应为一个 interval 之后：%r" % result
+    assert attempts == [0.0], ("冷却期内不应重复认证：%r" % attempts)
 
 
 def _make_app(monkeypatch, **overrides):
