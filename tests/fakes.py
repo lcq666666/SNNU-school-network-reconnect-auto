@@ -10,7 +10,8 @@
 
 包含：:class:`FakeRegistry`、:class:`FakeKeyring`、:class:`FakeResponse`、
 :class:`FakeSession`、:class:`FakeLauncher`、:class:`VirtualClock`、
-:class:`FakeCommandRunner`（V0.3 P0 只读诊断用的假命令执行器）。
+:class:`FakeCommandRunner`（V0.3 P0 只读诊断用的假命令执行器）、
+:class:`FakeRemoteOps`（V0.3 P7 远控探测用的假能力集合）。
 """
 from __future__ import annotations
 
@@ -416,6 +417,70 @@ class FakeProbeEngine:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+# --------------------------------------------------------------------------- #
+# 远控探测能力假件（V0.3 P7 campus_remote 用）
+# --------------------------------------------------------------------------- #
+class FakeRemoteOps:
+    """可编排的假远控探测能力（V0.3 P7），**零真实**子进程 / 注册表 / 凭据。
+
+    - ``processes``：``[{"pid", "process_name", "path"}]``（与
+      ``netdiag.parse_remote_processes`` 同构）；
+    - ``ports``：``[{"state", "remote_address", "local_port", ...}]``；
+    - ``udp`` / ``sleep`` / ``auto_logon`` / ``run_entries``：就绪自检输入；
+    - ``credentials``：凭据存在性（可为 ``Exception`` 或按序弹出的 list）；
+    - ``probe_error``：注入探测异常；``probe_calls`` / ``readiness_calls`` 记录调用。
+
+    ``probe()`` 只返回进程/端口/UDP；``probe_readiness()`` 额外带上睡眠/登录/
+    自启数据（与真实 ``build_windows_remote_ops`` 的两级探测一致）。
+    """
+
+    def __init__(self, *, processes=None, ports=None, udp=None, sleep=None,
+                 auto_logon=None, run_entries=None, credentials=True,
+                 probe_error=None) -> None:
+        self.processes = [dict(row) for row in (processes or [])]
+        self.ports = [dict(row) for row in (ports or [])]
+        self.udp = [dict(row) for row in (udp or [])]
+        self.sleep = dict(sleep or {})
+        self.auto_logon = dict(auto_logon or {})
+        self.run_entries = [dict(row) for row in (run_entries or [])]
+        self.credentials = credentials
+        self.probe_error = probe_error
+        self.probe_calls: List[int] = []
+        self.readiness_calls: List[int] = []
+
+    def _base(self):
+        from campus_remote import RemoteProbe
+
+        if self.probe_error is not None:
+            raise self.probe_error
+        return RemoteProbe(clients=[dict(row) for row in self.processes],
+                           ports=[dict(row) for row in self.ports],
+                           udp_endpoints=[dict(row) for row in self.udp])
+
+    def probe(self):
+        self.probe_calls.append(1)
+        return self._base()
+
+    def probe_readiness(self):
+
+        self.readiness_calls.append(1)
+        if self.probe_error is not None:
+            raise self.probe_error
+        probe = self._base()
+        probe.sleep_states = dict(self.sleep)
+        probe.auto_logon = dict(self.auto_logon)
+        probe.run_entries = [dict(row) for row in self.run_entries]
+        return probe
+
+    def credentials_present(self) -> bool:
+        value = self.credentials
+        if isinstance(value, list):
+            value = value.pop(0) if value else True
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
 
 
 # --------------------------------------------------------------------------- #
