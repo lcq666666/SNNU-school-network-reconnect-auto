@@ -522,3 +522,159 @@ class FakeSnnuLink:
 
     def advance(self, steps: int = 1) -> None:
         self._index += int(steps)
+
+
+# --------------------------------------------------------------------------- #
+# 路由能力假件（V0.3 P5 campus_route_guard 用）
+# --------------------------------------------------------------------------- #
+class FakeRouteOps:
+    """可编排的假路由能力集合（V0.3 P5），**零真实** netsh / PowerShell / 路由写入。
+
+    与 :class:`campus_route_guard.RouteOps` 同构，模拟一个"按 InterfaceMetric 选出口"
+    的简化 Windows 行为：
+
+    - ``metrics``：``{if_index: dict}``，键为 if_index，值为
+      ``alias`` / ``ipv4_metric`` / ``ipv6_metric`` / ``ipv4_automatic`` /
+      ``ipv6_automatic``；``set_metric`` / ``restore_automatic`` 会就地更新它，
+      因此"读到的状态"随写入真实变化（可断言快照/回滚）。
+    - ``egress``：``{target: if_index|None}``，键为路由查询目标地址
+      （``8.8.8.8`` / ``2606:4700:4700::1111``），值为该目标当前实际出口。
+    - ``apply_egress=True``（默认）：每次写入后按"最小 Metric 优先"重算出口，
+      模拟 Windows 依 Metric 选择出口；设 ``False`` 可构造"写入成功但出口未改变"。
+    - ``set_ok`` / ``restore_ok``：写入是否成功（可为 ``list`` 按序弹出或 ``Exception``）。
+
+    记录 ``writes``（``(if_index, family, metric)``）、``restores``、``reads``，
+    供断言"最小变更""写入顺序""回滚内容"。
+    """
+
+    def __init__(self, metrics: Optional[Dict[int, Dict[str, Any]]] = None,
+                 egress: Optional[Dict[str, Optional[int]]] = None,
+                 default_routes: Optional[List[Dict[str, Any]]] = None,
+                 set_ok: Any = True, restore_ok: Any = True,
+                 apply_egress: bool = True) -> None:
+        self.metrics: Dict[int, Dict[str, Any]] = {
+            int(k): dict(v) for k, v in (metrics or {}).items()}
+        self.egress: Dict[str, Optional[int]] = dict(egress or {})
+        self.default_routes: List[Dict[str, Any]] = list(default_routes or [])
+        self.set_ok = set_ok
+        self.restore_ok = restore_ok
+        self.apply_egress = apply_egress
+        self.writes: List[Tuple[int, str, int]] = []
+        self.restores: List[Tuple[int, str]] = []
+        self.reads: int = 0
+
+    # ---- 只读 ---- #
+    def read_metrics(self) -> Dict[int, Any]:
+        from campus_route_guard import MetricState
+
+        self.reads += 1
+        return {if_index: MetricState(if_index=if_index,
+                                      alias=str(row.get("alias") or ""),
+                                      ipv4_metric=row.get("ipv4_metric"),
+                                      ipv6_metric=row.get("ipv6_metric"),
+                                      ipv4_automatic=row.get("ipv4_automatic"),
+                                      ipv6_automatic=row.get("ipv6_automatic"))
+                for if_index, row in self.metrics.items()}
+
+    def read_default_routes(self) -> List[Dict[str, Any]]:
+        return [dict(row) for row in self.default_routes]
+
+    def read_primary_egress(self) -> Optional[int]:
+        return self.egress.get("8.8.8.8")
+
+    def egress_check(self, target: str) -> Any:
+        from campus_route_guard import EgressCheck
+
+        if target not in self.egress:
+            return EgressCheck("", target, error="假件未提供该目标的出口")
+        return EgressCheck("", target, self.egress[target])
+
+    # ---- 写入 ---- #
+    def _result(self, scripted: Any) -> bool:
+        value = scripted
+        if isinstance(value, list):
+            value = value.pop(0) if value else True
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
+
+    def set_metric(self, if_index: int, family: str, metric: int) -> bool:
+        ok = self._result(self.set_ok)
+        if not ok:
+            return False
+        self.writes.append((int(if_index), str(family), int(metric)))
+        row = self.metrics.setdefault(int(if_index), {})
+        row["%s_metric" % family.lower()] = int(metric)
+        row["%s_automatic" % family.lower()] = "Disabled"
+        if self.apply_egress:
+            self._recompute_egress()
+        return True
+
+    def restore_automatic(self, if_index: int, family: str) -> bool:
+        ok = self._result(self.restore_ok)
+        if not ok:
+            return False
+        self.restores.append((int(if_index), str(family)))
+        row = self.metrics.setdefault(int(if_index), {})
+        row["%s_automatic" % family.lower()] = "Enabled"
+        if self.apply_egress:
+            self._recompute_egress()
+        return True
+
+    def _recompute_egress(self) -> None:
+        """按"最小 IPv4/IPv6 Metric 优先"重算两个目标地址的出口。"""
+        for family, target in (("ipv4", "8.8.8.8"),
+                               ("ipv6", "2606:4700:4700::1111")):
+            if target not in self.egress:
+                continue
+            key = "%s_metric" % family
+            candidates = [(row.get(key), if_index)
+                          for if_index, row in self.metrics.items()
+                          if row.get(key) is not None]
+            if candidates:
+                self.egress[target] = min(candidates)[1]
+
+
+class FakeMetricWriter:
+    """假 Metric 写入器（V0.3 P5）：记录写入脚本，**零真实** PowerShell。
+
+    每次写入先经 :func:`campus_route_guard.assert_write_allowed` 自检
+    （未通过即抛错），从而永久看守"路由卫士只会发出白名单内的写入命令"。
+    """
+
+    def __init__(self, set_ok: Any = True, restore_ok: Any = True) -> None:
+        self.set_ok = set_ok
+        self.restore_ok = restore_ok
+        self.scripts: List[str] = []
+        self.calls: List[Tuple[str, int, str]] = []
+
+    def _record(self, script: str) -> None:
+        from campus_route_guard import assert_write_allowed
+
+        assert_write_allowed(script)
+        self.scripts.append(script)
+
+    def _result(self, scripted: Any) -> bool:
+        value = scripted
+        if isinstance(value, list):
+            value = value.pop(0) if value else True
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
+
+    def set_metric(self, if_index: int, family: str, metric: int) -> bool:
+        from campus_route_guard import WindowsMetricWriter
+
+        self._record(WindowsMetricWriter.SET_METRIC.format(
+            if_index=int(if_index), family=str(family), metric=int(metric)))
+        self.calls.append(("set_metric", int(if_index), str(family)))
+        return self._result(self.set_ok)
+
+    def restore_automatic(self, if_index: int, family: str) -> bool:
+        from campus_route_guard import WindowsMetricWriter
+
+        self._record(WindowsMetricWriter.RESTORE_AUTOMATIC.format(
+            if_index=int(if_index), family=str(family)))
+        self.calls.append(("restore_automatic", int(if_index), str(family)))
+        return self._result(self.restore_ok)
+
