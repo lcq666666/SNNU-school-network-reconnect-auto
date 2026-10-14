@@ -64,16 +64,18 @@
   ```bash
   http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= git push origin fix/reconnect-stability-20261013
   ```
-- **本机实测**：`github.com` 的 git 推送会被网络限速/重置而挂起（`git ls-remote` 可用，但 pack 上传卡死），
-  而 `api.github.com` 始终畅通。因此**推荐直接用仓库内工具完成推送**（`git push` 仅作备用）：
+- **本机实测**：`github.com` 的 git 推送会被网络限速/重置而挂起（`git ls-remote` 可用，但 pack 上传卡死）；
+  `api.github.com` 曾畅通，但 `~/.git-credentials` 的 PAT 已于 2026-10-14 实测失效（`401 Bad credentials`）。
+- **现行推送方式（2026-10-14 起，经用户确认）**：远端已切换为 **SSH**
+  `git@github.com:lcq666666/SNNU-school-network-reconnect-auto.git`
+  （`~/.ssh/config` 已将其映射到 `ssh.github.com:443`，密钥 `id_ed25519`）。推送一次成功：
   ```bash
-  .venv/Scripts/python.exe tools/api_push.py <远端分支当前SHA>
+  http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= git push origin fix/reconnect-stability-20261013
   ```
-  该工具用 GitHub Git Data API 上传 blob/tree/commit 并更新分支 ref，随后把本地分支重建为与远端一致的 SHA
-  （保证 local == remote，后续可快进推送）。
-- 凭据：PAT 已存入 `~/.git-credentials`（`credential.helper=store`），工具自动读取，**不打印、不入库**。
+- 备用方式：`tools/api_push.py <远端分支当前SHA>`（GitHub Git Data API，需 `~/.git-credentials` 中的 PAT 有效；
+  该工具会把本地分支重建为与远端一致的 SHA，保证 local == remote）。PAT 失效期间不可用。
 - **绝不推送 `main`**；不 force push；不覆盖既有版本产物。
-- 注：只读查询远端（`git ls-remote`、`git fetch`）需走系统代理 `127.0.0.1:7897`，见第 4 节。
+- 注：只读查询远端（`git ls-remote`、`git fetch`）走 SSH 即可；如需走 https 则需系统代理 `127.0.0.1:7897`，见第 4 节。
 
 ## 3. V0.3 双网卡专项工作规则
 
@@ -101,8 +103,8 @@
 - 依赖清单：`requirements.txt`（requests/keyring + 托盘 pystray/pillow）、
   `requirements-dev.txt`（pytest/pytest-cov/ruff/pyinstaller）。
 - 网络访问：
-  - 远端 git 只读（fetch/ls-remote）需走系统代理：`https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 git ...`
-  - 远端 git 推送须**清空**代理变量（见 2.7）。
+  - 远端 git 现行走 **SSH**（`git@github.com`，映射 `ssh.github.com:443`）：`git ls-remote` / `git fetch` / `git push` 均可直连，无需代理。
+  - 若需回退 https：只读（fetch/ls-remote）走系统代理 `https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 git ...`；推送须**清空**代理变量（见 2.7）。
   - 校园网测试地址 `202.117.144.205` 保持 Direct/Bypass，不经 Clash。
 - Wi-Fi SSID = `SNNU`；脚本勿带 shebang 行；托管 Python 路径见项目记忆。
 
