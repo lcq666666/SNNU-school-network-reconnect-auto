@@ -9,7 +9,8 @@
 - 不真实 ``sleep``。
 
 包含：:class:`FakeRegistry`、:class:`FakeKeyring`、:class:`FakeResponse`、
-:class:`FakeSession`、:class:`FakeLauncher`、:class:`VirtualClock`。
+:class:`FakeSession`、:class:`FakeLauncher`、:class:`VirtualClock`、
+:class:`FakeCommandRunner`（V0.3 P0 只读诊断用的假命令执行器）。
 """
 from __future__ import annotations
 
@@ -272,3 +273,64 @@ class VirtualClock:
                                      time=self.time)
         monkeypatch.setattr(module, "time", fake)
         return self
+
+
+# --------------------------------------------------------------------------- #
+# 只读命令执行（V0.3 P0 netdiag）
+# --------------------------------------------------------------------------- #
+class FakeCommandRunner:
+    """按诊断项名称返回预置输出的假命令执行器，零真实子进程。
+
+    ``responses`` 键为诊断项名称（由被测工具定义），值可为：
+
+    - ``str``：视为 ``rc=0`` 的 stdout（PowerShell ConvertTo-Json 文本等）；
+    - ``(rc, stdout, stderr)`` 元组：完整结局；
+    - ``Exception``：调用时抛出（构造"命令执行器本身故障"）；
+    - ``list``：同一诊断项多次调用时按序弹出（空列表表示未预期的额外调用）。
+
+    未提供且未设 ``default`` 的诊断项会抛出 :class:`KeyError`，
+    迫使测试显式覆盖全部诊断项（防止漏桩导致假绿）。
+
+    记录 ``commands``（``(name, script)`` 全量调用记录），
+    供 I-0-01 断言"全部命令只读、无任何写操作"。
+    """
+
+    def __init__(self, responses: Optional[Dict[str, Any]] = None,
+                 default: Any = None) -> None:
+        self.responses: Dict[str, Any] = dict(responses or {})
+        self.default = default
+        self.commands: List[Tuple[str, str]] = []
+        self.calls: List[str] = []
+        self._pop: Dict[str, List[Any]] = {}
+
+    def run(self, name: str, script: str) -> Tuple[int, str, str]:
+        self.commands.append((name, script))
+        self.calls.append(name)
+        value: Any
+        if name in self._pop:
+            queue = self._pop[name]
+            if not queue:
+                raise AssertionError("unexpected extra call: %r" % name)
+            value = queue.pop(0)
+        elif name in self.responses:
+            scripted = self.responses[name]
+            if isinstance(scripted, list):
+                self._pop[name] = list(scripted)
+                if not scripted:
+                    raise AssertionError("empty response list for %r" % name)
+                value = scripted[0]
+                if isinstance(value, Exception):
+                    raise value
+            else:
+                value = scripted
+        elif self.default is not None:
+            value = self.default
+        else:
+            raise KeyError("no fake response for command %r" % name)
+        if isinstance(value, Exception):
+            raise value
+        if isinstance(value, tuple):
+            return int(value[0]), str(value[1]), str(value[2])
+        if isinstance(value, int):
+            return value, "", ""
+        return 0, str(value), ""

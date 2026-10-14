@@ -22,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.fakes import (FakeKeyring, FakeLauncher, FakeRegistry, FakeSession,
-                         VirtualClock)
+from tests.fakes import (FakeCommandRunner, FakeKeyring, FakeLauncher,
+                         FakeRegistry, FakeSession, VirtualClock)
 
 # tests/conftest.py -> 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +63,12 @@ def fake_launcher() -> FakeLauncher:
 def virtual_clock() -> VirtualClock:
     """可推进的虚拟时钟（不真实 sleep）。"""
     return VirtualClock()
+
+
+@pytest.fixture
+def fake_runner() -> FakeCommandRunner:
+    """假只读命令执行器（零真实子进程；V0.3 P0 netdiag 用）。"""
+    return FakeCommandRunner()
 
 
 @pytest.fixture(autouse=True)
