@@ -179,6 +179,10 @@ TCP_PORTS_JSON = _json([
      "RemotePort": 0, "State": "Listen", "OwningProcess": 4120},
 ])
 
+UDP_PORTS_JSON = _json([
+    {"LocalAddress": "0.0.0.0", "LocalPort": 41641, "OwningProcess": 6120},
+])
+
 POWERCFG_TEXT = """\
 The following sleep states are available on this system:
     Standby (S3)
@@ -247,6 +251,29 @@ def test_u0_02_interface_metrics_parse_ipv4_ipv6_separately():
     assert eth[0]["automatic_metric"] == "Enabled"
 
 
+def test_u0_02_enum_integers_are_normalized():
+    """实测：ConvertTo-Json 把 AddressFamily/AutomaticMetric 序列化为整数。"""
+    rows = netdiag.parse_ip_interfaces(_json([
+        {"ifIndex": 10, "InterfaceAlias": "以太网", "AddressFamily": 2,
+         "InterfaceMetric": 25, "AutomaticMetric": 1},
+        {"ifIndex": 10, "InterfaceAlias": "以太网", "AddressFamily": 23,
+         "InterfaceMetric": 25, "AutomaticMetric": 1},
+        {"ifIndex": 5, "InterfaceAlias": "WLAN", "AddressFamily": 2,
+         "InterfaceMetric": 35, "AutomaticMetric": 0},
+    ]))
+    by_family = {r["address_family"]: r for r in rows if r["if_index"] == 10}
+    assert set(by_family) == {"IPv4", "IPv6"}
+    assert by_family["IPv4"]["automatic_metric"] == "Enabled"
+    assert [r for r in rows if r["if_index"] == 5][0]["automatic_metric"] \
+        == "Disabled"
+
+    addrs = netdiag.parse_ip_addresses(_json([
+        {"ifIndex": 10, "AddressFamily": 2, "IPAddress": "192.168.124.9"},
+        {"ifIndex": 10, "AddressFamily": 23, "IPAddress": "fe80::1"},
+    ]))
+    assert [a["address_family"] for a in addrs] == ["IPv4", "IPv6"]
+
+
 # --------------------------------------------------------------------------- #
 # U-0-03 默认路由读取
 # --------------------------------------------------------------------------- #
@@ -263,6 +290,17 @@ def test_u0_03_default_routes_parsed_with_family_and_metrics():
     assert by_if[12]["interface_metric"] == 25
     assert by_if[25]["next_hop"] == "0.0.0.0"
     assert by_if[25]["interface_metric"] == 10
+
+
+def test_u0_03_route_protocol_integer_normalized():
+    """实测：Protocol 枚举序列化为整数（3 = NetMgmt）。"""
+    routes = netdiag.parse_default_routes(_json([
+        {"ifIndex": 10, "DestinationPrefix": "0.0.0.0/0",
+         "NextHop": "192.168.124.1", "RouteMetric": 0, "InterfaceMetric": 25,
+         "Protocol": 3, "PolicyStore": None},
+    ]))
+    assert routes[0]["protocol"] == "NetMgmt"
+    assert routes[0]["policy_store"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -318,6 +356,27 @@ def test_u0_05_egress_failure_records_error_without_assumption():
                                   target="8.8.8.8")
     assert egress["if_index"] is None
     assert egress["error"]
+
+
+def test_u0_05_egress_accepts_output_despite_nonzero_rc():
+    """实测：非终止错误时 rc=1 但 stdout 仍有效（routes/tcp/udp 均如此）。"""
+    egress = netdiag.parse_egress((1, EGRESS_V4_JSON, "minor error"),
+                                  target="8.8.8.8")
+    assert egress["if_index"] == 12
+    assert egress["error"] is None
+
+
+def test_tcp_state_integer_normalized():
+    """实测：State 枚举序列化为整数（2 = Listen，5 = Established）。"""
+    ports = netdiag.parse_tcp_ports(_json([
+        {"LocalAddress": "100.118.101.104", "LocalPort": 443,
+         "RemoteAddress": "0.0.0.0", "RemotePort": 0, "State": 2,
+         "OwningProcess": 7832},
+        {"LocalAddress": "192.168.124.9", "LocalPort": 50000,
+         "RemoteAddress": "203.0.113.9", "RemotePort": 443, "State": 5,
+         "OwningProcess": 4120},
+    ]))
+    assert [p["state"] for p in ports] == ["Listen", "Established"]
 
 
 # --------------------------------------------------------------------------- #
@@ -445,6 +504,9 @@ def test_remote_section_collects_clients_ports_and_unattended_settings():
     ports = netdiag.parse_tcp_ports(TCP_PORTS_JSON)
     listen = [p for p in ports if p["state"] == "Listen"]
     assert listen and listen[0]["local_port"] == 40000
+
+    udp = netdiag.parse_udp_ports(UDP_PORTS_JSON)
+    assert udp == [{"local_address": "0.0.0.0", "local_port": 41641, "pid": 6120}]
 
     winlogon = netdiag.parse_winlogon(WINLOGON_JSON)
     assert winlogon["auto_admin_logon"] is True

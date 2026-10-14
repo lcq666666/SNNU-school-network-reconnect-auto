@@ -21,7 +21,8 @@ from tests.unit.test_v03_p0_netdiag import (ADAPTERS_JSON, ADVANCED_PROPS_BENIGN
                                              IP_INTERFACES_JSON, NETSH_INTERFACES_TEXT,
                                              POWERCFG_TEXT, POWER_MGMT_JSON,
                                              REMOTE_PROCESSES_JSON, RUN_ENTRIES_RAW,
-                                             TCP_PORTS_JSON, WINLOGON_JSON)
+                                             TCP_PORTS_JSON, UDP_PORTS_JSON,
+                                             WINLOGON_JSON)
 from tools import netdiag
 
 FULL_STUB = {
@@ -38,6 +39,7 @@ FULL_STUB = {
     "power_management": POWER_MGMT_JSON,
     "remote_processes": REMOTE_PROCESSES_JSON,
     "remote_tcp": TCP_PORTS_JSON,
+    "remote_udp": UDP_PORTS_JSON,
     "sleep_states": POWERCFG_TEXT,
     "winlogon": WINLOGON_JSON,
     "run_entries": RUN_ENTRIES_RAW,
@@ -89,6 +91,17 @@ def test_i0_01_command_failure_is_recorded_not_fatal():
     assert report.wifi["available"] is True
 
 
+def test_i0_01_nonzero_rc_with_valid_output_is_used():
+    """实测修正：PowerShell 非终止错误 rc=1 但 stdout 有效时应采用输出。"""
+    runner = FakeCommandRunner(responses=dict(FULL_STUB))
+    runner.responses["default_routes"] = (1, DEFAULT_ROUTES_JSON, "minor error")
+    report = netdiag.collect(runner)
+    assert len(report.default_routes) == 3
+    notes = {e["command"]: e["error"] for e in report.errors}
+    assert "default_routes" in notes
+    assert "有有效输出" in notes["default_routes"]
+
+
 def test_i0_02_json_contract_covers_p1_inputs():
     """I-0-02：JSON 契约完整、可解析、无自定义对象残留（P1 输入冻结）。"""
     runner = FakeCommandRunner(responses=FULL_STUB)
@@ -132,6 +145,12 @@ def test_i0_02_json_contract_covers_p1_inputs():
     assert data["coexistence"]["verdict"] in ("allowed", "blocked", "undetermined")
     assert data["coexistence"]["evidence"]
     assert data["connection_profiles"]
+
+    # 远控路径输入：客户端进程 / TCP 端口 / UDP 端点（Tailscale 等）
+    remote = data["remote_control"]
+    assert remote["clients"] and remote["ports"] and remote["udp_endpoints"]
+    assert remote["sleep_states"] and remote["auto_logon"] is not None
+    assert remote["run_entries"]
 
     # 契约版本稳定（P1 按此版本消费）
     assert data["contract_version"] == netdiag.CONTRACT_VERSION

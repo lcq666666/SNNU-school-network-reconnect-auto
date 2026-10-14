@@ -46,11 +46,13 @@ EGRESS_TARGETS: Tuple[Tuple[str, str], ...] = (
     ("public_ipv6", "2606:4700:4700::1111"),
 )
 
-#: 远控客户端进程名关键词（常见国内 + 国际客户端，可按需扩充）。
+#: 远控客户端进程名关键词（常见国内 + 国际客户端 + Tailscale 远程网络层，
+#: 可按需扩充）。
 REMOTE_CLIENT_PATTERN = ("ToDesk|SunloginClient|AnyDesk|RustDesk|TeamViewer|"
                          "Parsec|Radmin|Splashtop|LiteManager|AnyViewer|"
                          "AweSun|Iperius|VncViewer|UltraVNC|TightVNC|"
-                         "WinVNC|Ammyy|Netman|tmremoteclient|RemoteDesktop")
+                         "WinVNC|Ammyy|Netman|tmremoteclient|RemoteDesktop|"
+                         "Tailscale|tailscaled")
 
 #: 虚拟网卡描述关键字（Virtual 标志缺失时的兜底判定）。
 VIRTUAL_DESCRIPTION_HINTS = ("tap-", "tun", "hyper-v", "wsl", "virtual",
@@ -146,6 +148,10 @@ _COMMANDS: Dict[str, str] = {
         "SilentlyContinue | Select-Object LocalAddress,LocalPort,"
         "RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json "
         "-Depth 2 -Compress"),
+    "remote_udp": (
+        "Get-NetUDPEndpoint -OwningProcess {pids} -ErrorAction "
+        "SilentlyContinue | Select-Object LocalAddress,LocalPort,"
+        "OwningProcess | ConvertTo-Json -Depth 2 -Compress"),
     "sleep_states": "powercfg /a",
     "winlogon": (
         "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\"
@@ -282,6 +288,38 @@ def _first(obj: Dict[str, Any], *keys: str) -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# 枚举归一化
+# --------------------------------------------------------------------------- #
+#: PowerShell 5.1 的 ConvertTo-Json 可能把枚举序列化为**整数**（实测本机
+#: AddressFamily=23/2、TcpState=2/5、AutomaticMetric=1、RouteProtocol=3），
+#: 这里按稳定枚举值还原名称；字符串值原样通过。
+_TCP_STATES = {1: "Closed", 2: "Listen", 3: "SynSent", 4: "SynReceived",
+               5: "Established", 6: "FinWait1", 7: "FinWait2", 8: "CloseWait",
+               9: "Closing", 10: "LastAck", 11: "DeleteWait", 12: "TimeWait"}
+_ADDRESS_FAMILIES = {2: "IPv4", 10: "IPv6", 23: "IPv6"}  # InterNetwork/V6
+_AUTOMATIC_METRIC = {0: "Disabled", 1: "Enabled"}
+_ROUTE_PROTOCOLS = {1: "Other", 2: "Local", 3: "NetMgmt", 4: "IcmpRedirect",
+                    5: "Eigrp", 6: "Bgp", 7: "Rip", 8: "Static", 9: "Dump",
+                    10: "Bbn", 11: "Ndis"}
+
+
+def _enum_name(value: Any, mapping: Dict[int, str], default: str = "") -> str:
+    """枚举值归一化：整数或数字字符串按映射还原，其余原样返回。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return mapping.get(value, str(value))
+    text = str(value).strip()
+    if not text:
+        return default
+    if text.isdigit():
+        return mapping.get(int(text), text)
+    return text
+
+
+# --------------------------------------------------------------------------- #
 # 结构化记录
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -398,9 +436,11 @@ def parse_ip_interfaces(payload: Any) -> List[Dict[str, Any]]:
         rows.append({
             "if_index": _as_int(_pick(row, "ifIndex", "InterfaceIndex")),
             "interface_alias": str(_pick(row, "InterfaceAlias") or ""),
-            "address_family": str(_pick(row, "AddressFamily") or ""),
+            "address_family": _enum_name(_pick(row, "AddressFamily"),
+                                          _ADDRESS_FAMILIES),
             "interface_metric": _as_int(_pick(row, "InterfaceMetric")),
-            "automatic_metric": str(_pick(row, "AutomaticMetric") or ""),
+            "automatic_metric": _enum_name(_pick(row, "AutomaticMetric"),
+                                            _AUTOMATIC_METRIC),
             "dhcp": str(_pick(row, "Dhcp") or ""),
             "connection_state": str(_pick(row, "ConnectionState") or ""),
         })
@@ -413,7 +453,8 @@ def parse_ip_addresses(payload: Any) -> List[Dict[str, Any]]:
         rows.append({
             "if_index": _as_int(_pick(row, "ifIndex", "InterfaceIndex")),
             "interface_alias": str(_pick(row, "InterfaceAlias") or ""),
-            "address_family": str(_pick(row, "AddressFamily") or ""),
+            "address_family": _enum_name(_pick(row, "AddressFamily"),
+                                          _ADDRESS_FAMILIES),
             "ip_address": str(_pick(row, "IPAddress") or ""),
             "prefix_length": _as_int(_pick(row, "PrefixLength")),
             "address_state": str(_pick(row, "AddressState") or ""),
@@ -435,21 +476,25 @@ def parse_default_routes(payload: Any) -> List[Dict[str, Any]]:
             "next_hop": str(_pick(row, "NextHop") or ""),
             "route_metric": _as_int(_pick(row, "RouteMetric")),
             "interface_metric": _as_int(_pick(row, "InterfaceMetric")),
-            "protocol": str(_pick(row, "Protocol") or ""),
-            "policy_store": str(_pick(row, "PolicyStore") or ""),
+            "protocol": _enum_name(_pick(row, "Protocol"), _ROUTE_PROTOCOLS),
+            "policy_store": str(_pick(row, "PolicyStore") or "") or None,
         })
     return rows
 
 
 def parse_egress(payload: Any, target: str) -> Dict[str, Any]:
-    """解析 ``Find-NetRoute`` 出口识别结果；失败如实记录，不假定成功。"""
+    """解析 ``Find-NetRoute`` 出口识别结果；失败如实记录，不假定成功。
+
+    注意：PowerShell 存在**非终止错误**时退出码为非 0 但仍可能产出有效
+    输出（实测），因此以 stdout 是否可解析为准，而非退出码。
+    """
     outcome: Dict[str, Any] = {"target": target, "source_ip": None,
                                "if_index": None, "interface_alias": None,
                                "interface_metric": None, "error": None}
     if isinstance(payload, tuple):
         rc, out, err = int(payload[0]), str(payload[1]), str(payload[2])
-        if rc != 0 or not out.strip():
-            outcome["error"] = (err or out or "命令失败").strip()[:200]
+        if not out.strip():
+            outcome["error"] = (err or out or ("命令返回码 %s" % rc)).strip()[:200]
             return outcome
         payload = out
     rows = _as_list(payload)
@@ -695,7 +740,19 @@ def parse_tcp_ports(payload: Any) -> List[Dict[str, Any]]:
             "local_port": _as_int(_pick(row, "LocalPort")),
             "remote_address": str(_pick(row, "RemoteAddress") or ""),
             "remote_port": _as_int(_pick(row, "RemotePort")),
-            "state": str(_pick(row, "State") or ""),
+            "state": _enum_name(_pick(row, "State"), _TCP_STATES),
+            "pid": _as_int(_pick(row, "OwningProcess")),
+        })
+    return rows
+
+
+def parse_udp_ports(payload: Any) -> List[Dict[str, Any]]:
+    """解析 UDP 端点（Tailscale 等仅用 UDP 的远程网络层）。"""
+    rows: List[Dict[str, Any]] = []
+    for row in _as_list(payload):
+        rows.append({
+            "local_address": str(_pick(row, "LocalAddress") or ""),
+            "local_port": _as_int(_pick(row, "LocalPort")),
             "pid": _as_int(_pick(row, "OwningProcess")),
         })
     return rows
@@ -895,6 +952,11 @@ class DiagReport:
              ("（%s）" % ", ".join(str(p["local_port"]) for p in listening))
              if listening else "",
              len(established)))
+        udp = remote.get("udp_endpoints") or []
+        if udp:
+            add("    UDP 端点: %s" % ", ".join(
+                "%s:%s(pid=%s)" % (u["local_address"], u["local_port"], u["pid"])
+                for u in udp[:10]))
         sleep = remote.get("sleep_states") or {}
         if sleep.get("mentions_standby") is None:
             add("    睡眠状态: 查询失败/无输出")
@@ -943,16 +1005,21 @@ def collect(runner: Any, *, target_ssid: str = DEFAULT_TARGET_SSID,
             errors.append({"command": name,
                            "error": "%s: %s" % (type(exc).__name__, exc)})
             return None
-        if rc != 0:
+        if rc != 0 and not out.strip():
             errors.append({"command": name,
                            "error": ((err or out) or ("返回码 %s" % rc)).strip()[:300]})
+        elif rc != 0:
+            # PowerShell 非终止错误：rc!=0 但产出有效输出（实测常见），采用输出
+            errors.append({"command": name,
+                           "error": "命令返回码 %s 但有有效输出（非终止错误，已采用）：%s"
+                                    % (rc, (err or "").strip()[:200])})
         return rc, out, err
 
     def _out(name: str, pids: Optional[Sequence[int]] = None) -> Optional[str]:
         raw = _call(name, pids=pids)
-        if raw is None or raw[0] != 0:
+        if raw is None:
             return None
-        return raw[1]
+        return raw[1] or None
 
     adapters = parse_adapters(_out("adapters"), _out("cim_adapters"))
     ip_interfaces = parse_ip_interfaces(_out("ip_interfaces"))
@@ -973,17 +1040,22 @@ def collect(runner: Any, *, target_ssid: str = DEFAULT_TARGET_SSID,
 
     processes_raw = _call("remote_processes")
     processes = parse_remote_processes(processes_raw[1]) \
-        if processes_raw and processes_raw[0] == 0 else []
+        if processes_raw and processes_raw[1].strip() else []
     ports: List[Dict[str, Any]] = []
+    udp_ports: List[Dict[str, Any]] = []
     pids = [p["pid"] for p in processes if p["pid"]]
     if pids:
         tcp_raw = _call("remote_tcp", pids=pids)
-        if tcp_raw and tcp_raw[0] == 0:
+        if tcp_raw and tcp_raw[1].strip():
             ports = parse_tcp_ports(tcp_raw[1])
+        udp_raw = _call("remote_udp", pids=pids)
+        if udp_raw and udp_raw[1].strip():
+            udp_ports = parse_udp_ports(udp_raw[1])
 
     remote_control = {
         "clients": processes,
         "ports": ports,
+        "udp_endpoints": udp_ports,
         "sleep_states": parse_powercfg(_out("sleep_states")),
         "auto_logon": parse_winlogon(_out("winlogon")),
         "run_entries": parse_run_entries(_out("run_entries")),
