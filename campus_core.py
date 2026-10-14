@@ -712,6 +712,10 @@ def validate_config(raw: Any) -> ConfigLoadResult:
         "schema_version", "ssid", "profile", "interface", "operator", "yys",
         "account_format", "interval", "threshold", "cooldown",
         "browser_fallback", "clash_auto_proxy", "proxy_consent", "proxy_endpoint",
+        # 托盘本地状态键（非认证引擎字段，由托盘自行读写；此处登记以避免
+        # 被误判为"未知配置键"）：暂停标志（P2）与 V0.3 P6 三模式/锁定/Clash。
+        "paused", "failover_mode", "failover_lock", "clash_keep",
+        "auto_switch_authorized",
     }
     unknown_keys = tuple(sorted(k for k in raw if k not in known))
     for key in unknown_keys:

@@ -39,13 +39,20 @@ from campus_network import HealthState, NetworkHealthSnapshot
 
 __all__ = [
     "CONTRACT_VERSION", "RELIABLE_FAILURE_STATES", "UNRELIABLE_STATES",
-    "CAPTIVE_STATES", "EXECUTION_STATES", "FailoverState", "FailoverMode",
+    "CAPTIVE_STATES", "EXECUTION_STATES", "LOCK_TARGETS", "PATH_LABEL",
+    "FailoverState", "FailoverMode",
     "OpKind", "FailoverPolicy", "OpRequest", "OpOutcome",
     "NetworkOpScheduler", "TickResult", "NetworkFailoverManager",
     "format_tick",
 ]
 
 CONTRACT_VERSION = "v03-p3-failover-1"
+
+#: 手动锁定（``FailoverMode.LOCKED``）可选的优先路径（方案 §11「手动锁定」）。
+LOCK_TARGETS = ("ethernet", "wifi")
+
+#: 路径中文名（托盘/CLI 展示用）。
+PATH_LABEL = {"ethernet": "以太网", "wifi": "Wi-Fi"}
 
 #: 「可靠失败」：可作为连续失败计数与切换依据的健康结论（方案 §3.3）。
 RELIABLE_FAILURE_STATES = frozenset({
@@ -97,8 +104,9 @@ class FailoverMode(Enum):
 
     - :attr:`MONITOR`：**只读监测** —— 观察双网络状态，不执行任何动作（P3 默认）；
     - :attr:`AUTO`：智能自动 —— 允许执行已批准的动作（真实执行层由 P5 接入）；
-    - :attr:`LOCKED`：手动锁定 —— P3 中与 MONITOR 同样不执行任何动作，
-      锁定语义（固定优先路径）由 P6 接入。
+    - :attr:`LOCKED`：手动锁定 —— 与 MONITOR 同样**不执行任何动作**；P6 接入
+      锁定语义：``lock_target`` 非空时优先路径固定为该目标，仍照常显示健康告警，
+      且**不自动禁用**另一张网卡（方案 §11）。
     """
 
     MONITOR = "MONITOR"
@@ -386,9 +394,13 @@ class NetworkFailoverManager:
                  scheduler: Optional[NetworkOpScheduler] = None,
                  timer_table: Optional[TimerTable] = None,
                  executor: Optional[Any] = None,
+                 lock_target: Optional[str] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.policy = policy or FailoverPolicy()
         self.mode = mode
+        #: 手动锁定目标（P6）：仅 ``FailoverMode.LOCKED`` 下生效；非 ``None`` 时
+        #: 优先路径固定为该目标，**绝不**执行任何路由变更，也不自动禁用另一网卡。
+        self.lock_target = lock_target if lock_target in LOCK_TARGETS else None
         self.timers = timer_table if timer_table is not None else TimerTable()
         self.scheduler = (scheduler if scheduler is not None
                           else NetworkOpScheduler(mode, executor))
@@ -433,6 +445,18 @@ class NetworkFailoverManager:
         self.manual_reason = ""
         self._enter(FailoverState.ETHERNET_PRIMARY, now, [])
 
+    def set_lock_target(self, target: Optional[str]) -> None:
+        """设置/清除手动锁定的优先路径（``ethernet`` / ``wifi`` / ``None``）。
+
+        仅在 :attr:`FailoverMode.LOCKED` 下生效：非 ``None`` 时优先路径固定为该
+        目标，仍照常显示健康告警，但**不执行任何路由变更**，也**不自动禁用**
+        另一张网卡（方案 §11）。非法取值一律视为"未锁定"。
+        """
+        self.lock_target = target if target in LOCK_TARGETS else None
+        self._note("手动锁定目标：%s"
+                   % (PATH_LABEL.get(self.lock_target, "未锁定") if self.lock_target
+                      else "未锁定"))
+
     def next_detection_at(self) -> float:
         """下一次网络检测时刻（**恒**与认证/切换冷却无关）。"""
         return self.timers.next_detection_at
@@ -464,10 +488,14 @@ class NetworkFailoverManager:
 
         self.last_tick_at = now
         self.history.append((now, self.state))
+        preferred = self.state.preferred
+        if self.mode is FailoverMode.LOCKED and self.lock_target:
+            # 手动锁定：优先路径固定为锁定目标（方案 §11），零执行。
+            preferred = self.lock_target
         result = TickResult(
             mode=self.mode, at=now, state=self.state, previous_state=previous,
             changed=self.state is not previous, predicted_state=predicted,
-            preferred=self.state.preferred,
+            preferred=preferred,
             would_switch=any(p.kind is OpKind.METRIC_WRITE for p in plan),
             plan=list(plan), executed=list(self._executed), notes=notes,
             counters=self._counters(now))
@@ -490,6 +518,8 @@ class NetworkFailoverManager:
             "auth_ready_in": max(0.0, self.timers.auth_ready_at - now),
             "switch_ready_in": max(0.0, self.timers.switch_ready_at - now),
             "state_elapsed": max(0.0, now - self.state_since),
+            "lock_target": self.lock_target,
+            "locked": bool(self.mode is FailoverMode.LOCKED and self.lock_target),
         }
 
     def _enter(self, state: FailoverState, now: float,
@@ -558,6 +588,27 @@ class NetworkFailoverManager:
         if state is FailoverState.MANUAL_REQUIRED:
             notes.append("需人工处理（%s）：自动调度保持停止"
                          % (self.manual_reason or "未说明"))
+            return state
+
+        # ---- 手动锁定（P6）：优先路径固定，仍显示健康告警，零执行 ---- #
+        if self.mode is FailoverMode.LOCKED and self.lock_target:
+            label = PATH_LABEL.get(self.lock_target, self.lock_target)
+            notes.append("手动锁定：优先路径固定为 %s；不执行任何路由变更，"
+                         "也不自动禁用另一张网卡（方案 §11）" % label)
+            locked_state = (eth_state if self.lock_target == "ethernet"
+                            else wifi_state)
+            if locked_state is None:
+                notes.append("锁定路径 %s 角色未解析：无法评估健康" % label)
+            elif locked_state is HealthState.HEALTHY:
+                notes.append("锁定路径 %s 健康" % label)
+            else:
+                notes.append("健康告警：锁定路径 %s 异常（%s）"
+                             % (label, locked_state.value))
+            other = "wifi" if self.lock_target == "ethernet" else "ethernet"
+            other_state = wifi_state if self.lock_target == "ethernet" else eth_state
+            if other_state is not None and other_state is not HealthState.HEALTHY:
+                notes.append("提示：另一条路径 %s 异常（%s），但锁定模式不自动切换"
+                             % (PATH_LABEL.get(other, other), other_state.value))
             return state
 
         # ---- ETHERNET_PRIMARY：有线主用 ---- #

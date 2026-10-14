@@ -51,6 +51,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
+from typing import Optional
 
 import keyring
 import pystray
@@ -67,6 +68,9 @@ from campus_reconnect import (direct_session, edge_fallback,
                               resolve_port, setup_logging, wifi_reconnect,
                               wifi_state)
 from campus_windows import CredentialStore, ProxyController, default_refresh
+from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
+                                  parse_lock, parse_mode, tray_mode_label)
+from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
@@ -95,6 +99,11 @@ DEFAULT_CONFIG = {
     "clash_auto_proxy": None,   # None=尚未询问; True=同意联动; False=拒绝
     "proxy_endpoint": None,     # 用户显式确认的代理端点
     "paused": False,
+    # ---- V0.3 P6：托盘三模式与手动锁定（方案 §11 / §9）----
+    "failover_mode": "MONITOR",     # MONITOR(仅监测,默认) / AUTO(智能自动) / LOCKED(手动锁定)
+    "failover_lock": None,          # LOCKED 下的锁定目标: "ethernet" / "wifi" / None
+    "clash_keep": True,             # 网络切换期间保持 Clash 原样（默认开启）
+    "auto_switch_authorized": False,  # 智能自动接入真实执行器的显式授权（默认关闭）
 }
 CONFIG_KEYS = tuple(DEFAULT_CONFIG)
 
@@ -103,6 +112,13 @@ MODE_COLOR = {"online": (63, 185, 80), "reconnecting": (210, 153, 34),
               "boot": (88, 166, 255), "error": (188, 140, 255)}
 MODE_TEXT = {"online": "在线", "reconnecting": "重连中", "offline": "已断开",
              "paused": "已暂停", "boot": "启动中", "error": "异常"}
+
+#: V0.3 P6 三模式说明（方案 §11；菜单与通知用）。
+_MODE_HINT = {
+    FailoverMode.MONITOR: "仅观察双网络状态，不修改系统路由",
+    FailoverMode.AUTO: "有线优先，故障自动切 Wi-Fi，稳定后切回（需显式授权）",
+    FailoverMode.LOCKED: "锁定优先路径，仍显示健康告警，不自动禁用另一网卡",
+}
 
 #: 代理授权三态在设置面板中的显示标签。
 CONSENT_CHOICES = (("每次询问", None), ("自动开启", True), ("不开启", False))
@@ -167,13 +183,39 @@ def _read_config_text():
 
 def _read_paused_flag(text: str) -> bool:
     """从原始配置文本里读取 ``paused``（非 bool 一律按 ``False``）。"""
+    raw = _raw_config(text)
+    if isinstance(raw.get("paused"), bool):
+        return raw["paused"]
+    return False
+
+
+def _raw_config(text: str) -> dict:
+    """把原始配置文本解析为 dict（非法/非对象一律返回空 dict）。"""
     try:
         raw = json.loads(text)
     except (ValueError, TypeError):
-        return False
-    if isinstance(raw, dict) and isinstance(raw.get("paused"), bool):
-        return raw["paused"]
-    return False
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _read_failover_keys(text: str) -> dict:
+    """读取 P6 三模式/锁定/Clash 键（非法值回退安全默认）。
+
+    与 ``paused`` 一样，这些键由托盘自行读写（不进入 ``campus_core.Config``），
+    因此从原始 JSON 文本读取并逐项校验：模式非法回退 MONITOR、锁定目标非法
+    回退 ``None``、开关非 bool 回退默认；``AUTO`` 授权默认关闭（fail-closed）。
+    """
+    raw = _raw_config(text)
+    mode = parse_mode(raw.get("failover_mode")).value
+    lock = parse_lock(raw.get("failover_lock"))
+    clash_keep = raw.get("clash_keep")
+    if not isinstance(clash_keep, bool):
+        clash_keep = DEFAULT_CONFIG["clash_keep"]
+    authorized = raw.get("auto_switch_authorized")
+    if not isinstance(authorized, bool):
+        authorized = False
+    return {"failover_mode": mode, "failover_lock": lock,
+            "clash_keep": clash_keep, "auto_switch_authorized": authorized}
 
 
 def config_to_dict(config) -> dict:
@@ -205,6 +247,7 @@ def load_config() -> dict:
     result = load_config_text(text)
     cfg = config_to_dict(result.config)
     cfg["paused"] = _read_paused_flag(text)
+    cfg.update(_read_failover_keys(text))
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
@@ -423,6 +466,100 @@ class TrayApp:
         self._ui_pump_id = None
         self._startup_timer = None
 
+        # ---- V0.3 P6 故障切换桥接（默认仅监测；AUTO 需显式授权才接入执行器）----
+        #: 只读快照提供者（注入点；缺省用轻量快照，零 I/O）。
+        self._failover_snapshot_provider = None
+        #: 最近一次故障切换展示状态（由 :meth:`_failover_tick` 更新）。
+        self.failover_status = None
+        self.failover = self._build_failover_bridge()
+
+    # ---------- 故障切换桥接（V0.3 P6）----------
+    def _build_failover_bridge(self) -> TrayFailoverBridge:
+        """按当前配置构造故障切换桥接（默认**仅监测**）。
+
+        执行器工厂指向 :meth:`_build_auto_executor`，但仅在 ``AUTO`` 与
+        ``auto_switch_authorized`` **同时**成立时才会被调用（见
+        :meth:`campus_tray_failover.TrayFailoverBridge._sync_executor`）；
+        默认（仅监测/手动锁定/未授权）**不接入**任何真实执行器。
+        """
+        cfg = self.get_config()
+        policy = FailoverPolicy(
+            detection_interval=float(self._interval()),
+            failure_threshold=int(self._threshold()),
+            auth_cooldown=float(self._cooldown()))
+        return TrayFailoverBridge(
+            mode=cfg.get("failover_mode", "MONITOR"),
+            lock_target=cfg.get("failover_lock"),
+            clash_keep=bool(cfg.get("clash_keep", True)),
+            authorized=bool(cfg.get("auto_switch_authorized", False)),
+            executor_factory=self._build_auto_executor,
+            policy=policy, timer_table=self._timers,
+            log=lambda message: self.log.info("[failover] %s", message))
+
+    def _build_auto_executor(self):
+        """构造 P5 真实组合执行器（**仅**在 AUTO + 显式授权时被调用）。
+
+        复用 CLI 侧同一套构件（P4 SNNU + P5 路由），保证托盘与 CLI 行为一致；
+        构造过程含一次只读观察（解析网卡角色与无线源地址），属只读、无副作用。
+        真实路由/Metric 变更仍由 P5 ``RouteGuard`` 的事务与单一副作用门把关。
+        """
+        import campus_reconnect as engine
+        from types import SimpleNamespace
+        from tools import netdiag
+        from campus_network import NetworkObserver, resolve_roles
+
+        cfg = self.get_config()
+        if self.session is None:
+            self.session = direct_session()
+        runner = netdiag.PowerShellRunner()
+        observer = NetworkObserver(runner)
+        ssid = cfg.get("ssid") or "SNNU"
+        report = observer.observe(target_ssid=ssid)
+        roles = resolve_roles(report, engine._load_adapters_config())
+        eth, wifi = roles.get("ethernet"), roles.get("wifi")
+        args = SimpleNamespace(
+            ssid=ssid, port=cfg.get("port"), yys=cfg.get("yys", "mobile"),
+            account_format=cfg.get("account_format", "plain"),
+            interval=int(self._interval()), threshold=int(self._threshold()),
+            auth_cooldown=int(self._cooldown()), switch_min_interval=300, yes=True)
+        guard = engine._build_route_guard(observer, runner, eth, wifi, args,
+                                          self.log, timers=self._timers)
+        self.log.warning("智能自动已授权：接入真实组合执行器（受控路由/Metric 变更）")
+        return engine._build_composite_executor(self.session, observer, report,
+                                                wifi, args, self.log, guard)
+
+    def _failover_owns_actions(self) -> bool:
+        """当前是否由故障切换管理器**独占**副作用（AUTO 模式）。
+
+        AUTO 下所有副作用（含 Portal 认证）交由 P3 单一副作用门调度，托盘
+        V0.2 的自动重连路径**让位**，避免出现两个副作用源（AGENTS §3.3）。
+        """
+        bridge = getattr(self, "failover", None)
+        return bool(bridge is not None
+                    and bridge.mode is FailoverMode.AUTO)
+
+    def _build_failover_snapshot(self, online: bool):
+        """构造喂给状态机的只读快照（缺省轻量，零 I/O）。"""
+        provider = self._failover_snapshot_provider
+        if provider is not None:
+            try:
+                return provider()
+            except Exception as exc:
+                self.log.warning("故障切换快照提供者异常：%s", type(exc).__name__)
+        return light_snapshot(system_online=bool(online),
+                              system_source="托盘轻量探测")
+
+    def _failover_tick(self, now: float, online: bool) -> None:
+        """推进一轮故障切换状态机并刷新展示（不额外产生副作用）。"""
+        bridge = getattr(self, "failover", None)
+        if bridge is None:
+            return
+        result = bridge.tick(now, self._build_failover_snapshot(online))
+        self.failover_status = bridge.status()
+        if result.executed:
+            self.log.info("故障切换已执行动作：%s",
+                          ", ".join(o.kind.value for o in result.executed))
+
     # ---------- 图标与通知 ----------
     def make_image(self):
         color = MODE_COLOR.get(self.state["mode"], (139, 148, 158))
@@ -433,7 +570,9 @@ class TrayApp:
         return img
 
     def tooltip(self):
-        return "%s · %s" % (APP_NAME, MODE_TEXT.get(self.state["mode"], "?"))
+        return "%s · %s · 模式 %s" % (APP_NAME,
+                                     MODE_TEXT.get(self.state["mode"], "?"),
+                                     tray_mode_label(self._current_mode()))
 
     def set_state(self, mode, detail="", notify=None):
         prev = self.state["mode"]
@@ -813,6 +952,8 @@ class TrayApp:
         except Exception as exc:
             self.log.warning("探测异常: %s", type(exc).__name__)
             online = False
+        # V0.3 P6：把本轮只读观测喂给故障切换状态机（默认仅监测，零动作）。
+        self._failover_tick(now, online)
         if online:
             if self.state["mode"] != "online":
                 self.set_state("online", "网络正常")
@@ -830,6 +971,10 @@ class TrayApp:
             self.set_state("reconnecting", "正在尝试重新连接",
                            notify=("校园网已断开", "正在尝试重新连接，请稍候…"))
             self._edge_opened_this_cycle = False   # 新的故障周期
+        if self._failover_owns_actions():
+            # AUTO：副作用统一由故障切换单一副作用门调度，V0.2 自动重连让位
+            # （AGENTS §3.3：一轮检测不得同时触发两类以上动作）。
+            return self._next_probe_time(now)
         # 三表分离（P2）：认证冷却**只**门控新的认证，不门控探测 ——
         # 探测节奏仍由 _next_probe_time 保持为 interval；冷却期内继续探测，
         # 一旦公网恢复可在下一个 interval 内被发现，而不是等到冷却结束。
@@ -875,7 +1020,8 @@ class TrayApp:
         status = self.worker_status()
         if not status["alive"]:
             extra += " · %s" % status["label"]
-        return "状态：%s%s" % (MODE_TEXT.get(self.state["mode"], "?"), extra)
+        return "状态：%s · 模式：%s%s" % (MODE_TEXT.get(self.state["mode"], "?"),
+                                       tray_mode_label(self._current_mode()), extra)
 
     def _pause_text(self, item=None):
         return "恢复监测" if self.config.get("paused") else "暂停监测"
@@ -913,14 +1059,110 @@ class TrayApp:
         self.update_config({"paused": paused})
         if not save_config(self.config):
             self.notify("保存失败", "暂停状态未能写入配置（已保留原文件）")
+        bridge = getattr(self, "failover", None)
         if paused:
             self.set_state("paused", "监测已暂停")
+            if bridge is not None:
+                bridge.pause(time.monotonic())      # 状态机粘性 PAUSED：零动作
         else:
             self.set_state("boot", "监测恢复，正在检查网络")
+            if bridge is not None:
+                bridge.resume(time.monotonic())
         self.notify("监测已暂停" if paused else "监测已恢复",
                     "可在菜单或设置面板随时切换")
         if self.icon is not None:
             self.icon.update_menu()
+
+    # ---------- 三模式与手动锁定（V0.3 P6，方案 §11 / §9）----------
+    def _current_mode(self) -> FailoverMode:
+        bridge = getattr(self, "failover", None)
+        if bridge is not None:
+            return bridge.mode
+        return parse_mode(self.config.get("failover_mode"))
+
+    def _current_lock(self) -> Optional[str]:
+        bridge = getattr(self, "failover", None)
+        if bridge is not None:
+            return bridge.lock_target
+        return parse_lock(self.config.get("failover_lock"))
+
+    def _apply_failover_config(self, changes: dict) -> None:
+        """保存并应用故障切换相关配置，同步桥接与托盘菜单。"""
+        self.update_config(changes)
+        if not save_config(self.config):
+            self.notify("保存失败", "故障切换设置未能写入配置（已保留原文件）")
+        self._sync_failover_from_config()
+        if self.icon is not None:
+            self.icon.update_menu()
+
+    def _sync_failover_from_config(self) -> None:
+        """把当前配置同步到桥接（模式/锁定/Clash/授权）。"""
+        cfg = self.get_config()
+        bridge = getattr(self, "failover", None)
+        if bridge is None:
+            self.failover = self._build_failover_bridge()
+            return
+        bridge.set_mode(cfg.get("failover_mode", "MONITOR"))
+        bridge.set_lock_target(cfg.get("failover_lock"))
+        bridge.set_clash_keep(bool(cfg.get("clash_keep", True)))
+        bridge.set_authorized(bool(cfg.get("auto_switch_authorized", False)))
+
+    def apply_mode(self, mode) -> FailoverMode:
+        """设置运行模式（纯逻辑；菜单、设置面板与测试共用）。"""
+        resolved = parse_mode(mode)
+        self._apply_failover_config({"failover_mode": resolved.value})
+        self.notify("运行模式：%s" % tray_mode_label(resolved),
+                    _MODE_HINT.get(resolved, ""))
+        return resolved
+
+    def on_set_mode(self, mode):
+        """菜单选择模式：切到「智能自动」且未授权时，先征求**显式授权**。"""
+        resolved = parse_mode(mode)
+        if resolved is FailoverMode.AUTO \
+                and not self.config.get("auto_switch_authorized"):
+            answer = self._ui_ask(
+                "智能自动授权",
+                "「智能自动」允许程序在有线故障时自动切换网络出口"
+                "（真实修改路由 / Metric，受控、前台上人）。\n\n"
+                "是否授权启用？\n（默认「仅监测」不改动任何路由，可随时切回）")
+            if answer is not True:
+                self.notify("未授权", "仍保持当前模式（未启用智能自动）")
+                if self.icon is not None:
+                    self.icon.update_menu()
+                return
+            self.update_config({"auto_switch_authorized": True})
+            if not save_config(self.config):
+                self.notify("保存失败", "授权未能写入配置（已保留原文件）")
+        self.apply_mode(resolved)
+
+    def apply_lock(self, target) -> Optional[str]:
+        """设置手动锁定的优先路径（``ethernet`` / ``wifi`` / ``None``）。"""
+        resolved = parse_lock(target)
+        self._apply_failover_config({"failover_lock": resolved})
+        self.notify("锁定目标：%s"
+                    % (PATH_LABEL.get(resolved, resolved) if resolved else "未锁定"),
+                    "手动锁定不自动禁用另一张网卡")
+        return resolved
+
+    def apply_clash_keep(self, flag: bool) -> bool:
+        """设置「网络切换期间保持 Clash 原样」（方案 §9，默认开启）。"""
+        value = bool(flag)
+        self._apply_failover_config({"clash_keep": value})
+        self.notify("网络切换期间%s Clash"
+                    % ("保持原样" if value else "允许联动"), "")
+        return value
+
+    def on_toggle_clash_keep(self, icon=None, item=None):
+        self.apply_clash_keep(not bool(self.config.get("clash_keep", True)))
+
+    def _failover_text(self, item=None):
+        """菜单中的故障切换状态摘要（只读）。"""
+        status = getattr(self, "failover_status", None)
+        if status is None:
+            return "故障切换：%s（等待首次观测）" % tray_mode_label(self._current_mode())
+        primary = PATH_LABEL.get(status.primary, "无可用路径") if status.primary else "无可用路径"
+        return "故障切换：%s · 主 %s · 有线 %s · Wi-Fi %s" % (
+            status.mode_label, primary, status.ethernet_status, status.wifi_status)
 
     def on_toggle_proxy(self, icon=None, item=None):
         new_value = self.config.get("clash_auto_proxy") is not True
@@ -1020,9 +1262,49 @@ class TrayApp:
         if thread.is_alive():
             self.log.warning("网络工作线程在 %.1f 秒内未退出（可能在等待网络超时）", timeout)
 
+    def _mode_action(self, mode):
+        """返回符合 pystray 签名 ``(icon, item)`` 的模式切换动作。"""
+        def action(icon, item):
+            self.on_set_mode(mode)
+        return action
+
+    def _mode_checked(self, mode):
+        """返回符合 pystray 签名 ``(item)`` 的模式单选勾选判定。"""
+        def checked(item):
+            return self._current_mode() is mode
+        return checked
+
     def build_menu(self):
+        mode_menu = pystray.Menu(*[
+            pystray.MenuItem(
+                tray_mode_label(mode),
+                self._mode_action(mode),
+                checked=self._mode_checked(mode),
+                radio=True)
+            for mode in MODE_ORDER])
+        lock_menu = pystray.Menu(
+            pystray.MenuItem(
+                "以太网优先", lambda icon, item: self.apply_lock("ethernet"),
+                checked=lambda item: self._current_lock() == "ethernet",
+                radio=True),
+            pystray.MenuItem(
+                "Wi-Fi 优先", lambda icon, item: self.apply_lock("wifi"),
+                checked=lambda item: self._current_lock() == "wifi",
+                radio=True),
+            pystray.MenuItem(
+                "不锁定", lambda icon, item: self.apply_lock(None),
+                checked=lambda item: self._current_lock() is None,
+                radio=True),
+        )
         return pystray.Menu(
             pystray.MenuItem(self._status_text, None, enabled=False),
+            pystray.MenuItem(self._failover_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("运行模式", mode_menu),
+            pystray.MenuItem("手动锁定目标", lock_menu),
+            pystray.MenuItem("网络切换期间保持 Clash 原样", self.on_toggle_clash_keep,
+                             checked=lambda item: bool(self.config.get("clash_keep", True))),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("立即重连", self.on_reconnect),
             pystray.MenuItem(self._pause_text, self.on_toggle_pause),
             pystray.Menu.SEPARATOR,
@@ -1099,6 +1381,11 @@ class TrayApp:
             consent_value = None
         v_consent = tk.StringVar(value=CONSENT_VALUE_TO_LABEL[consent_value])
         v_endpoint = tk.StringVar(value=self.config.get("proxy_endpoint") or "")
+        # V0.3 P6：三模式 / 手动锁定 / Clash 保持原样（方案 §11 / §9）。
+        v_fmode = tk.StringVar(value=tray_mode_label(self._current_mode()))
+        lock_label = PATH_LABEL.get(self._current_lock(), "不锁定")
+        v_flock = tk.StringVar(value=lock_label)
+        v_clash_keep = tk.BooleanVar(value=bool(self.config.get("clash_keep", True)))
 
         ttk.Checkbutton(frame, text="开机自启（登录 Windows 后自动启动）",
                         variable=v_auto).grid(row=4, column=0, columnspan=3, sticky="w")
@@ -1148,7 +1435,35 @@ class TrayApp:
             "consent": CONSENT_VALUE_TO_LABEL[consent_value],
             "endpoint": self.config.get("proxy_endpoint") or "",
             "autostart": bool(get_autostart()),
+            "failover_mode": tray_mode_label(self._current_mode()),
+            "failover_lock": lock_label,
+            "clash_keep": bool(self.config.get("clash_keep", True)),
         }
+
+        # V0.3 P6：三模式 / 手动锁定 / Clash 保持原样 + 故障切换状态（只读展示）。
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=13, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        ttk.Label(frame, text="双网络故障切换（V0.3）",
+                  font=("Microsoft YaHei", 10, "bold")).grid(
+            row=14, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="运行模式").grid(row=15, column=0, sticky="e", **pad)
+        ttk.Combobox(frame, textvariable=v_fmode, width=15, state="readonly",
+                     values=[tray_mode_label(m) for m in MODE_ORDER]).grid(
+            row=15, column=1, sticky="w", **pad)
+        ttk.Label(frame, text="锁定目标").grid(row=16, column=0, sticky="e", **pad)
+        ttk.Combobox(frame, textvariable=v_flock, width=15, state="readonly",
+                     values=["不锁定", PATH_LABEL["ethernet"],
+                             PATH_LABEL["wifi"]]).grid(
+            row=16, column=1, sticky="w", **pad)
+        ttk.Checkbutton(frame, text="网络切换期间保持 Clash 原样（默认）",
+                        variable=v_clash_keep).grid(
+            row=17, column=0, columnspan=3, sticky="w")
+        failover_status = getattr(self, "failover_status", None)
+        failover_text = ("\n".join(failover_status.lines()) if failover_status
+                         is not None else "故障切换：等待首次观测（模式 %s）"
+                         % tray_mode_label(self._current_mode()))
+        ttk.Label(frame, text=failover_text, justify="left").grid(
+            row=18, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         def on_save():
             try:
@@ -1178,6 +1493,31 @@ class TrayApp:
             endpoint = v_endpoint.get().strip()
             if endpoint != initial["endpoint"]:
                 changes["proxy_endpoint"] = endpoint or None
+            # V0.3 P6：三模式 / 锁定 / Clash（切到智能自动需显式授权）。
+            fmode_label = v_fmode.get()
+            if fmode_label != initial["failover_mode"]:
+                mode = next((m for m in MODE_ORDER if tray_mode_label(m) == fmode_label),
+                            FailoverMode.MONITOR)
+                if mode is FailoverMode.AUTO \
+                        and not self.config.get("auto_switch_authorized"):
+                    if not messagebox.askyesno(
+                            "智能自动授权",
+                            "「智能自动」将允许自动切换网络出口"
+                            "（真实修改路由 / Metric）。\n是否授权启用？"):
+                        messagebox.showinfo("未授权", "已保持「仅监测」，未启用智能自动。")
+                        return
+                    changes["auto_switch_authorized"] = True
+                changes["failover_mode"] = mode.value
+            flock_label = v_flock.get()
+            if flock_label != initial["failover_lock"]:
+                if flock_label == "不锁定":
+                    changes["failover_lock"] = None
+                elif flock_label == PATH_LABEL["ethernet"]:
+                    changes["failover_lock"] = "ethernet"
+                else:
+                    changes["failover_lock"] = "wifi"
+            if bool(v_clash_keep.get()) != initial["clash_keep"]:
+                changes["clash_keep"] = bool(v_clash_keep.get())
 
             if changes:
                 new_cfg = self.get_config()
@@ -1187,6 +1527,7 @@ class TrayApp:
                                          "配置写入失败，已保留原文件。请检查目录权限后重试。")
                     return
                 self.update_config(changes)
+                self._sync_failover_from_config()
                 if "clash_auto_proxy" in changes:
                     with self._config_lock:
                         self._consent_version += 1
@@ -1212,11 +1553,11 @@ class TrayApp:
             win.destroy()
             self._open_settings()
 
-        ttk.Button(frame, text="保存", command=on_save).grid(row=13, column=0, pady=(12, 0))
+        ttk.Button(frame, text="保存", command=on_save).grid(row=19, column=0, pady=(12, 0))
         ttk.Button(frame, text="立即重连", command=on_reconnect_click).grid(
-            row=13, column=1, sticky="w", padx=4)
+            row=19, column=1, sticky="w", padx=4)
         ttk.Button(frame, text="暂停/恢复", command=on_pause_click).grid(
-            row=13, column=2, sticky="w")
+            row=19, column=2, sticky="w")
         win.protocol("WM_DELETE_WINDOW", win.destroy)
 
     @staticmethod
