@@ -184,10 +184,16 @@ class FakeSession:
     def __init__(self) -> None:
         self.calls: List[Dict[str, Any]] = []
         self.routes: Dict[Any, Any] = {}
+        #: ``mount(prefix, adapter)`` 调用记录（V0.3 P4：断言"会话已绑定接口"）。
+        self.mounts: List[Tuple[str, Any]] = []
 
     def route(self, url: str, response: Any, method: Optional[str] = None) -> "FakeSession":
         self.routes[(method, url)] = response
         return self
+
+    def mount(self, prefix: str, adapter: Any) -> None:
+        """记录接口绑定（不产生真实连接）。"""
+        self.mounts.append((prefix, adapter))
 
     def get(self, url: str, **kwargs: Any) -> FakeResponse:
         return self._handle("GET", url, kwargs)
@@ -456,3 +462,63 @@ class FakeOpExecutor:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+# --------------------------------------------------------------------------- #
+# SNNU 无线链路假件（V0.3 P4 campus_snnu 用）
+# --------------------------------------------------------------------------- #
+class FakeSnnuLink:
+    """假 SNNU 关联/IP 观察（V0.3 P4），零真实 ``netsh`` / ``ipconfig``。
+
+    以 ``readings`` 序列（``(ssid, 状态文本, has_ipv4)``）驱动：每次
+    :meth:`wifi_state` **消费**一条（并推进指针，尾部自动保持最后一条），
+    :meth:`ip_ready` 返回同一条 reading 的 ``has_ipv4``（与 ``wifi_state`` 配对）。
+    因此"观察一次 = 消费一条 reading"，可精确编排"重连前/后""等待 IP 前后"。
+
+    - :meth:`wifi_reconnect`：记录调用并按 ``reconnect_result`` 返回（可为 list
+      按序弹出）；
+    - :meth:`sleep`：只记录时长（零真实 sleep），供 ``SnnuBackupLink`` 的有界等待；
+    - ``wifi_calls`` / ``reconnect_calls`` / ``sleeps`` 供断言。
+    """
+
+    def __init__(self, readings: Optional[List[Tuple[Any, str, bool]]] = None,
+                 reconnect_result: Any = True) -> None:
+        self.readings: List[Tuple[Any, str, bool]] = list(
+            readings or [("SNNU", "connected", True)])
+        self.reconnect_result = reconnect_result
+        self.wifi_calls: List[Any] = []
+        self.reconnect_calls: List[str] = []
+        self.sleeps: List[float] = []
+        self._index = 0
+        self._last: Optional[Tuple[Any, str, bool]] = None
+
+    def _current(self) -> Tuple[Any, str, bool]:
+        if not self.readings:
+            return (None, "unknown", False)
+        return self.readings[min(self._index, len(self.readings) - 1)]
+
+    def wifi_state(self, interface: Any = None) -> Tuple[Any, str]:
+        reading = self._current()
+        self._index += 1
+        self._last = reading
+        self.wifi_calls.append(reading)
+        return reading[0], reading[1]
+
+    def ip_ready(self) -> bool:
+        reading = self._last if self._last is not None else self._current()
+        return bool(reading[2])
+
+    def wifi_reconnect(self, ssid: str, *args: Any, **kwargs: Any) -> bool:
+        self.reconnect_calls.append(ssid)
+        value = self.reconnect_result
+        if isinstance(value, list):
+            value = value.pop(0) if value else False
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(float(seconds))
+
+    def advance(self, steps: int = 1) -> None:
+        self._index += int(steps)
