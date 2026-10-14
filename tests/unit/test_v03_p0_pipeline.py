@@ -45,8 +45,10 @@ FULL_STUB = {
     "run_entries": RUN_ENTRIES_RAW,
 }
 
-#: 命令表覆盖的全部诊断项（含按 pids 动态追加的 remote_tcp）。
-EXPECTED_COMMANDS = set(netdiag.COMMANDS)
+#: collect() 在该全桩场景下执行的命令：全部批量命令 + remote_tcp/remote_udp
+#: （FULL_STUB 的远控进程带 PID，触发按需端口查询）；route_lookup 只由
+#: NetworkObserver 按目标调用，不进 collect 批次。
+EXPECTED_COMMANDS = set(netdiag.COMMANDS) - {"route_lookup"}
 
 
 def test_i0_01_full_pipeline_has_zero_write_side_effects(monkeypatch):

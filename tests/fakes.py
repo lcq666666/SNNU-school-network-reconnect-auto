@@ -18,6 +18,7 @@ import types
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from types import SimpleNamespace
 
 
 # --------------------------------------------------------------------------- #
@@ -334,3 +335,78 @@ class FakeCommandRunner:
         if isinstance(value, int):
             return value, "", ""
         return 0, str(value), ""
+
+
+# --------------------------------------------------------------------------- #
+# 网络探测引擎假件（V0.3 P1 campus_network 用）
+# --------------------------------------------------------------------------- #
+class FakeProbeEngine:
+    """可编排的假探测引擎：TCP / HTTP / DNS / 路由查询，零真实网络。
+
+    键语义（``*_`` 属性为可脚本化响应表，均支持 ``"default"`` 通配，
+    http/tcp 另支持 ``(key, source_address)`` 元组键——用于"同一 URL 经
+    不同源地址得到不同响应"的场景，如 Portal 只劫持 Wi-Fi 路径）：
+
+    - ``tcp[(host, port)]``：``bool``（True=主机可达，含"连接被拒绝"）；
+      或 ``Exception``（调用时抛出）；
+    - ``http[url]``：``dict``（``status_code``/``redirected``/``final_url``/
+      ``body``/``error``）或 :class:`types.SimpleNamespace`；
+    - ``dns[name]``：``bool`` 或 ``Exception``；
+    - ``routes[target]``：带 ``if_index`` 属性的对象、dict，或 ``None``
+      （无法确认出口）。
+
+    全部调用记录在 ``calls``（``tcp``/``http``/``dns``/``route``），供断言
+    "确实按源地址绑定探测"与"探测次数/顺序"。
+    """
+
+    def __init__(self) -> None:
+        self.tcp: Dict[Any, Any] = {}
+        self.http: Dict[Any, Any] = {}
+        self.dns: Dict[Any, Any] = {}
+        self.routes: Dict[Any, Any] = {}
+        self.calls: Dict[str, List[Any]] = {"tcp": [], "http": [], "dns": [],
+                                            "route": []}
+
+    def _resolve(self, table: Dict[Any, Any], key: Any,
+                 source: Any = None) -> Any:
+        if source is not None and (key, source) in table:
+            return table[(key, source)]
+        if key in table:
+            return table[key]
+        return table.get("default")
+
+    def tcp_connect(self, host: str, port: int, timeout: Any = None,
+                    source_address: Any = None) -> bool:
+        self.calls["tcp"].append((host, port, source_address))
+        value = self._resolve(self.tcp, (host, port), source_address)
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
+
+    def http_probe(self, url: str, timeout: Any = None,
+                   source_address: Any = None) -> Any:
+        self.calls["http"].append((url, source_address))
+        value = self._resolve(self.http, url, source_address)
+        if isinstance(value, Exception):
+            raise value
+        if value is None:
+            value = {}
+        if isinstance(value, SimpleNamespace):
+            return value
+        if isinstance(value, dict):
+            return SimpleNamespace(**value)
+        return SimpleNamespace(body=str(value))
+
+    def dns_resolve(self, name: str) -> bool:
+        self.calls["dns"].append(name)
+        value = self._resolve(self.dns, name)
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
+
+    def route_lookup(self, target: str) -> Any:
+        self.calls["route"].append(target)
+        value = self._resolve(self.routes, target)
+        if isinstance(value, Exception):
+            raise value
+        return value

@@ -127,6 +127,11 @@ _COMMANDS: Dict[str, str] = {
         "SilentlyContinue | Select-Object IPAddress,InterfaceIndex,"
         "InterfaceAlias,NextHop,DestinationPrefix,InterfaceMetric | "
         "ConvertTo-Json -Depth 2 -Compress"),
+    "route_lookup": (
+        "Find-NetRoute -RemoteIPAddress {target} -ErrorAction "
+        "SilentlyContinue | Select-Object IPAddress,InterfaceIndex,"
+        "InterfaceAlias,NextHop,DestinationPrefix,InterfaceMetric | "
+        "ConvertTo-Json -Depth 2 -Compress"),
     "wifi_interfaces": "netsh wlan show interfaces",
     "connection_profiles": (
         "Get-NetConnectionProfile | Select-Object InterfaceAlias,"
@@ -166,6 +171,10 @@ _COMMANDS: Dict[str, str] = {
 }
 
 COMMANDS: Dict[str, str] = dict(_COMMANDS)  # 公开只读命令表（测试自检用）
+
+#: 按需执行的命令（不在 collect() 批量跑，由 P1 NetworkObserver 按目标调用）：
+#: remote_tcp/remote_udp 依赖进程 PID，route_lookup 依赖目标地址。
+ONDEMAND_COMMANDS = ("remote_tcp", "remote_udp", "route_lookup")
 
 #: PowerShell 前导（只读、静默进度条、强制 UTF-8 输出）。
 _POWERSHELL_PRELUDE = (

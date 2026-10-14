@@ -23,7 +23,8 @@ from pathlib import Path
 import pytest
 
 from tests.fakes import (FakeCommandRunner, FakeKeyring, FakeLauncher,
-                         FakeRegistry, FakeSession, VirtualClock)
+                         FakeProbeEngine, FakeRegistry, FakeSession,
+                         VirtualClock)
 
 # tests/conftest.py -> 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +70,12 @@ def virtual_clock() -> VirtualClock:
 def fake_runner() -> FakeCommandRunner:
     """假只读命令执行器（零真实子进程；V0.3 P0 netdiag 用）。"""
     return FakeCommandRunner()
+
+
+@pytest.fixture
+def fake_engine() -> FakeProbeEngine:
+    """假探测引擎（零真实网络；V0.3 P1 campus_network 用）。"""
+    return FakeProbeEngine()
 
 
 @pytest.fixture(autouse=True)
