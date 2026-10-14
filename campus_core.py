@@ -38,6 +38,7 @@ __all__ = [
     "ProbeResult", "PortalStatus", "RepairResult", "PortalResolution",
     "BrowserLaunchResult", "ProxyApplyResult", "CredentialLoad",
     "CredentialSave", "CredentialClear", "SingleInstanceResult", "Scheduler",
+    "TimerTable",
     "validate_config", "load_config_text", "load_config_file", "default_config",
     # ---- 阶段 3：共享重连服务、状态页解析、重定向与探测分类 ----
     "ONLINE_MARKER", "MAX_BODY_BYTES", "PROBE_EXACT", "PROBE_HTML_TITLE",
@@ -498,6 +499,68 @@ class Scheduler:
         """配置版本变化：记录版本并重置失败计数（不解除冷却）。"""
         self.config_version = version
         self.failure_streak = 0
+
+
+# --------------------------------------------------------------------------- #
+# 三表分离：网络检测 / 认证冷却 / 切换冷却（V0.3 P2）
+# --------------------------------------------------------------------------- #
+@dataclass
+class TimerTable:
+    """三表分离的计时器组（V0.3 P2；AGENTS §3.4、执行计划 §0.2 P2）。
+
+    缺陷背景（P0-T6 取证，基线 ``4900ca9``）：V0.2 把「Portal 认证冷却」
+    错误地叠加到「网络检测」上 —— ``campus_reconnect.watch()`` 的
+    ``wait = max(interval, next_attempt - now)`` 与托盘 ``_next_probe_time``
+    的 ``max(now + interval, _next_attempt_at)``，都让 180s 认证冷却顺带把
+    公网探测整体暂停；公网一旦在冷却期内恢复，发现被推迟最多一个冷却周期。
+
+    本类把三个**互不干涉**的计时器显式分开，任何一处冷却都不得推迟网络检测：
+
+    - :attr:`next_detection_at` —— **网络检测计时器**：持续运行，每个
+      ``interval`` 到点即探测；只由 :meth:`schedule_detection` 推进，
+      **不受**认证/切换冷却影响。
+    - :attr:`auth_ready_at` —— **Portal 认证冷却**：只限制**新的认证尝试**
+      （:meth:`auth_allowed`），不限制探测。
+    - :attr:`switch_ready_at` —— **网卡切换冷却**：只限制**路由变更**
+      （:meth:`switch_allowed`）。P2 无路由切换，该表由 P3 的路由控制器消费。
+
+    纯数据结构：不持有时钟、不做 I/O；所有方法显式接收 ``now``，便于用虚拟
+    时钟离线断言（零真实 sleep）。
+    """
+
+    next_detection_at: float = 0.0
+    auth_ready_at: float = 0.0
+    switch_ready_at: float = 0.0
+
+    # ---- 网络检测计时器：持续运行，与任何冷却无关 ----
+    def detection_due(self, now: float) -> bool:
+        """检测计时器是否到点（与认证/切换冷却无关）。"""
+        return now >= self.next_detection_at
+
+    def schedule_detection(self, now: float, interval: float) -> float:
+        """登记下一次检测时刻 = ``now + interval``（**恒**与冷却无关）。"""
+        self.next_detection_at = now + max(0.0, float(interval))
+        return self.next_detection_at
+
+    # ---- Portal 认证冷却：只限制认证 ----
+    def auth_allowed(self, now: float) -> bool:
+        """当前是否已过认证冷却，允许发起一次新的认证尝试。"""
+        return now >= self.auth_ready_at
+
+    def note_auth(self, now: float, cooldown: float) -> float:
+        """登记一次认证尝试后的冷却截止时刻（只影响认证）。"""
+        self.auth_ready_at = now + max(0.0, float(cooldown))
+        return self.auth_ready_at
+
+    # ---- 网卡切换冷却：只限制路由变更（P3 消费） ----
+    def switch_allowed(self, now: float) -> bool:
+        """当前是否已过切换冷却，允许执行一次路由变更。"""
+        return now >= self.switch_ready_at
+
+    def note_switch(self, now: float, cooldown: float) -> float:
+        """登记一次路由变更后的切换冷却截止时刻（只影响路由变更）。"""
+        self.switch_ready_at = now + max(0.0, float(cooldown))
+        return self.switch_ready_at
 
 
 # --------------------------------------------------------------------------- #
