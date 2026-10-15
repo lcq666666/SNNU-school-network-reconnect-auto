@@ -35,8 +35,12 @@ class _ScopedHTTPConnection(HTTPConnection):
 
     def _new_conn(self):
         from urllib3.exceptions import NewConnectionError
+        transport = self.transport
+        if transport is None:
+            raise NewConnectionError(
+                self, "interface-scoped connection without transport (fail-closed)")
         try:
-            return self.transport._connect_socket(self.host, self.port)
+            return transport._connect_socket(self.host, self.port)
         except OSError as exc:
             raise NewConnectionError(self, str(exc)) from exc
 
@@ -52,8 +56,12 @@ class _ScopedHTTPSConnection(HTTPSConnection):
 
     def _new_conn(self):
         from urllib3.exceptions import NewConnectionError
+        transport = self.transport
+        if transport is None:
+            raise NewConnectionError(
+                self, "interface-scoped connection without transport (fail-closed)")
         try:
-            return self.transport._connect_socket(self.host, self.port)
+            return transport._connect_socket(self.host, self.port)
         except OSError as exc:
             raise NewConnectionError(self, str(exc)) from exc
     def connect(self):
@@ -83,6 +91,11 @@ class _ScopedPoolManager(PoolManager):
     def __init__(self, transport, *args, **kwargs):
         self.transport = transport
         super().__init__(*args, **kwargs)
+        # F75-11：urllib3 的 ``PoolManager.__init__`` 把**模块级共享 dict**
+        # ``pool_classes_by_scheme`` 直接挂到实例上；就地修改它会污染同进程内
+        # 所有普通 ``HTTPAdapter``（它们随后建出的受限 pool 因缺 transport 而抛
+        # AttributeError）。这里改为给本实例一份独立副本。
+        self.pool_classes_by_scheme = dict(self.pool_classes_by_scheme)
         self.pool_classes_by_scheme["http"] = _ScopedPool
         self.pool_classes_by_scheme["https"] = _ScopedHTTPSPool
 

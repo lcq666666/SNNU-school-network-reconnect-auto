@@ -7,7 +7,11 @@ import pytest
 import requests
 from urllib3.exceptions import NewConnectionError
 
-from campus_transport import InterfaceTransport
+from urllib3 import poolmanager
+from urllib3.connectionpool import HTTPConnectionPool
+
+from campus_transport import (_ScopedHTTPConnection, _ScopedPool,
+                              InterfaceTransport)
 
 
 class Socket:
@@ -200,3 +204,42 @@ def test_http_probe_error_closes_session(monkeypatch):
         result = transport().http_probe("http://portal.example/")
         assert result.error == "ConnectionError"
         assert closed
+
+
+# --------------------------------------------------------------------------- #
+# F75-11：接口绑定不得污染进程全局的 pool_classes_by_scheme
+# --------------------------------------------------------------------------- #
+#: 真机复现：``urllib3`` 的 ``pool_classes_by_scheme`` 是**模块级共享 dict**
+#: （``PoolManager.__init__`` 直接把它挂到实例上），因此就地改它会波及同进程内
+#: **所有**普通 ``HTTPAdapter``：它们随后建出的受限 pool 因缺少 transport 而抛
+#: ``AttributeError: 'NoneType' object has no attribute '_connect_socket'``，
+#: 被上层 ``except Exception`` 吞成"系统轴探测抛错 / 离线"，并制造 k 次假掉线。
+def test_scoped_manager_does_not_pollute_global_pool_classes():
+    before = dict(poolmanager.pool_classes_by_scheme)
+    t = transport()
+    with requests.Session() as session:
+        assert t.bind_session(session)
+        adapter = session.get_adapter("http://portal.example")
+        # 该会话自己的管理器必须用受限 pool，且保留自身 transport
+        assert adapter.poolmanager.pool_classes_by_scheme["http"] is _ScopedPool
+        assert adapter.poolmanager.transport is t
+    # 全局映射必须原样保留
+    assert poolmanager.pool_classes_by_scheme == before
+    assert poolmanager.pool_classes_by_scheme["http"] is HTTPConnectionPool
+
+
+def test_plain_pool_manager_class_unaffected_after_binding():
+    t = transport()
+    with requests.Session() as scoped:
+        assert t.bind_session(scoped)
+    plain = poolmanager.PoolManager()
+    assert plain.pool_classes_by_scheme["http"] is HTTPConnectionPool
+    assert plain.pool_classes_by_scheme["https"] is poolmanager.HTTPSConnectionPool
+
+
+def test_scoped_connection_without_transport_fails_closed():
+    """没拿到 transport 的受限连接必须按 fail-closed 报连接错误，而非 AttributeError。"""
+    conn = _ScopedHTTPConnection("portal.example")
+    assert conn.transport is None
+    with pytest.raises(NewConnectionError):
+        conn._new_conn()
