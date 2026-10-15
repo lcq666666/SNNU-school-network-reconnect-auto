@@ -64,8 +64,8 @@ from campus_network import (NetworkObserver, WindowsProbeEngine, evaluate,
 from campus_route_guard import (CompositeExecutor, MetricExecutor, RouteGuard,
                                 RouteJournal, build_windows_route_ops,
                                 format_route_change, format_route_snapshot)
-from campus_snnu import (SnnuBackupExecutor, SnnuBackupLink, SnnuOps,
-                         format_backup_result)
+from campus_snnu import (InterfaceBinding, SnnuBackupExecutor, SnnuBackupLink,
+                         SnnuOps, format_backup_result)
 from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
                             parse_ipconfig_ipv4, parse_netsh_interfaces,
                             wifi_state_from_text)
@@ -774,6 +774,15 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         return repair_service(bound_session, options, time.monotonic,
                               _cli_adapters(), get_credentials, log=log)
 
+    def _refresh_binding():
+        report = observer.observe(target_ssid="SNNU")
+        adapter = next((item for item in report.adapters
+                        if getattr(item, "name", "") == interface), None)
+        if adapter is None:
+            raise RuntimeError("SNNU 接口不存在")
+        source = _wifi_source_ip(report, adapter.if_index)
+        return InterfaceBinding(interface=interface or "",
+                                if_index=adapter.if_index, source_ip=source)
     def _bind_interface(bound_session, binding):
         from campus_network import _interface_dns
         report = observer.observe(target_ssid="SNNU")
@@ -781,7 +790,6 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
             binding.if_index, binding.source_ip,
             _interface_dns(report, binding.if_index))
         return transport.bind_session(bound_session)
-
     return SnnuOps(
         wifi_state=lambda: wifi_state(interface),
         wifi_reconnect=lambda ssid: wifi_reconnect(ssid, log,
@@ -793,8 +801,8 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         read_status=lambda sess, port: read_status_page(sess, port, log),
         repair=_repair,
         bind_interface=_bind_interface,
+        refresh_binding=_refresh_binding,
     )
-
 
 def snnu(session: requests.Session, args: argparse.Namespace,
          log: logging.Logger) -> int:

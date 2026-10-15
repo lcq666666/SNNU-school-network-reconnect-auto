@@ -273,6 +273,7 @@ class SnnuOps:
     read_status: Callable[[Any, int], Any]
     repair: Optional[Callable[[Any, RepairOptions], RepairResult]] = None
     bind_interface: Optional[Callable[[Any, InterfaceBinding], bool]] = None
+    refresh_binding: Optional[Callable[[], InterfaceBinding]] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -405,7 +406,16 @@ class SnnuBackupLink:
         if error is not None:
             return self._fail(result, error[0], error[1])
 
-        # ---- 出口证明（硬前置；AGENTS §3.6 / 方案 §6.2）---- #
+        if self.ops.refresh_binding is not None:
+            try:
+                binding = self.ops.refresh_binding()
+                self.interface = binding.interface
+                self.if_index = binding.if_index
+                self.source_ip = binding.source_ip
+            except Exception as exc:
+                return self._fail(result, SnnuAuthError.AUTH_PATH_UNCONFIRMED,
+                                  "%s：无法刷新无线接口信息（%s）"
+                                  % (AUTH_PATH_UNCONFIRMED_TEXT, type(exc).__name__))
         binding = InterfaceBinding(interface=self.interface,
                                    if_index=self.if_index,
                                    source_ip=self.source_ip)

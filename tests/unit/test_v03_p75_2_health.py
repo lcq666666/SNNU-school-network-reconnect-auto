@@ -85,3 +85,24 @@ def test_plain_http_portal_probe_is_available_without_disabling_tls():
     from campus_network import DEFAULT_HTTP_TARGETS
     assert any(spec.url.startswith("http://") for spec in DEFAULT_HTTP_TARGETS)
     assert any(spec.url.startswith("https://") for spec in DEFAULT_HTTP_TARGETS)
+
+
+def test_p75_3_binding_refresh_replaces_dhcp_source_before_auth():
+    from campus_snnu import InterfaceBinding, SnnuBackupLink, SnnuOps
+    from tests.fakes import FakeInterfaceBinder, FakeSnnuLink
+    fake = FakeSnnuLink()
+    refreshed = InterfaceBinding("WLAN", 5, "10.8.0.9")
+    binder = FakeInterfaceBinder()
+    ops = SnnuOps(
+        wifi_state=fake.wifi_state, wifi_reconnect=fake.wifi_reconnect,
+        ip_ready=fake.ip_ready, route_lookup=lambda target: SimpleNamespace(if_index=5),
+        resolve_port=lambda session, requested: (8601, "test"),
+        portal_reachable=lambda session, port: True,
+        read_status=lambda session, port: None,
+        bind_interface=binder, refresh_binding=lambda: refreshed)
+    link = SnnuBackupLink(ops=ops, session=SimpleNamespace(),
+                          if_index=5, source_ip="10.8.0.5", reconnect_wifi=False)
+    result = link.run()
+    assert result.error is not None
+    assert binder.calls and binder.calls[0].source_ip == "10.8.0.9"
+    assert result.binding.source_ip == "10.8.0.9"
