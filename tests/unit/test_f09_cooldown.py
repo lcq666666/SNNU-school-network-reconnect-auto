@@ -169,3 +169,43 @@ def test_t20_tray_recovery_does_not_reset_cooldown(monkeypatch, virtual_clock):
     app._probe_tick(180.0)
     assert attempts == [0.0], "后台自动认证入口已移除：%r" % attempts
     assert probed[-1] == 180.0, probed
+
+
+# --------------------------------------------------------------------------- #
+# P8 / K-4：确认窗口内自愈 ⇒ 抑制重复告警与重复修复
+# --------------------------------------------------------------------------- #
+def test_watch_self_heal_in_confirmation_window_resets_failures(monkeypatch,
+                                                               virtual_clock):
+    """达阈值后修复预检确认「公网已连通」⇒ 判定为探测抖动：
+
+    - 清零失败计数（下一次抖动需重新累积阈值，不再逐轮重复修复）；
+    - 因此 12 次全失败探测、阈值 3、无冷却时，修复次数应为 4（每 3 连败一次），
+      而不是旧行为的 10（阈值之后每轮都修）。
+    """
+    clock = virtual_clock
+    clock.install(monkeypatch, engine)
+    monkeypatch.setattr(engine, "ensure_single_instance", lambda log: True)
+    probes: list = []
+    attempts: list = []
+
+    class _OnlineRepair:
+        needs_user = False
+        network_ok = True
+
+    def fake_internet_ok(session, probes_=None):
+        if len(probes) >= 12:
+            raise KeyboardInterrupt
+        probes.append(clock.monotonic())
+        return False, ""
+
+    def fake_attempt(session, args, log):
+        attempts.append(clock.monotonic())
+        return _OnlineRepair()
+
+    monkeypatch.setattr(engine, "internet_ok", fake_internet_ok)
+    monkeypatch.setattr(engine, "attempt_repair", fake_attempt)
+    engine.watch(object(), _args(threshold=3, interval=int(INTERVAL), cooldown=0), LOG)
+
+    assert len(probes) == 12, probes
+    assert len(attempts) == 4, (
+        "确认窗口内自愈后未清零失败计数，出现重复修复：%r" % attempts)

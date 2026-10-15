@@ -21,21 +21,32 @@ from campus_core import (PROBE_EXACT, PROBE_HTML_TITLE, PortalStatus,
                          classify_network, probe_matches)
 
 LOG = logging.getLogger("campus")
-MSFT = engine.DEFAULT_PROBES[0].url
-APPLE = engine.DEFAULT_PROBES[1].url
+#: 默认探测点的首/末项（探测点集合属于契约，用例不写死具体 URL）。
+FIRST_PROBE = engine.DEFAULT_PROBES[0].url
+LAST_PROBE = engine.DEFAULT_PROBES[-1].url
+
+
+def _matching_response(spec):
+    """按探测点的匹配模式造一个**严格匹配**的假响应（供抗抖动用例复用）。"""
+    from tests.fakes import FakeResponse
+    if spec.mode == PROBE_HTML_TITLE:
+        return FakeResponse(200, "<HTML><HEAD><TITLE>%s</TITLE></HEAD></HTML>"
+                                 % spec.expect)
+    return FakeResponse(200, spec.expect)
 
 
 # --------------------------------------------------------------------------- #
 # T18：严格匹配
 # --------------------------------------------------------------------------- #
 def test_t18_probe_matches_rejects_free_text_success():
-    spec = ProbeSpec(APPLE, "Success", PROBE_HTML_TITLE)
+    spec = ProbeSpec("http://probe.invalid/index.html", "Success", PROBE_HTML_TITLE)
     assert probe_matches(spec, 200, "yay Success here") is False
     assert probe_matches(spec, 200, "<title>Success</title>") is True
 
 
 def test_t18_probe_matches_requires_200_and_no_redirect():
-    spec = ProbeSpec(MSFT, "Microsoft Connect Test", PROBE_EXACT)
+    spec = ProbeSpec("http://probe.invalid/exact.txt", "Microsoft Connect Test",
+                     PROBE_EXACT)
     assert probe_matches(spec, 200, "Microsoft Connect Test") is True
     assert probe_matches(spec, 200, "Microsoft Connect Test ", redirected=True) is False
     assert probe_matches(spec, 302, "Microsoft Connect Test") is False
@@ -44,26 +55,27 @@ def test_t18_probe_matches_requires_200_and_no_redirect():
 def test_t18_internet_ok_rejects_arbitrary_200_with_success(monkeypatch):
     from tests.fakes import FakeResponse, FakeSession
     session = FakeSession()
-    session.route(MSFT, FakeResponse(200, "totally unrelated Success page"))
-    session.route(APPLE, FakeResponse(200, "<html>Success</html>"))
+    for spec in engine.DEFAULT_PROBES:
+        session.route(spec.url, FakeResponse(200, "totally unrelated Success page"))
     ok, _ = engine.internet_ok(session)
     assert ok is False, "任意 200 含 Success 被错误认可"
 
 
 def test_t18_internet_ok_accepts_structured_response(monkeypatch):
-    from tests.fakes import FakeResponse, FakeSession
+    from tests.fakes import FakeSession
+    spec = engine.DEFAULT_PROBES[0]
     session = FakeSession()
-    session.route(MSFT, FakeResponse(200, "Microsoft Connect Test"))
+    session.route(spec.url, _matching_response(spec))
     ok, via = engine.internet_ok(session)
     assert ok is True
-    assert via == MSFT
+    assert via == spec.url
 
 
 def test_probe_online_records_error_kinds():
     from tests.fakes import FakeSession
     session = FakeSession()
-    session.route(MSFT, requests.ConnectTimeout("timed out"))
-    session.route(APPLE, requests.ConnectionError("getaddrinfo failed for host"))
+    session.route(FIRST_PROBE, requests.ConnectTimeout("timed out"))
+    session.route(LAST_PROBE, requests.ConnectionError("getaddrinfo failed for host"))
     results = engine.probe_online(session)
     kinds = {r.error for r in results}
     assert "timeout" in kinds and "dns" in kinds
@@ -73,13 +85,13 @@ def test_probe_online_records_error_kinds():
 # T17：分类
 # --------------------------------------------------------------------------- #
 def _failing():
-    return [ProbeResult(False, MSFT, error="connection"),
-            ProbeResult(False, APPLE, error="connection")]
+    return [ProbeResult(False, FIRST_PROBE, error="connection"),
+            ProbeResult(False, LAST_PROBE, error="connection")]
 
 
 def test_t17_any_probe_ok_is_online():
-    results = [ProbeResult(False, MSFT, error="connection"),
-               ProbeResult(True, APPLE, status_code=200)]
+    results = [ProbeResult(False, FIRST_PROBE, error="connection"),
+               ProbeResult(True, LAST_PROBE, status_code=200)]
     assert classify_network("SNNU", "SNNU", results) is PortalStatus.ONLINE
 
 
@@ -168,9 +180,38 @@ def test_diagnose_network_uses_probe_and_status_page(monkeypatch):
                         lambda session, port, log=None:
                         StatusPageResult(PortalStatus.AUTH_REQUIRED))
     session = FakeSession()
-    session.route(MSFT, FakeResponse(200, "nope"))
-    session.route(APPLE, FakeResponse(200, "nope"))
+    for spec in engine.DEFAULT_PROBES:
+        session.route(spec.url, FakeResponse(200, "nope"))
     verdict, results, portal = engine.diagnose_network(session, "SNNU", port=8601)
     assert verdict is PortalStatus.AUTH_REQUIRED
-    assert len(results) == 2
+    assert len(results) == len(engine.DEFAULT_PROBES)
     assert portal is not None
+
+
+# --------------------------------------------------------------------------- #
+# P8 / K-4：默认探测点必须在本校园网**可达**且具备冗余
+# 真机实测（2026-10-15）：www.msftconnecttest.com 3/3 不可达（DNS/连接失败），
+# 导致「所有探测点同时失败 ⇒ 假掉线」。改为 3 个实测可达的独立目标。
+# --------------------------------------------------------------------------- #
+def test_p8_k4_default_probes_are_reachable_and_redundant():
+    urls = [spec.url for spec in engine.DEFAULT_PROBES]
+    assert len(engine.DEFAULT_PROBES) >= 3, urls
+    assert all("msftconnecttest.com" not in url for url in urls), \
+        "真机实测不可达的探测点仍在列表中：%r" % urls
+    assert "http://detectportal.firefox.com/success.txt" in urls, urls
+    assert len(set(urls)) == len(urls), "探测点重复：%r" % urls
+
+
+def test_p8_k4_internet_ok_survives_other_endpoints_flaking():
+    """任一探测点可用即在线：其余探测点全部抖动/失败时仍须判在线。"""
+    from tests.fakes import FakeSession
+    specs = engine.DEFAULT_PROBES
+    assert len(specs) >= 3, "探测点不足以容忍单点抖动：%r" % [s.url for s in specs]
+    session = FakeSession()
+    for spec in specs[:-1]:
+        session.route(spec.url, requests.ConnectionError("getaddrinfo failed (flaky)"))
+    last = specs[-1]
+    session.route(last.url, _matching_response(last))
+    ok, via = engine.internet_ok(session)
+    assert ok is True, "仅最后一个探测点可用就被判离线（K-4 假掉线）"
+    assert via == last.url

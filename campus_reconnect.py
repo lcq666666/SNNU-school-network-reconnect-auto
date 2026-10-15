@@ -92,9 +92,16 @@ KNOWN_PORTS = (8601, 8602, 8603, 8605, 8609)
 PORTAL_BUDGET = 20.0
 
 #: 连通性探测点：严格匹配响应结构，不再「任意 200 含 Success 即通过」（F08/T18）。
+#:
+#: P8/K-4（2026-10-15 真机取证）：原先首选的 ``www.msftconnecttest.com`` 在本校园网
+#: **3/3 不可达**（DNS/连接失败），``captive.apple.com`` 又偶发首次失配；两点同时失败
+#: 即产生「假掉线」。改为 3 个**实测可达**且互相独立的目标：任一严格匹配即判在线，
+#: 单点抖动不再导致整轮误判（真实的 Portal 劫持返回 HTML，不会误匹配）。
 DEFAULT_PROBES = (
-    ProbeSpec("http://www.msftconnecttest.com/connecttest.txt",
-              "Microsoft Connect Test", PROBE_EXACT),
+    ProbeSpec("http://detectportal.firefox.com/success.txt",
+              "success", PROBE_EXACT),
+    ProbeSpec("http://www.msftncsi.com/ncsi.txt",
+              "Microsoft NCSI", PROBE_EXACT),
     ProbeSpec("http://captive.apple.com/hotspot-detect.html",
               "Success", PROBE_HTML_TITLE),
 )
@@ -1293,6 +1300,13 @@ def watch(session: requests.Session, args: argparse.Namespace,
                     timers.note_auth(time.monotonic(), args.cooldown)
                     if getattr(result, "needs_user", False):
                         needs_user = True
+                    elif getattr(result, "network_ok", None) is True:
+                        # 确认窗口内自愈：修复预检（复核探测）已确认公网连通 ⇒
+                        # 判定为探测抖动而非真实掉线，清零失败计数，避免阈值之后
+                        # 逐轮重复告警与重复修复（P8 K-4）。
+                        log.info("确认窗口内公网已连通（修复预检），判定为探测抖动，"
+                                 "已抑制本次掉线判定。")
+                        failures = 0
             # 网络检测计时器：持续运行 —— 探测节奏恒为 interval，认证冷却（auth）
             # 与切换冷却（switch）都不得推迟它（V0.3 P2 三表分离）。
             timers.schedule_detection(time.monotonic(), args.interval)
