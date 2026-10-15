@@ -13,8 +13,9 @@ from types import SimpleNamespace
 
 from tools import netdiag
 
-from campus_network import (CONTRACT_VERSION, HealthAxis, HealthState,
-                            evaluate, recommend_path, resolve_roles)
+from campus_network import (CONTRACT_VERSION, DEFAULT_HTTP_TARGETS, HealthAxis,
+                            HealthState, evaluate, recommend_path, resolve_roles)
+from tests.fakes import healthy_http_table, matching_http_response
 
 ETH_ADAPTER = {"Name": "以太网",
                "InterfaceDescription": "Intel(R) Ethernet Connection (16) I219-V",
@@ -59,18 +60,10 @@ def _healthy_engine(engine):
     engine.dns.clear()
     engine.routes.clear()
     engine.tcp.update({"default": True})
-    engine.http.update({
-        "https://www.msftconnecttest.com/connecttest.txt":
-            {"status_code": 200, "redirected": False,
-             "final_url": "https://www.msftconnecttest.com/connecttest.txt",
-             "body": "Microsoft Connect Test"},
-        "https://captive.apple.com/hotspot-detect.html":
-            {"status_code": 200, "redirected": False,
-             "final_url": "https://captive.apple.com/hotspot-detect.html",
-             "body": "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success"
-                     "</BODY></HTML>"},
-        "default": {"status_code": 200, "redirected": False, "body": "success"},
-    })
+    # P8/K-5：命中响应由真实探测点表推导，不再写死旧目标的正文（表变则夹具跟随）。
+    engine.http.update(healthy_http_table())
+    engine.http["default"] = {"status_code": 200, "redirected": False,
+                              "body": "success"}
     engine.dns.update({"default": True})
     engine.routes.update({"default": SimpleNamespace(if_index=5,
                                                      source_ip="10.252.37.88")})
@@ -139,12 +132,10 @@ def test_u1_01_internet_unreachable(fake_engine):
 
 def test_u1_01_captive_portal_redirect(fake_engine):
     _healthy_engine(fake_engine)
-    for url in ("https://www.msftconnecttest.com/connecttest.txt",
-                "https://captive.apple.com/hotspot-detect.html"):
-        fake_engine.http[url] = {
-            "status_code": 302, "redirected": True,
-            "final_url": "http://202.117.144.205:8601/snnuportal/login.jsp",
-            "body": ""}
+    for spec in DEFAULT_HTTP_TARGETS:
+        fake_engine.http[spec.url] = matching_http_response(
+            spec, status_code=302, redirected=True,
+            final_url="http://202.117.144.205:8601/snnuportal/login.jsp")
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     snapshot = evaluate(report, engine=fake_engine)
     assert snapshot.wifi.state == HealthState.CAPTIVE_PORTAL
@@ -291,12 +282,11 @@ def test_u1_05_recommendation_branches(fake_engine):
             source_ip="192.168.124.9")})
         if wifi_state == "captive":
             # Portal 只劫持 Wi-Fi 源地址路径（双网卡并存时的真实行为）
-            for url in ("https://www.msftconnecttest.com/connecttest.txt",
-                        "https://captive.apple.com/hotspot-detect.html"):
-                fake_engine.http[(url, wifi_src)] = {
-                    "status_code": 302, "redirected": True,
-                    "final_url": "http://202.117.144.205:8601/snnuportal/"
-                                 "login.jsp", "body": ""}
+            for spec in DEFAULT_HTTP_TARGETS:
+                fake_engine.http[(spec.url, wifi_src)] = matching_http_response(
+                    spec, status_code=302, redirected=True,
+                    final_url="http://202.117.144.205:8601/snnuportal/"
+                              "login.jsp")
         if wifi_state == "unreachable":
             fake_engine.tcp[("10.252.1.1", 443)] = True   # 网关可达
             fake_engine.tcp.update({"default": False})

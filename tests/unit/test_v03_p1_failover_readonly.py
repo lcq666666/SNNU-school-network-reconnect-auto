@@ -13,10 +13,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import campus_reconnect as engine
-from tests.fakes import (FakeProbeEngine, FakeResponse, FakeSession)
+from tests.fakes import (FakeProbeEngine, FakeResponse, FakeSession,
+                         healthy_http_table, matching_http_response)
 from tools import netdiag
 
-from campus_network import HealthState, evaluate
+from campus_network import DEFAULT_HTTP_TARGETS, HealthState, evaluate
 
 ETH_ADAPTER = {"Name": "以太网",
                "InterfaceDescription": "Intel(R) Ethernet Connection (16) I219-V",
@@ -43,17 +44,15 @@ ONLINE_RESP = {"status_code": 200, "redirected": False, "body": ""}
 def _session(online: bool) -> FakeSession:
     """离线全局探测 Session（V0.2 ``internet_ok`` 语义）。
 
-    ``online=True``：两个探测站点均返回严格匹配正文；``False``：无路由
-    （FakeSession 抛 ConnectionError），等价于公网不可达。
+    ``online=True``：按真实系统探测点表（``DEFAULT_PROBES``）逐个布点、逐个严格匹配；
+    ``False``：无路由（FakeSession 抛 ConnectionError），等价于公网不可达。
     """
     session = FakeSession()
     if online:
-        session.route("http://www.msftconnecttest.com/connecttest.txt",
-                      FakeResponse(200, "Microsoft Connect Test"))
-        session.route("http://captive.apple.com/hotspot-detect.html",
-                      FakeResponse(
-                          200, "<HTML><HEAD><TITLE>Success</TITLE></HEAD>"
-                               "<BODY>Success</BODY></HTML>"))
+        # P8/K-5：从 DEFAULT_PROBES 推导，不写死旧目标 URL。
+        for spec in engine.DEFAULT_PROBES:
+            session.route(spec.url,
+                          FakeResponse(200, matching_http_response(spec)["body"]))
     return session
 
 
@@ -93,24 +92,16 @@ def _engine(wifi_state: str, *, best_route_if_index: int = 10) -> FakeProbeEngin
     """
     eng = FakeProbeEngine()
     eng.tcp.update({"default": True})
-    ok_http = {
-        "https://www.msftconnecttest.com/connecttest.txt":
-            {"status_code": 200, "redirected": False, "body": "Microsoft Connect Test"},
-        "https://captive.apple.com/hotspot-detect.html":
-            {"status_code": 200, "redirected": False,
-             "body": "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success"
-                     "</BODY></HTML>"},
-    }
-    eng.http.update(ok_http)
+    # P8/K-5：命中响应由真实探测点表推导（不再写死旧目标正文）。
+    eng.http.update(healthy_http_table())
     if wifi_state == "captive":
         # Portal 只劫持 Wi-Fi 源地址路径（以太网路径不受影响）
         wifi_src = ("10.252.37.88", 0)
-        for url in ("https://www.msftconnecttest.com/connecttest.txt",
-                    "https://captive.apple.com/hotspot-detect.html"):
-            eng.http[(url, wifi_src)] = {
-                "status_code": 302, "redirected": True,
-                "final_url": "http://202.117.144.205:8601/snnuportal/"
-                             "login.jsp", "body": ""}
+        for spec in DEFAULT_HTTP_TARGETS:
+            eng.http[(spec.url, wifi_src)] = matching_http_response(
+                spec, status_code=302, redirected=True,
+                final_url="http://202.117.144.205:8601/snnuportal/"
+                          "login.jsp")
     if wifi_state == "down":
         # 仅 Wi-Fi 源地址的公网探测失败（以太网路径不受影响）
         wifi_src = ("10.252.37.88", 0)

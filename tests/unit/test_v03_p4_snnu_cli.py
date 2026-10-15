@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import campus_reconnect as engine
 from campus_core import PortalStatus
 from campus_snnu import BackupLinkResult
-from tests.fakes import FakeProbeEngine, FakeSession
+from tests.fakes import FakeProbeEngine, FakeSession, healthy_http_table
 from tools import netdiag
 
 LOG = logging.getLogger("campus")
@@ -57,15 +57,8 @@ def _report() -> netdiag.DiagReport:
 def _engine() -> FakeProbeEngine:
     eng = FakeProbeEngine()
     eng.tcp.update({"default": True})
-    eng.http.update({
-        "https://www.msftconnecttest.com/connecttest.txt":
-            {"status_code": 200, "redirected": False,
-             "body": "Microsoft Connect Test"},
-        "https://captive.apple.com/hotspot-detect.html":
-            {"status_code": 200, "redirected": False,
-             "body": "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success"
-                     "</BODY></HTML>"},
-    })
+    # P8/K-5：命中响应由真实探测点表推导（不再写死旧目标正文）。
+    eng.http.update(healthy_http_table())
     eng.dns.update({"default": True})
     eng.routes.update({"default": SimpleNamespace(if_index=5,
                                                   source_ip="10.252.37.88")})

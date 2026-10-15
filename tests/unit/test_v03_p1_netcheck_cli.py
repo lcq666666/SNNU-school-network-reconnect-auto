@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import campus_reconnect
 from campus_network import CONTRACT_VERSION
-from tests.fakes import FakeProbeEngine, FakeSession
+from tests.fakes import FakeProbeEngine, FakeSession, healthy_http_table
 from tools import netdiag
 
 ETH_ADAPTER = {"Name": "以太网",
@@ -67,15 +67,8 @@ class _FakeObserver:
 def _healthy_engine() -> FakeProbeEngine:
     eng = FakeProbeEngine()
     eng.tcp.update({"default": True})
-    eng.http.update({
-        "https://www.msftconnecttest.com/connecttest.txt":
-            {"status_code": 200, "redirected": False,
-             "body": "Microsoft Connect Test"},
-        "https://captive.apple.com/hotspot-detect.html":
-            {"status_code": 200, "redirected": False,
-             "body": "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success"
-                     "</BODY></HTML>"},
-    })
+    # P8/K-5：命中响应由真实探测点表推导（不再写死旧目标正文）。
+    eng.http.update(healthy_http_table())
     eng.dns.update({"default": True})
     return eng
 

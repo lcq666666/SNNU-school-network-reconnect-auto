@@ -43,7 +43,7 @@ import campus_tray_failover as tf
 import campus_tray_observer as tso
 from campus_failover import FailoverMode, FailoverState, OpKind
 from campus_network import HealthState, evaluate
-from tests.fakes import FakeProbeEngine
+from tests.fakes import FakeProbeEngine, healthy_http_table
 
 LOG = logging.getLogger("campus")
 
@@ -117,8 +117,8 @@ class FakeCollector:
         report = self.report()
         fake = FakeProbeEngine()
         fake.tcp["default"] = True
-        fake.http["default"] = {"status_code": 200, "redirected": False,
-                                "body": "Microsoft Connect Test", "error": ""}
+        # P8/K-5：命中响应由真实探测点表推导（不再写死旧目标正文）。
+        fake.http.update(healthy_http_table())
         fake.dns["default"] = True
         fake.routes["default"] = SimpleNamespace(if_index=self.egress_if,
                                                  source_ip=self.wifi_ip,

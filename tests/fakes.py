@@ -429,6 +429,38 @@ class FakeProbeEngine:
             dns_resolve=lambda name: self.dns_resolve(name, source))
 
 
+def matching_http_response(spec, *, status_code=200, redirected=False,
+                           final_url=None, error=""):
+    """按 ``ProbeSpec`` 生成**能通过** ``probe_matches`` 的假响应 dict。
+
+    夹具过去靠"写死某个正文恰好命中某个探测点"（如 ``body="Microsoft Connect Test"``），
+    探测点表一变就静默失效（P8/K-5 实测踩坑）。改为从 ``spec`` 推导期望正文，夹具与真实
+    探测点表**同源**：目标表变更时夹具自动跟随，不会悄悄退化成"永远是失败探测"。
+    """
+    from campus_core import PROBE_HTML_TITLE
+
+    if spec.mode == PROBE_HTML_TITLE:
+        body = "<HTML><HEAD><TITLE>%s</TITLE></HEAD><BODY>%s</BODY></HTML>" % (
+            spec.expect, spec.expect)
+    else:
+        body = spec.expect
+    return {"status_code": status_code, "redirected": redirected,
+            "final_url": spec.url if final_url is None else final_url,
+            "body": body, "error": error}
+
+
+def healthy_http_table(specs=None) -> Dict[Any, Any]:
+    """生成"分轴 HTTP 探测点**全部命中**"的假响应表。
+
+    ``specs`` 缺省取 ``campus_network.DEFAULT_HTTP_TARGETS``（真实目标表）。
+    """
+    if specs is None:
+        from campus_network import DEFAULT_HTTP_TARGETS
+
+        specs = DEFAULT_HTTP_TARGETS
+    return {spec.url: matching_http_response(spec) for spec in specs}
+
+
 # --------------------------------------------------------------------------- #
 # 远控探测能力假件（V0.3 P7 campus_remote 用）
 # --------------------------------------------------------------------------- #

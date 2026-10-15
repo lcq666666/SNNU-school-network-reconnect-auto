@@ -38,7 +38,7 @@ import campus_snnu as snnu_mod
 from campus_core import TimerTable
 from campus_failover import OpKind, OpRequest
 from campus_network import (HealthAxis, HealthState, InterfaceHealthChecker)
-from tests.fakes import FakeProbeEngine, FakeRouteOps
+from tests.fakes import FakeProbeEngine, FakeRouteOps, healthy_http_table
 
 LOG = logging.getLogger("campus")
 
@@ -118,8 +118,8 @@ def _real_three_axis_collector(eth_ip: str = "10.20.30.40",
     report = _report(wifi_ip=wifi_ip, eth_ip=eth_ip)
     fake = FakeProbeEngine()
     fake.tcp["default"] = True
-    fake.http["default"] = {"status_code": 200, "redirected": False,
-                            "body": "Microsoft Connect Test", "error": ""}
+    # P8/K-5：命中响应由真实探测点表推导（不再写死旧目标正文）。
+    fake.http.update(healthy_http_table())
     fake.dns["default"] = True
     fake.routes["default"] = SimpleNamespace(if_index=ETH_IF,
                                              source_ip=eth_ip, error=None)
@@ -217,8 +217,8 @@ def test_r75_03_wifi_not_default_route_must_be_confirmable():
     report = _report(wifi_ip="10.8.0.5")
     fake = FakeProbeEngine()
     fake.tcp["default"] = True
-    fake.http["default"] = {"status_code": 200, "redirected": False,
-                            "body": "Microsoft Connect Test", "error": ""}
+    # P8/K-5：命中响应由真实探测点表推导（不再写死旧目标正文）。
+    fake.http.update(healthy_http_table())
     fake.dns["default"] = True
     # 系统最佳路由仍是以太网（Wi-Fi 非默认出口），但 Wi-Fi 自身完全可用
     fake.routes["default"] = SimpleNamespace(if_index=ETH_IF,
