@@ -56,7 +56,8 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          RepairOptions, RepairResult, LoginOutcome,
                          StatusPageResult, TimerTable,
                          check_redirect_target, classify_network,
-                         extract_error_hint, parse_status_page, probe_matches,
+                         extract_error_hint, normalize_account,
+                         parse_status_page, probe_matches,
                          repair_service, resolve_url)
 from campus_failover import (FailoverMode, FailoverPolicy,
                              NetworkFailoverManager, format_tick)
@@ -586,9 +587,12 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
                             error_code=E_PORTAL_UNREACHABLE)
 
     # 2) 只读预检：已有会话且就是本账号 → 不 POST、不声称验证了新密码
+    #    （F75-12：状态页显示 `学号@运营商`、提交为纯学号，须按规范化账号比较）
     pre = read_status_page(session, port, log)
     if pre is not None and getattr(pre, "status", None) is PortalStatus.ONLINE \
-            and getattr(pre, "account", None) == account.strip():
+            and normalize_account(getattr(pre, "account", None)) \
+            and normalize_account(getattr(pre, "account", None)) \
+            == normalize_account(account):
         return LoginOutcome(True, "Portal 显示该账号已在线（复用已有会话，未验证新凭据）",
                             status=PortalStatus.ONLINE, already_authenticated=True)
 

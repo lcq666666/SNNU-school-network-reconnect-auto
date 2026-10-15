@@ -17,7 +17,7 @@ import logging
 import campus_reconnect as engine
 from campus_core import (E_AUTH_CAPTCHA, E_AUTH_REJECTED,
                          E_PORTAL_STRUCTURE_UNKNOWN, PortalStatus,
-                         extract_error_hint)
+                         extract_error_hint, parse_status_page)
 from tests.fakes import FakeResponse, FakeSession
 
 LOG = logging.getLogger("campus")
@@ -130,3 +130,67 @@ def test_t16_real_error_region_is_classified():
     assert outcome.ok is False
     assert outcome.status is PortalStatus.NEEDS_USER
     assert outcome.error_code == E_AUTH_REJECTED
+
+
+# --------------------------------------------------------------------------- #
+# F75-12：真机状态页「账号被 <span> 包裹 + 带运营商后缀」导致的验证假阴性
+# （P8-4 实测：受控认证**已真正成功**——SNNU 出口 3/3 探测通过、状态页有登录
+#  账号——但工具报 E_AUTH_REJECTED/E_SNNU_AUTH_FAILED，needs_user=True）
+# --------------------------------------------------------------------------- #
+#: 真机 `userstatus.jsp` 片段（2026-10-15 实测抓取，仅账号数字被替换）。
+REAL_STATUS_PAGE = (
+    '<td width="30%" class="zhengwen">当前登录账号：'
+    '<span class="zhengwen1">20210001@mobile</span></td>'
+)
+
+
+def test_f75_12_span_wrapped_account_must_be_parsed():
+    """真机形态：账号被 <span> 包裹、且带 @mobile 后缀，必须解析出纯学号。"""
+    result = parse_status_page(REAL_STATUS_PAGE, expected_account="20210001")
+    assert result.account == "20210001", "未解析出真机账号字段：%r" % result.account
+    assert result.status is PortalStatus.ONLINE
+    assert result.marker_found is True
+
+
+def test_f75_12_operator_suffix_is_the_same_account():
+    """`学号@运营商`（页面）与 `学号`（plain 提交）指向同一账号，不得判为不一致。"""
+    result = parse_status_page(REAL_STATUS_PAGE, expected_account="20210001@mobile")
+    assert result.status is PortalStatus.ONLINE
+
+
+def test_f75_12_another_account_is_still_rejected():
+    """安全属性不得后退：页面显示**另一个学号**时仍必须拒绝。"""
+    page = REAL_STATUS_PAGE.replace("20210001", "20219999")
+    result = parse_status_page(page, expected_account="20210001")
+    assert result.status is PortalStatus.NEEDS_USER
+    assert result.error_code == E_AUTH_REJECTED
+
+
+def test_f75_12_marker_without_account_is_structure_unknown_not_other_account():
+    """标记后解析不出账号 ⇒ 结构未知；**不得**因截到非账号片段而误判「另一账号」。"""
+    page = '<td class="zhengwen">当前登录账号：<span class="zhengwen1"></span></td>'
+    result = parse_status_page(page, expected_account="20210001")
+    assert result.status is PortalStatus.NEEDS_USER
+    assert result.error_code == E_PORTAL_STRUCTURE_UNKNOWN, (
+        "把非账号片段当成「另一账号」：account=%r" % result.account)
+
+
+def test_f75_12_real_page_login_is_reported_success():
+    """真机形态下 POST 后的状态页必须被判为成功（P8-4 假阴性的直接回归）。"""
+    session = _session_with_login_response(
+        FakeResponse(200, REAL_STATUS_PAGE, encoding="utf-8"))
+    outcome = engine.portal_login(session, "20210001", "pw", "mobile", PORT, LOG)
+    assert outcome.ok is True, "真机状态页被判为失败：%s（%s）" % (
+        outcome.detail, outcome.error_code)
+    assert outcome.status is PortalStatus.ONLINE
+
+
+def test_f75_12_real_page_existing_session_is_reused_without_post():
+    """真机形态下已有会话必须被识别为同账号在线 ⇒ 不重复提交凭据。"""
+    session = FakeSession()
+    session.route(LOGIN_JSP, FakeResponse(200, "<html>login</html>"))
+    session.route(USERSTATUS, FakeResponse(200, REAL_STATUS_PAGE, encoding="utf-8"))
+    outcome = engine.portal_login(session, "20210001", "pw", "mobile", PORT, LOG)
+    assert outcome.ok is True
+    assert outcome.already_authenticated is True
+    assert session.posts() == [], "已有会话仍重复提交了认证请求"

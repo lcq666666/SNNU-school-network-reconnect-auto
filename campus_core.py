@@ -776,7 +776,12 @@ PROBE_EXACT = "exact"
 PROBE_HTML_TITLE = "html_title"
 
 #: 状态页账号字段：``当前登录账号：123456`` / ``当前登录账号 123456``。
-_STATUS_ACCOUNT_RE = re.compile(r"当前登录账号\s*[:：]?\s*([^\s<>\"']+)")
+_STATUS_ACCOUNT_RE = re.compile(
+    r"当前登录账号[\s:：]*(?:<[^<>]{0,200}>[\s:：]*){0,4}([^\s<>\"'：]+)")
+
+#: 账号形态校验：真实账号为学号（可带 ``@运营商`` 后缀）。不满足形态即视为
+#: **无法解析**，避免把 HTML 片段或标点当成「另一个账号」（F75-12 失效模式）。
+_ACCOUNT_SHAPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-@]{1,63}$")
 
 #: 错误文字提取：只在「错误/失败/提示」等标记后的短片段里找，避免导航脚本误触发。
 _ERROR_REGION_RE = re.compile(r"(?:错误|失败|提示|异常)\s*[:：]?\s*([^<>]{1,80})")
@@ -790,14 +795,23 @@ AUTH_REJECT_HINTS = ("密码错误", "密码不正确", "密码有误", "密码�
                      "欠费", "冻结", "已停机", "登录失败", "认证失败")
 
 
+#: 状态页会把账号显示成 ``学号@运营商``（真机实测 ``@mobile``），而 ``plain`` 格式
+#: 提交纯学号；两者指向**同一账号**，比较前剥离**已知**运营商后缀（F75-12）。
+_ACCOUNT_SUFFIX_RE = re.compile(
+    r"@(?:%s)$" % "|".join(re.escape(op) for op in OPERATORS if op), re.IGNORECASE)
+
+
 def normalize_account(value: Any) -> str:
-    """规范化账号用于**完整比较**：去空白、去包裹引号（不做子串匹配）。"""
+    """规范化账号用于**完整比较**：去空白、去包裹引号、去已知运营商后缀。
+
+    不做子串匹配：页面显示**另一个学号**时仍必须判为不一致。
+    """
     if value is None:
         return ""
     text = str(value).strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
         text = text[1:-1].strip()
-    return text
+    return _ACCOUNT_SUFFIX_RE.sub("", text)
 
 
 class LoginOutcome(tuple):
@@ -844,11 +858,13 @@ class StatusPageResult:
 def parse_status_page(body: str, expected_account: Optional[str] = None) -> StatusPageResult:
     """解析 Portal 状态页（**纯函数**）。
 
-    规则（F06）：
+    规则（F06 / F75-12）：
     - 命中验证码特征 ⇒ ``NEEDS_USER``（``E_AUTH_CAPTCHA``）；
-    - 解析出明确的账号字段后**完整比较**（不是子串）：一致 ⇒ ``ONLINE``，
-      不一致 ⇒ ``NEEDS_USER``（其他账号）；
-    - 出现标记但无法解析账号 ⇒ 结构未知 ⇒ ``NEEDS_USER``；
+    - 解析出明确的账号字段（真机为「标记 → 全角冒号 → ``<span>`` → 账号@运营商」，
+      允许标记与账号之间有**有限**的标签）后**完整比较**（不是子串）：一致 ⇒
+      ``ONLINE``，不一致 ⇒ ``NEEDS_USER``（其他账号）；
+    - 出现标记但解析不出**账号形态**的内容 ⇒ 结构未知 ⇒ ``NEEDS_USER``
+      （``E_PORTAL_STRUCTURE_UNKNOWN``），**不得**把 HTML 片段/标点当成「另一账号」；
     - 无标记 ⇒ 需要认证（``AUTH_REQUIRED``）。
     """
     text = body or ""
@@ -858,10 +874,14 @@ def parse_status_page(body: str, expected_account: Optional[str] = None) -> Stat
                                 detail="Portal 要求验证码，需要人工处理")
     marker = ONLINE_MARKER in text
     match = _STATUS_ACCOUNT_RE.search(text)
+    account = ""
     if match:
-        account = normalize_account(match.group(1))
+        candidate = normalize_account(match.group(1))
+        if _ACCOUNT_SHAPE_RE.match(candidate):
+            account = candidate
+    if account:
         if expected_account is not None:
-            if account and account == normalize_account(expected_account):
+            if account == normalize_account(expected_account):
                 return StatusPageResult(PortalStatus.ONLINE, account=account,
                                         detail="状态页账号与本次提交完整一致",
                                         marker_found=True)
