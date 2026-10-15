@@ -197,6 +197,58 @@ def test_t38_ipv4_respects_interface_filter():
 
 
 # --------------------------------------------------------------------------- #
+# F75-09：真实 ipconfig 布局（适配器名与属性之间有空行）
+# --------------------------------------------------------------------------- #
+#: 真实 ipconfig 输出：**适配器标题行后跟一个空行**，再接属性行。
+#: 旧实现按空行分块 ⇒ 标题块不含 IPv4 行 ⇒ 指定 interface 时恒判 False。
+REAL_IPCONFIG = """
+Windows IP Configuration
+
+Unknown adapter Tailscale:
+
+   Connection-specific DNS Suffix  . :
+   Autoconfiguration IPv4 Address. . : 169.254.83.107
+   Subnet Mask . . . . . . . . . . . : 255.255.0.0
+
+Ethernet adapter 以太网:
+
+   Connection-specific DNS Suffix  . :
+   IPv4 Address. . . . . . . . . . . : 192.168.124.9
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+
+Wireless LAN adapter WLAN:
+
+   Connection-specific DNS Suffix  . : snnu.edu.cn
+   IPv6 Address. . . . . . . . . . . : 240c:c28f:1011:dbbe:d958:8ed1:4010:54cc
+   Link-local IPv6 Address . . . . . : fe80::d38e:a3fe:a3ac:93e6%5
+   IPv4 Address. . . . . . . . . . . : 10.138.241.249
+   Subnet Mask . . . . . . . . . . . : 255.255.0.0
+"""
+
+
+def test_f75_09_ipv4_ready_real_layout_scoped_to_interface():
+    # 无 interface：任一可用 IPv4 即就绪
+    assert cw.parse_ipconfig_ipv4(REAL_IPCONFIG) is True
+    # 指定接口：必须归属该适配器（这是 F75-09 的核心缺陷用例）
+    assert cw.parse_ipconfig_ipv4(REAL_IPCONFIG, interface="WLAN") is True
+    assert cw.parse_ipconfig_ipv4(REAL_IPCONFIG, interface="以太网") is True
+
+
+def test_f75_09_ipv4_ready_scope_does_not_leak_across_adapters():
+    # Tailscale 块只有 169.254 链路本地地址 ⇒ 指定它时应为 False，
+    # 不得把它接口的可用地址"串"过来。
+    assert cw.parse_ipconfig_ipv4(REAL_IPCONFIG, interface="Tailscale") is False
+    assert cw.parse_ipconfig_ipv4(REAL_IPCONFIG, interface="不存在的网卡") is False
+
+
+def test_f75_09_ipv4_ready_chinese_header_with_blank_line():
+    text = ("无线局域网适配器 WLAN:\n\n"
+            "   IPv4 地址 . . . . . . . . . . . . : 10.0.0.5\n")
+    assert cw.parse_ipconfig_ipv4(text, interface="WLAN") is True
+    assert cw.parse_ipconfig_ipv4(text, interface="以太网") is False
+
+
+# --------------------------------------------------------------------------- #
 # 连接后等待 IP（T29）
 # --------------------------------------------------------------------------- #
 def test_t29_reconnect_uses_profile_and_waits(monkeypatch):

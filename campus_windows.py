@@ -532,6 +532,10 @@ def wifi_state_from_text(text: str, ssid: str = "",
 
 _IPV4_KEY_HINTS = ("ipv4", "ip 地址", "ip address")
 
+#: ipconfig 适配器**标题行**：英文 `... adapter <名>:` / 中文 `...适配器 <名>:`。
+#: 真实 ipconfig 会在标题行与属性行之间插入空行，故不能用空行分块（F75-09）。
+_ADAPTER_HEADER = re.compile(r"^\s*.*(?:adapter|适配器).*:\s*$", re.IGNORECASE)
+
 
 def _valid_ipv4(addr: str) -> bool:
     """是否为可用（非 link-local / 非 0.0.0.0）的 IPv4 地址。"""
@@ -545,20 +549,29 @@ def _valid_ipv4(addr: str) -> bool:
 
 
 def parse_ipconfig_ipv4(text: str, interface: Optional[str] = None) -> bool:
-    """判断 ``ipconfig`` 输出里是否已有可用 IPv4 地址（F17）。
+    """判断 ``ipconfig`` 输出里是否已有可用 IPv4 地址（F17 / F75-09）。
 
-    ``interface`` 给定时仅检查包含该名称的适配器块。用于“连接后等待 IP 就绪再判定”，
-    避免刚发起连接就断言成功。
+    ``interface`` 给定时仅检查**归属该适配器**的 IPv4 行。真实 ``ipconfig`` 在适配器
+    标题行与属性行之间**有空行**，因此不能按空行分块（否则标题所在的块永不含 IPv4 行，
+    指定接口时恒判 False，F75-09）：这里逐行扫描，记住最近的适配器标题行，把其后的
+    IPv4 行归属到该适配器后再做接口过滤。
     """
-    for block in _iter_blocks(text or ""):
-        if interface and interface.strip().casefold() not in block.casefold():
+    want = interface.strip().casefold() if interface else None
+    current = ""
+    for line in (text or "").splitlines():
+        if not line.strip():
             continue
-        for line in block.splitlines():
-            low = line.lower()
-            if any(hint in low for hint in _IPV4_KEY_HINTS):
-                _, _, value = line.partition(":")
-                if _valid_ipv4(value):
-                    return True
+        if _ADAPTER_HEADER.match(line):
+            current = line.strip()
+            continue
+        low = line.lower()
+        if not any(hint in low for hint in _IPV4_KEY_HINTS):
+            continue
+        _, _, value = line.partition(":")
+        if not _valid_ipv4(value):
+            continue
+        if want is None or want in current.casefold():
+            return True
     return False
 
 
