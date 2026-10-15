@@ -39,6 +39,7 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -72,7 +73,7 @@ from campus_snnu import (InterfaceBinding, SnnuBackupExecutor, SnnuBackupLink,
                          SnnuOps, format_backup_result)
 from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
                             parse_ipconfig_ipv4, parse_netsh_interfaces,
-                            tcp_probe, wifi_state_from_text)
+                            tcp_probe, tcp_probe_bound, wifi_state_from_text)
 
 if os.name == "nt":
     import winreg
@@ -122,6 +123,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 IP_PROBE_TIMEOUT = 1.0
 #: IP 级探测实现（默认 :func:`campus_windows.tcp_probe`；测试注入假件以保证零真实网络）。
 IP_TCP_PROBE: Callable[[str, int, float], bool] = tcp_probe
+#: **接口级** IP 级探测（绑定指定源地址，F75-14）：供 SNNU 绑定上下文使用，
+#: 避免未绑定探针经默认路由成功而把「该接口实际不通」误判为在线。
+IP_TCP_PROBE_BOUND: Callable[[str, int, float, Optional[str]], bool] = tcp_probe_bound
 
 
 def _prefer_ipv4() -> None:
@@ -235,16 +239,20 @@ def _error_kind(exc: Exception) -> str:
 
 
 def _probe_detail(result: ProbeResult) -> str:
-    """失败探测点的可读明细 ``主机(错误类型/状态码)``（F75-13③）。"""
+    """探测点的可读明细 ``主机(ok/错误类型/状态码)``（F75-13③、V0.4-1）。"""
     try:
         host = urlsplit(result.source).hostname or result.source
     except ValueError:  # pragma: no cover - source 恒为探测点 URL
         host = result.source
+    if result.ok:
+        return "%s(ok)" % host
     return "%s(%s)" % (host, result.error or result.status_code)
 
 
 def internet_ok(session: requests.Session,
-                probes=DEFAULT_PROBES) -> Tuple[bool, str]:
+                probes=DEFAULT_PROBES, *,
+                tcp_probe: Optional[Callable[[str, int, float], bool]] = None
+                ) -> Tuple[bool, str]:
     """直连(不走系统代理)判定公网可达，返回 ``(是否在线, 证据或失败明细)``。
 
     判据（F75-13②）：**任一** HTTP 探测点严格结构匹配，**或任一** 免 DNS 的 IP 级
@@ -253,7 +261,13 @@ def internet_ok(session: requests.Session,
 
     在线时第二项为通过的证据（探测点 URL 或 ``tcp://host:port``）；离线时为失败明细
     （各失败探测点 + 错误类型，``；`` 分隔），供 :func:`watch` 记入日志（F75-13③）。
+
+    ``tcp_probe``（F75-14）：可选的**接口级** IP 级探针 ``(host, port, timeout) -> bool``。
+    **绑定上下文必须传入**受接口约束的探针（见 :func:`_snnu_ops` 内的 ``_bound_tcp_probe``）：
+    默认的模块级 :data:`IP_TCP_PROBE` 不绑定源地址，会经**默认路由**成功握手，从而为
+    「该接口实际不通」背书 ⇒ ``snnu --auth`` 预检恒判在线、永不重认证（F75-14）。
     """
+    probe = tcp_probe or IP_TCP_PROBE
     details: List[str] = []
     for result in probe_online(session, probes):
         if result.ok:
@@ -261,7 +275,7 @@ def internet_ok(session: requests.Session,
         details.append(_probe_detail(result))
     for host, port in DEFAULT_TCP_TARGETS:
         try:
-            reachable = bool(IP_TCP_PROBE(host, port, IP_PROBE_TIMEOUT))
+            reachable = bool(probe(host, port, IP_PROBE_TIMEOUT))
         except Exception as exc:  # 探测自身异常只算"不可达"，不得中断监测循环
             details.append("tcp://%s:%d(%s)" % (host, port, type(exc).__name__))
             continue
@@ -269,6 +283,95 @@ def internet_ok(session: requests.Session,
             return True, "tcp://%s:%d" % (host, port)
         details.append("tcp://%s:%d(unreachable)" % (host, port))
     return False, "；".join(details)
+
+
+#: V0.4-1 连接后**真实上网校验**的**闸门**探测点（2026-10-16 真机取证）：
+#: ``www.baidu.com`` 裸 URL 返回 3xx → 跟随重定向后 200，``<title>`` 为实测标题。
+VERIFY_GATE = ProbeSpec("http://www.baidu.com/", "百度一下，你就知道",
+                        PROBE_HTML_TITLE)
+#: V0.4-1 **交叉**探测点：与闸门来源相互独立，命中 ``VERIFY_MIN_CROSS`` 站即认为真实可达。
+VERIFY_CROSS = (
+    ProbeSpec("http://www.qq.com/", "腾讯网", PROBE_HTML_TITLE),
+    ProbeSpec("http://www.163.com/", "网易", PROBE_HTML_TITLE),
+    ProbeSpec("http://www.sohu.com/", "搜狐", PROBE_HTML_TITLE),
+)
+#: 交叉命中数下限（方案 §6 Q2 默认档「闸门 + 交叉 ≥2」）。
+VERIFY_MIN_CROSS = 2
+#: 校验超时（连接, 读取）：真实页面比 ``success.txt`` 类探针慢，但仍须有界。
+VERIFY_TIMEOUT = (3.0, 8.0)
+
+
+def verify_site(session: requests.Session, spec: ProbeSpec,
+                timeout: Tuple[float, float] = VERIFY_TIMEOUT) -> ProbeResult:
+    """抓取**单个站点**并按响应结构严格匹配（V0.4-1，跟随重定向）。
+
+    真机取证（2026-10-16）：``baidu.com`` / ``qq.com`` / ``sohu.com`` 裸 URL 均返回
+    3xx 跳转，故必须 ``allow_redirects=True``；跟随后的最终响应为 200 且 ``<title>``
+    命中期望值，因此按 ``redirected=False`` 交给 :func:`probe_matches` 判定。
+
+    任何一个站点的异常都**只算该站失败**（返回失败 :class:`ProbeResult`），
+    绝不向上抛出——校验挂在监测循环里，不允许把循环炸掉。
+    """
+    start = time.monotonic()
+    try:
+        resp = session.get(spec.url, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.Timeout:
+        return ProbeResult(False, spec.url, error="timeout",
+                           elapsed=time.monotonic() - start)
+    except requests.RequestException as exc:
+        return ProbeResult(False, spec.url, error=_error_kind(exc),
+                           elapsed=time.monotonic() - start)
+    except Exception as exc:  # 非 requests 异常（含假件实现缺陷）：只算该站失败
+        return ProbeResult(False, spec.url, error=type(exc).__name__,
+                           elapsed=time.monotonic() - start)
+    body = decode_body(resp) or ""
+    ok = probe_matches(spec, resp.status_code, body, redirected=False)
+    return ProbeResult(ok, spec.url, status_code=resp.status_code,
+                       elapsed=time.monotonic() - start)
+
+
+def verify_internet(session: requests.Session, *,
+                    gate: ProbeSpec = VERIFY_GATE,
+                    cross: Tuple[ProbeSpec, ...] = VERIFY_CROSS,
+                    min_cross: int = VERIFY_MIN_CROSS,
+                    timeout: Tuple[float, float] = VERIFY_TIMEOUT
+                    ) -> Tuple[bool, str]:
+    """V0.4-1 连接后**真实上网校验**：抓真实页面并按 ``<title>`` 结构严格匹配。
+
+    用户需求（2026-10-16）：连上（有线或无线 SNNU）之后做一次真实上网校验，防止
+    「连着 Wi-Fi 却打不开网页」的**假死**——原 ``internet_ok`` 只看连通性探针，
+    假死时探针可能仍「通过」而浏览器实际不可用。
+
+    判据：**闸门通过 且 交叉命中 ≥ ``min_cross``**。闸门不过 ⇒ 直接失败（避免
+    「只有闸门通、别的站全打不开」的假死漏判）。返回 ``(是否通过, 明细)``，明细
+    逐站给出 ``主机(ok/错误类型/状态码)``，供日志/托盘提示。
+
+    **本函数不抛异常**（异常一律转成该站失败），可安全嵌入 ``watch`` 与托盘循环；
+    失败**只记日志**，不触发重认证、不触发路由切换（V0.4 不改动 V0.3 的判据与计时器）。
+    """
+    lines: List[str] = []
+    gate_result = verify_site(session, gate, timeout)
+    lines.append("闸门 %s" % _probe_detail(gate_result))
+    hits = 0
+    for spec in cross:
+        result = verify_site(session, spec, timeout)
+        if result.ok:
+            hits += 1
+        lines.append("交叉 %s" % _probe_detail(result))
+    ok = bool(gate_result.ok and hits >= min_cross)
+    if not ok and gate_result.ok:
+        lines.append("交叉命中 %d/%d（需 ≥%d）" % (hits, len(cross), min_cross))
+    return ok, "；".join(lines)
+
+
+def _verify_after_connect(session: requests.Session, log: logging.Logger) -> bool:
+    """在**确认在线**后执行一次校验并记日志（V0.4-1 触发点；失败不触发重认证）。"""
+    ok, detail = verify_internet(session)
+    if ok:
+        log.info("连接后上网校验通过：%s", detail)
+    else:
+        log.warning("连接后上网校验未通过，疑似「假死」（浏览器可能无法上网）：%s", detail)
+    return ok
 
 
 def portal_base(port: int) -> str:
@@ -859,11 +962,37 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
     ``repair`` 封装调用 ``campus_core.repair_service``（**不重写认证引擎**，
     AGENTS §3.1），并把已绑定源地址的会话传入，使 Portal 解析/状态/认证/验证
     四步全部经 SNNU 接口（方案 §6.2）。
+
+    F75-14：预检的**免 DNS IP 级证据也必须受接口约束** —— 模块级 ``IP_TCP_PROBE``
+    不绑定源地址，会经默认路由（以太网）成功握手，使 ``snnu --auth`` 恒短路返回
+    「公网已连通，无需认证」。故 ``repair`` 为 ``probe_online`` 注入绑定 SNNU 源地址
+    的接口级探针（取不到源地址时不产生 IP 级证据）。
     """
 
+    def _bound_tcp_probe(source_ip: Optional[str]):
+        """接口级 IP 探测：绑定 SNNU 源地址后再连接（F75-14）。
+
+        源地址不可得时**fail-closed**：返回恒不可达的探针而**不**回退到未绑定的
+        :data:`IP_TCP_PROBE` —— 否则默认路由（以太网）的成功握手会再次掩盖
+        「无线实际不通」，使预检恒判在线而永不重认证。
+        """
+        if not source_ip:
+            return lambda host, port, timeout: False
+        return lambda host, port, timeout: IP_TCP_PROBE_BOUND(
+            host, port, timeout, source_ip)
+
     def _repair(bound_session: Any, options: RepairOptions) -> RepairResult:
+        try:
+            source_ip = _refresh_binding().source_ip
+        except Exception as exc:  # 取不到源地址 ⇒ 不做 IP 级证据（见 _bound_tcp_probe）
+            log.warning("读取 SNNU 源地址失败，本次不做接口级 IP 级证据：%s",
+                        type(exc).__name__)
+            source_ip = None
+        probe = _bound_tcp_probe(source_ip)
+        adapters = replace(_cli_adapters(),
+                           probe_online=lambda sess: internet_ok(sess, tcp_probe=probe))
         return repair_service(bound_session, options, time.monotonic,
-                              _cli_adapters(), get_credentials, log=log)
+                              adapters, get_credentials, log=log)
 
     def _refresh_binding():
         report = observer.observe(target_ssid="SNNU")
@@ -1114,6 +1243,43 @@ def remote(session: requests.Session, args: argparse.Namespace,
     return 0
 
 
+def remote_app(args: argparse.Namespace, log: logging.Logger) -> int:
+    """V0.4-2/3 UU 远程（网易 GameViewer）后台处理。
+
+    需求（2026-10-16 用户）：UU 远程在「断网 → 重连」后会卡在「正在重新连接」
+    而连不上本机；希望确认网络真连上后把 UU 远程后台清退重启。
+
+    - 默认（无参数）：**只读发现**——不切换路由、不认证、不清退/重启任何进程；
+    - ``--restart``：**有副作用**——清退用户态 ``GameViewer`` /
+      ``GameViewerLauncher`` 并按自启项重启；``GameViewerService`` 与
+      ``Server``/``Healthd`` 一律不动（方案 §3.2）。仅在**显式**指定时执行。
+    """
+    from campus_remote_app import (RestartGuard, build_windows_remote_app_ops,
+                                   discover, format_status, restart_user_app)
+
+    ops = build_windows_remote_app_ops()
+    status = discover(ops)
+    print(format_status(status))
+    if not args.restart:
+        log.info("remote-app 只读发现：进程 %d 个（清退范围 %d 个），服务=%s，错误=%s",
+                 len(status.processes), len(status.user_processes),
+                 status.service_state.get("status") or "未知", status.error or "无")
+        return 0
+
+    log.warning("--restart：将清退并重启用户态 UU 远程进程（GameViewer / "
+                "GameViewerLauncher）；不动 GameViewerService。")
+    result = restart_user_app(ops, status=status,
+                              guard=RestartGuard(cooldown=float(args.cooldown)))
+    print("[清退重启] %s（%s）：%s" % (result.action, "成功" if result.ok else "未完成",
+                                  result.detail))
+    if result.killed:
+        print("  已清退 PID：%s" % ", ".join(str(pid) for pid in result.killed))
+    if result.launched:
+        print("  已按自启项重启：%s" % result.launched)
+    log.info("remote-app 清退重启结果：action=%s ok=%s", result.action, result.ok)
+    return 0 if result.ok else 1
+
+
 def route(session: requests.Session, args: argparse.Namespace,
           log: logging.Logger) -> int:
     """V0.3 P5 受控路由切换与路由卫士（快照 / 崩溃恢复 / 受控切换 / 受控 AUTO）。
@@ -1339,6 +1505,7 @@ def watch(session: requests.Session, args: argparse.Namespace,
     failures = 0
     timers = TimerTable()
     needs_user = False
+    verified_online = False   # 本段「在线」是否已做连接后上网校验（V0.4-1）
     while True:
         try:
             online, via = internet_ok(session)
@@ -1347,8 +1514,14 @@ def watch(session: requests.Session, args: argparse.Namespace,
                     log.info("公网恢复。")
                 failures = 0
                 needs_user = False
+                # V0.4-1：每次「在线」（含刚连上/刚恢复）校验一次真实上网；
+                # 失败只记日志，不影响探测节奏，也不触发重认证。
+                if not verified_online:
+                    verified_online = True
+                    _verify_after_connect(session, log)
                 # 注意：**不**重置认证冷却 —— 恢复不抹掉最短重连间隔（F09）
             else:
+                verified_online = False
                 failures += 1
                 if failures < args.threshold:
                     log.info("公网探测失败（%d/%d）：%s", failures, args.threshold,
@@ -1402,6 +1575,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--port", type=_port_type, default=None,
                           help="默认动态识别端口；可强制指定 1..65535 的端口")
     sub.add_parser("fix-bypass", help="把 Portal 地址写入系统代理绕过列表")
+    sub.add_parser(
+        "verify",
+        help="V0.4-1 连接后真实上网校验（跟随重定向抓真实页面，只读，失败退出码 1）")
     p_netcheck = sub.add_parser(
         "netcheck",
         help="V0.3 P1 只读三轴网络健康检查（不切换路由、不发认证）")
@@ -1493,6 +1669,16 @@ def build_parser() -> argparse.ArgumentParser:
                           help="把本次事件追加到 logs/remote_guard.jsonl（默认不写文件）")
     p_remote.add_argument("--json", action="store_true",
                           help="额外输出机器可读 JSON（远程保障契约）")
+    p_remote_app = sub.add_parser(
+        "remote-app",
+        help="V0.4-2/3 UU 远程（网易 GameViewer）后台：默认只读发现，--restart 清退重启")
+    p_remote_app.add_argument(
+        "--restart", action="store_true",
+        help="**有副作用**：清退并重启用户态 UU 远程进程（GameViewer / "
+             "GameViewerLauncher），不动 GameViewerService 与 Server/Healthd")
+    p_remote_app.add_argument(
+        "--cooldown", type=int, default=300,
+        help="两次真实清退的最小间隔秒数（默认 300）")
     for command in ("once", "watch"):
         p = sub.add_parser(command, help="单次尝试" if command == "once" else "常驻自动重连")
         p.add_argument("--ssid", default="SNNU", help="目标校园 Wi-Fi 名称，默认 SNNU")
@@ -1533,6 +1719,13 @@ def main() -> None:
     session = direct_session()
     if args.command == "status":
         status(session, args)
+    elif args.command == "verify":
+        ok, detail = verify_internet(session)
+        if ok:
+            log.info("连接后上网校验通过：%s", detail)
+        else:
+            log.error("连接后上网校验未通过（疑似「假死」）：%s", detail)
+        raise SystemExit(0 if ok else 1)
     elif args.command == "netcheck":
         raise SystemExit(netcheck(session, args, log))
     elif args.command == "failover":
@@ -1543,6 +1736,8 @@ def main() -> None:
         raise SystemExit(route(session, args, log))
     elif args.command == "remote":
         raise SystemExit(remote(session, args, log))
+    elif args.command == "remote-app":
+        raise SystemExit(remote_app(args, log))
     elif args.command == "fix-bypass":
         if not fix_bypass(log):
             raise SystemExit(1)

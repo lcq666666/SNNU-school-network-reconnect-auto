@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import socket
+import subprocess
 from dataclasses import dataclass
 from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple)
 
@@ -37,6 +39,9 @@ __all__ = [
     "WifiInterface", "CONNECTED_STATES", "parse_netsh_interfaces",
     "select_wifi_interface", "wifi_state_from_text", "parse_ipconfig_ipv4",
     "MUTEX_NAME", "SingleInstanceGuard", "acquire_single_instance",
+    # ---- V0.4-3：UU 远程用户态进程清退 / 分离式重启（方案 §3.2/§3.3）----
+    "kill_process", "launch_detached", "split_command_line",
+    "DETACHED_PROCESS", "CREATE_NO_WINDOW",
 ]
 
 PROXY_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -91,6 +96,32 @@ def tcp_probe(host: str, port: int, timeout: float = 0.5) -> bool:
     """TCP 可达性探测：仅说明「有进程在监听」，不证明一定是目标代理。"""
     with socket.create_connection((host, port), timeout=timeout):
         return True
+
+
+def tcp_probe_bound(host: str, port: int, timeout: float = 0.5,
+                    source_ip: Optional[str] = None) -> bool:
+    """**绑定源地址**的 TCP 可达性探测（F75-14）。
+
+    与 :func:`tcp_probe` 的唯一区别：先把套接字 ``bind((source_ip, 0))`` 再 ``connect``。
+    当该源地址不可用于到 ``host:port`` 的路径时连接会失败（``WSAEADDRNOTAVAIL`` 等），
+    而不是悄悄改走默认路由 —— 这正是多网卡场景需要的「接口级证据」。
+
+    未给 ``source_ip`` 时退化为 :func:`tcp_probe`（默认路由语义，供主链路使用）。
+    连接失败按「不可达」返回 ``False``，不抛异常（探测不得中断监测循环）。
+
+    注意：Windows 上「绑定源地址」仍**不等于**「证明出口」（见 ``campus_network``
+    的同类说明），本函数只作为接口级证据之一，真正的出口确认仍由路由/出口核对负责。
+    """
+    if not source_ip:
+        return tcp_probe(host, port, timeout)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.bind((str(source_ip), 0))
+            sock.connect((host, port))
+    except OSError:
+        return False
+    return True
 
 
 def validate_proxy_endpoint(endpoint: Any, probe: Optional[Callable] = None,
@@ -676,3 +707,103 @@ def acquire_single_instance(log: Any = None, kernel32: Any = None,
     """兼容层：获取成功返回 ``True``；已有实例 / 创建失败均返回 ``False``。"""
     return SingleInstanceGuard(kernel32=kernel32, get_last_error=get_last_error,
                                log=log).acquire().ok
+
+
+# --------------------------------------------------------------------------- #
+# V0.4-3 用户态进程清退 / 分离式重启（UU 远程 GameViewer）
+#
+# 仅用于**用户态**远控进程的清退重启（方案 §3.2）：不触碰 Windows 服务
+# （``GameViewerService`` 重启需 UAC），不动 ``GameViewerServer/Healthd``。
+# 失败一律**如实返回**（原样带上工具输出），绝不静默重试。
+# --------------------------------------------------------------------------- #
+#: 分离式启动：子进程不带控制台、不随本进程退出而结束（GUI 远控的正常启动方式）。
+DETACHED_PROCESS = 0x00000008
+#: 无窗口（命令行工具用；GUI 程序用 DETACHED_PROCESS）。
+CREATE_NO_WINDOW = 0x08000000
+
+
+def split_command_line(command: Any) -> List[str]:
+    """把 Windows 命令行切成 argv。
+
+    **Windows 语义**（``posix=False``）：反斜杠是普通字符、不做转义 —— 否则
+    ``C:\\_study\\GameViewer\\GameViewer.exe`` 会被 POSIX 规则吃掉反斜杠。
+    真机自启项实测写法为 ``"C:\\_study\\GameViewer\\GameViewer.exe" --auto-run``，
+    有引号与无引号两种写法本函数都能正确切分（详见 V0.4-3 单测）。
+    """
+    text = str(command or "").strip()
+    if not text:
+        return []
+    try:
+        parts = shlex.split(text, posix=False)
+    except ValueError:                     # 引号不配对等：按空白粗切，不抛异常
+        parts = text.split()
+    cleaned: List[str] = []
+    for part in parts:
+        if len(part) >= 2 and part.startswith('"') and part.endswith('"'):
+            part = part[1:-1]
+        if part:
+            cleaned.append(part)
+    return cleaned
+
+
+def kill_process(pid: int, timeout: float = 8.0) -> Tuple[bool, str]:
+    """强制清退指定 PID（``taskkill /PID <pid> /F``）。
+
+    **不经 shell**（无注入面）；返回 ``(是否成功, 说明)``，失败时带上工具原始输出。
+    进程不存在同样返回 ``False``（如实报告，不假装成功）。
+    """
+    try:
+        target = str(int(pid))
+    except (TypeError, ValueError):
+        return False, "非法 PID：%r" % (pid,)
+    try:
+        done = subprocess.run(
+            ["taskkill", "/PID", target, "/F"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+            creationflags=CREATE_NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, "taskkill 执行失败：%s" % type(exc).__name__
+    if done.returncode == 0:
+        return True, "已清退 PID %s" % target
+    detail = _decode_output(done.stderr) or _decode_output(done.stdout)
+    return False, "taskkill 返回 %s%s" % (
+        done.returncode, ("：%s" % detail) if detail else "")
+
+
+def launch_detached(command: Any, timeout: float = 8.0) -> Tuple[bool, str]:
+    """以**分离式**方式启动命令（不等待、不带控制台、随父进程退出而不结束）。
+
+    工作目录取可执行文件所在目录（远控程序常依赖相对路径的资源）；
+    取不到则继承当前目录。启动异常返回 ``(False, 说明)``，不抛异常。
+    """
+    argv = split_command_line(command)
+    if not argv:
+        return False, "重启命令为空，未启动任何进程"
+    cwd: Optional[str] = None
+    exe = argv[0]
+    if os.path.sep in exe or "/" in exe:
+        directory = os.path.dirname(exe)
+        if directory and os.path.isdir(directory):
+            cwd = directory
+    kwargs: Dict[str, Any] = {"creationflags": DETACHED_PROCESS, "close_fds": True}
+    if cwd:
+        kwargs["cwd"] = cwd
+    try:
+        subprocess.Popen(argv, **kwargs)     # noqa: S603 - 参数已切分且不经 shell
+    except (OSError, ValueError) as exc:
+        return False, "启动失败（%s）：%s" % (type(exc).__name__, exe)
+    return True, "已启动 %s" % " ".join(argv)
+
+
+def _decode_output(raw: Any) -> str:
+    """解码子进程输出（中文系统多为 GBK；失败再退回 UTF-8 / 忽略错误）。"""
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    for encoding in ("gbk", "utf-8"):
+        try:
+            return raw.decode(encoding).strip()
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace").strip()
