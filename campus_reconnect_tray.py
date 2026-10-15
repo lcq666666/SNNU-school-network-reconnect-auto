@@ -71,6 +71,8 @@ from campus_reconnect import (direct_session, edge_fallback,
 from campus_windows import CredentialStore, ProxyController, default_refresh
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
                                   parse_lock, parse_mode, tray_mode_label)
+from campus_tray_observer import (ObservationResult, TraySnapshotSource,
+                                  is_full_snapshot)
 from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
 from campus_remote import (MonitorWatchdog, RemoteSafetyGuard,
                            apply_watchdog_decision, build_windows_remote_ops)
@@ -93,6 +95,13 @@ WATCHDOG_HEARTBEAT_TIMEOUT = 90.0
 #: V0.3 P7 看门狗：重启频次上限（窗口内），超过转人工处理。
 WATCHDOG_MAX_RESTARTS = 3
 WATCHDOG_RESTART_WINDOW = 1800.0
+
+#: V0.3 P7.5-1 三轴观测：快照有效期 / 采集超时 / 采集最小间隔（秒）。
+#: 采集走**独立后台线程**（netdiag 的 PowerShell 只读管道），Tk 主线程不参与；
+#: 限流用于避免诊断进程堆积；过期或代次失效的快照一律不得用于 AUTO 决策。
+SNAPSHOT_MAX_AGE = 60.0
+SNAPSHOT_COLLECT_TIMEOUT = 25.0
+SNAPSHOT_MIN_INTERVAL = 10.0
 
 #: 托盘配置的完整键集合（保存时只写这些键，未知键永不落盘）。
 DEFAULT_CONFIG = {
@@ -503,8 +512,17 @@ class TrayApp:
         self._startup_timer = None
 
         # ---- V0.3 P6 故障切换桥接（默认仅监测；AUTO 需显式授权才接入执行器）----
-        #: 只读快照提供者（注入点；缺省用轻量快照，零 I/O）。
-        self._failover_snapshot_provider = None
+        #: 只读快照提供者（注入点）。P7.5-1 起**默认指向真实三轴观测**
+        #: （:meth:`_full_snapshot`：后台采集 + 可信度门禁），返回 ``None`` 时
+        #: 托盘只回退到轻量占位快照，且该快照**不授权**任何 AUTO 执行。
+        self._failover_snapshot_provider = self._full_snapshot
+        #: 三轴观测源（惰性构造；注入点 ``_snapshot_collector`` / ``_snapshot_spawn``
+        #: 便于离线测试替换采集能力与线程启动方式）。
+        self._snapshot_source = None
+        self._snapshot_collector = None
+        self._snapshot_spawn = None
+        #: 最近一次三轴观测结论（含可信度与证据；供 UI 与告警展示）。
+        self.last_observation = ObservationResult()
         #: 最近一次故障切换展示状态（由 :meth:`_failover_tick` 更新）。
         self.failover_status = None
 
@@ -582,37 +600,139 @@ class TrayApp:
                                                 wifi, args, self.log, guard)
 
     def _failover_owns_actions(self) -> bool:
-        """当前是否由故障切换管理器**独占**副作用（AUTO 模式）。
+        """**自动**副作用是否已由故障切换管理器独占（P7.5-1：全模式恒真）。
 
-        AUTO 下所有副作用（含 Portal 认证）交由 P3 单一副作用门调度，托盘
-        V0.2 的自动重连路径**让位**，避免出现两个副作用源（AGENTS §3.3）。
+        V0.3 P7.5-1 修复 F75-02：旧实现仅 ``AUTO`` 返回 ``True``，于是
+        MONITOR / LOCKED 下 V0.2 的 ``_run_repair()`` 自动重连照常触发
+        Portal 认证与 Wi-Fi 重连，形成**第二个副作用源**（违反 AGENTS §3.3）。
+
+        修复后：任何模式下**后台自动**副作用都只可能来自 P3 单一副作用门；
+        V0.2 自动重连路径已彻底移除，仅保留**显式手动**重连（:meth:`on_reconnect`）。
         """
-        bridge = getattr(self, "failover", None)
-        return bool(bridge is not None
-                    and bridge.mode is FailoverMode.AUTO)
+        return getattr(self, "failover", None) is not None
+
+    # ---------- 真实三轴观测（V0.3 P7.5-1，修复 F75-01）----------
+    def snapshot_source(self) -> TraySnapshotSource:
+        """惰性构造三轴观测源（构造过程零 I/O）。"""
+        if self._snapshot_source is None:
+            spawn = self._snapshot_spawn
+            self._snapshot_source = TraySnapshotSource(
+                collect=lambda: self._collect_health_snapshot(),
+                clock=lambda: time.monotonic(),
+                generation=lambda: self.config_version(),
+                max_age=SNAPSHOT_MAX_AGE,
+                collect_timeout=SNAPSHOT_COLLECT_TIMEOUT,
+                min_interval=SNAPSHOT_MIN_INTERVAL,
+                spawn=spawn,
+                log=lambda message: self.log.info("[观测] %s", message))
+        return self._snapshot_source
+
+    def _collect_health_snapshot(self):
+        """一次三轴采集（**在后台线程执行**，绝不阻塞 Tk 主线程）。"""
+        collector = self._snapshot_collector
+        if collector is not None:          # 注入点（离线测试 / 受控环境）
+            return collector()
+        return self._real_collect_health_snapshot()
+
+    def _real_collect_health_snapshot(self):
+        """真实三轴采集：``NetworkObserver`` + ``InterfaceHealthChecker`` + ``evaluate``。
+
+        全程**只读**（P0 ``netdiag`` 只读管道 + 只读探测），不切路由、不认证。
+        """
+        from tools import netdiag
+        from campus_network import (NetworkObserver, WindowsProbeEngine,
+                                    evaluate, resolve_roles)
+
+        cfg = self.get_config()
+        runner = netdiag.PowerShellRunner()
+        observer = NetworkObserver(runner)
+        report = observer.observe(target_ssid=cfg.get("ssid") or "SNNU")
+        roles = resolve_roles(report, engine._load_adapters_config())
+        return evaluate(report, WindowsProbeEngine(),
+                        system_probe=lambda: internet_ok(self.session),
+                        roles=roles, route_lookup=observer.route_lookup)
+
+    def _observe_snapshot(self, now: Optional[float] = None) -> ObservationResult:
+        """发起（必要时）并读取一次三轴观测；**永不阻塞**。
+
+        返回 :class:`ObservationResult`：``trusted`` 综合存在性 / 新鲜度 / 代次 /
+        采集错误 / 结构完整性。``light_snapshot`` 因缺少 ``recommendation`` 与
+        ``generated_at``，结构判定即为**不可信**，永远无法授权 AUTO 执行。
+        """
+        source = self.snapshot_source()
+        try:
+            source.request(now)
+        except Exception as exc:                     # 采集调度故障不得影响主流程
+            self.log.warning("三轴观测调度异常：%s", type(exc).__name__)
+        self.last_observation = source.observe(now)
+        return self.last_observation
+
+    def _full_snapshot(self):
+        """默认快照提供者：仅在观测**可信**时返回完整三轴快照。
+
+        不可信（缺失 / 过期 / 代次失效 / 结构不完整 / 采集失败）时返回 ``None``，
+        由 :meth:`_build_failover_snapshot` 回退到轻量占位快照 —— 该占位快照
+        **只用于显示**，不授权任何网络副作用。
+        """
+        observation = self._observe_snapshot()
+        return observation.snapshot if observation.trusted else None
+
+    def invalidate_snapshot(self, reason: str = "") -> int:
+        """作废旧的三轴观测代次（SSID / 模式 / 配置变化后调用）。"""
+        if self._snapshot_source is None:
+            return 0
+        return self._snapshot_source.invalidate(reason)
 
     def _build_failover_snapshot(self, online: bool):
-        """构造喂给状态机的只读快照（缺省轻量，零 I/O）。"""
+        """构造喂给状态机的只读快照。
+
+        - 提供者返回完整三轴快照 → 直接采用（AUTO 可据此执行）；
+        - 提供者返回 ``None`` 或抛错 → 轻量占位快照（**仅显示**，不授权切换）。
+        """
         provider = self._failover_snapshot_provider
+        snapshot = None
         if provider is not None:
             try:
-                return provider()
+                snapshot = provider()
             except Exception as exc:
                 self.log.warning("故障切换快照提供者异常：%s", type(exc).__name__)
-        return light_snapshot(system_online=bool(online),
-                              system_source="托盘轻量探测")
+                snapshot = None
+        observation = getattr(self, "last_observation", None)
+        if observation is None or observation.snapshot is not snapshot:
+            # 外部注入的提供者（兼容路径 / 测试）：只做**结构**判定，
+            # 不假定新鲜度 —— 轻量占位快照仍会被判为不可信。
+            observation = ObservationResult(
+                snapshot=snapshot,
+                trusted=bool(snapshot is not None and is_full_snapshot(snapshot)),
+                reason=("NO_DATA" if snapshot is None else "EXTERNAL_PROVIDER"),
+                detail="" if snapshot is None else "外部注入快照（未经新鲜度校验）")
+            self.last_observation = observation
+        if snapshot is None:
+            return light_snapshot(system_online=bool(online),
+                                  system_source="托盘轻量探测（占位，不授权切换）")
+        return snapshot
 
-    def _failover_tick(self, now: float, online: bool) -> None:
+    def _failover_tick(self, now: float, online: bool):
         """推进一轮故障切换状态机并刷新展示（不额外产生副作用）。"""
         bridge = getattr(self, "failover", None)
         if bridge is None:
-            return
+            return None
         self._remote_poll(now)      # V0.3 P7：先刷新远控状态（按间隔节流）
-        result = bridge.tick(now, self._build_failover_snapshot(online))
+        snapshot = self._build_failover_snapshot(online)
+        observation = getattr(self, "last_observation", None)
+        trusted = bool(observation is not None and observation.trusted)
+        # 可信度门禁（P7.5-1）：数据不足时 AUTO 一律拒绝执行网络副作用。
+        bridge.set_snapshot_trust(
+            trusted, observation.reason_text if observation is not None else "")
+        if not trusted and observation is not None:
+            self.log.info("三轴快照不可信（%s）：本轮不执行任何网络副作用",
+                          observation.reason_text)
+        result = bridge.tick(now, snapshot)
         self.failover_status = bridge.status()
         if result.executed:
             self.log.info("故障切换已执行动作：%s",
                           ", ".join(o.kind.value for o in result.executed))
+        return result
 
     # ---------- 远程保障（V0.3 P7）----------
     def enable_remote_guard(self, ops=None) -> Optional[RemoteSafetyGuard]:
@@ -1177,6 +1297,14 @@ class TrayApp:
         kind = cmd[0] if cmd else "probe"
         if kind == "reconnect":
             force = bool(cmd[1]) if len(cmd) > 1 else False
+            # P7.5-1：手动重连携带**请求时的配置版本**。若期间模式/配置已变更，
+            # 该请求即视为过期并丢弃 —— 旧任务不得在新模式下继续执行。
+            version = cmd[2] if len(cmd) > 2 else None
+            if version is not None and version != self._config_version:
+                self.log.info("丢弃过期手动重连请求（版本 %s != 当前 %s）",
+                              version, self._config_version)
+                self._repair_pending.clear()
+                return time.monotonic() + self._interval()
             self._run_repair(force=force)
             # 手动/强制重连已完成一次认证 → 登记**认证冷却**；但**不**推迟探测（P2）。
             self._timers.note_auth(time.monotonic(), self._cooldown())
@@ -1228,23 +1356,28 @@ class TrayApp:
                 self.set_state("offline", "公网探测失败（%d/%d）"
                                % (self.state["failures"], threshold))
             return self._next_probe_time(now)
-        if self.state["mode"] != "reconnecting":
-            self.set_state("reconnecting", "正在尝试重新连接",
-                           notify=("校园网已断开", "正在尝试重新连接，请稍候…"))
-            self._edge_opened_this_cycle = False   # 新的故障周期
-        if self._failover_owns_actions():
-            # AUTO：副作用统一由故障切换单一副作用门调度，V0.2 自动重连让位
-            # （AGENTS §3.3：一轮检测不得同时触发两类以上动作）。
-            return self._next_probe_time(now)
-        # 三表分离（P2）：认证冷却**只**门控新的认证，不门控探测 ——
-        # 探测节奏仍由 _next_probe_time 保持为 interval；冷却期内继续探测，
-        # 一旦公网恢复可在下一个 interval 内被发现，而不是等到冷却结束。
-        if not self._timers.auth_allowed(now):
-            return self._next_probe_time(now)
-        self._run_repair()
-        self.state["failures"] = 0
-        self._timers.note_auth(now, self._cooldown())
+        # ---- P7.5-1（F75-02）：后台**永不**自动认证 ----
+        # 旧实现在此调用 V0.2 的 ``_run_repair()``（Portal POST + Wi-Fi 重连），
+        # 于是 MONITOR / LOCKED 下也会出现第二个副作用源。修复后：自动副作用
+        # 只可能来自 P3 单一副作用门（AUTO 且已授权且快照可信）；其余模式
+        # 只如实显示故障并等待，或在菜单/设置面板由用户**显式**手动重连。
+        detail = self._offline_detail()
+        if self.state["mode"] != "offline" or self.state["detail"] != detail:
+            self.set_state("offline", detail)
         return self._next_probe_time(now)
+
+    def _offline_detail(self) -> str:
+        """达到失败阈值后的说明（按模式如实区分，不谎称"正在重连"）。"""
+        mode = self._current_mode()
+        failures = self.state["failures"]
+        threshold = self._threshold()
+        prefix = "公网探测连续失败（%d/%d）" % (failures, threshold)
+        if mode is FailoverMode.AUTO:
+            return (prefix + "：已交由故障切换调度器（单一副作用门），"
+                    "是否需要动作由三轴快照决定")
+        if mode is FailoverMode.LOCKED:
+            return prefix + "：手动锁定模式不自动认证/切换（可手动重连）"
+        return prefix + "：仅监测模式不自动认证（可在托盘菜单手动重连）"
 
     def _run_repair(self, force=False):
         """串行执行一次重连；重复请求合并（F01）。"""
@@ -1303,7 +1436,8 @@ class TrayApp:
             self.notify("无法启动", "网络工作线程启动失败")
             return False
         self._repair_pending.set()
-        self._commands.put(("reconnect", bool(force)))
+        # 第三个元素 = 请求时的配置版本（P7.5-1：模式/配置变更后丢弃旧请求）。
+        self._commands.put(("reconnect", bool(force), self.config_version()))
         return True
 
     def _request_manual_while_paused(self):
@@ -1357,8 +1491,14 @@ class TrayApp:
             self.icon.update_menu()
 
     def _sync_failover_from_config(self) -> None:
-        """把当前配置同步到桥接（模式/锁定/Clash/授权）。"""
+        """把当前配置同步到桥接（模式/锁定/Clash/授权）并作废旧观测代次。
+
+        P7.5-1：模式 / SSID / 锁定目标等变化后，必须作废在途的三轴采集结果，
+        否则旧数据（采集于变更之前）会被当作当前依据喂给状态机。
+        """
         cfg = self.get_config()
+        # 作废旧代次（内部自增 + 配置版本已变更，双重保险）。
+        self.invalidate_snapshot("故障切换配置已变更")
         bridge = getattr(self, "failover", None)
         if bridge is None:
             self.failover = self._build_failover_bridge()

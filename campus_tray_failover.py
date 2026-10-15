@@ -33,6 +33,7 @@ from campus_failover import (RELIABLE_FAILURE_STATES, UNRELIABLE_STATES,
                              TickResult)
 from campus_network import (HealthState, InterfaceHealth,
                             NetworkHealthSnapshot)
+from campus_tray_observer import RefusingExecutor
 
 __all__ = [
     "CONTRACT_VERSION", "MODE_ORDER", "DEFAULT_MODE", "DEFAULT_CLASH_KEEP",
@@ -359,6 +360,10 @@ class TrayFailoverBridge:
         self.last_result: Optional[TickResult] = None
         self._last_snapshot: Optional[NetworkHealthSnapshot] = None
         self._executor: Optional[Any] = None
+        #: V0.3 P7.5-1 快照可信度门禁：``None`` = 未评估；``False`` = 数据不足，
+        #: AUTO 下**拒绝**执行任何网络副作用（F75-01）。
+        self.snapshot_trust: Optional[bool] = None
+        self.snapshot_reason: str = ""
         self._sync_executor()
 
     # ---- 执行器接线（默认不接入；显式授权 + 工厂齐备才接入） ---- #
@@ -367,8 +372,37 @@ class TrayFailoverBridge:
         """单一副作用门当前是否已接入真实执行器（未接入=动作仅计划不执行）。"""
         return self.manager.scheduler.executor is not None
 
+    def set_snapshot_trust(self, trusted: bool, reason: str = "") -> bool:
+        """登记本轮快照的可信度，据此门控单一副作用门（P7.5-1）。
+
+        - ``trusted=True`` → 按「模式 + 授权 + 工厂」恢复真实执行器；
+        - ``trusted=False`` → 换成 :class:`RefusingExecutor`：动作照常登记为
+          "已尝试"，但 ``executed`` 恒为 ``False``，Portal POST / Wi-Fi 重连 /
+          Metric 写入**一个都不会发生**。
+        """
+        value = bool(trusted)
+        if self.snapshot_trust is not value or reason != self.snapshot_reason:
+            self._note("三轴快照可信度：%s（%s）"
+                       % ("可信" if value else "不可信", reason or "未说明"))
+        self.snapshot_trust = value
+        self.snapshot_reason = str(reason or "")
+        self._sync_executor()
+        return value
+
     def _sync_executor(self) -> None:
-        """按「模式 + 授权 + 工厂」决定单一副作用门是否接入真实执行器。"""
+        """按「快照可信度 + 模式 + 授权 + 工厂」决定单一副作用门的执行器。
+
+        门禁顺序（P7.5-1：**数据可信优先于授权**）：
+
+        1. 快照不可信 → :class:`RefusingExecutor`（零副作用，如实登记拒绝）；
+        2. 非 AUTO / 未授权 / 无工厂 → ``None``（动作仅计划不执行，P6 语义）；
+        3. AUTO + 已授权 + 工厂齐备 → 真实执行器。
+        """
+        if self.snapshot_trust is False:
+            self.manager.scheduler.executor = RefusingExecutor(
+                "三轴快照不可信：%s" % (self.snapshot_reason or "数据不足"),
+                log=self._log)
+            return
         want = (self.mode is FailoverMode.AUTO and self.authorized
                 and self.executor_factory is not None)
         if want:
@@ -491,6 +525,10 @@ class TrayFailoverBridge:
                 warnings.append("本轮已计划路由切换但未执行（模式 %s）"
                                 % result.mode.value)
             warnings.extend(n for n in result.notes if "告警" in n)
+        if self.snapshot_trust is False:
+            # V0.3 P7.5-1：数据不可信时明确告知"不会执行"，而不是静默无动作。
+            warnings.append("三轴快照不可信（%s）：本轮不执行任何网络副作用"
+                            % (self.snapshot_reason or "数据不足"))
         if manager.mode is FailoverMode.AUTO and not self.authorized:
             warnings.append("智能自动未授权：动作仅计划不执行（默认仅监测语义）")
         if locked and result is None:
