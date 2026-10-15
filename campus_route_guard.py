@@ -563,6 +563,7 @@ class RouteGuard:
         self.policy = policy or FailoverPolicy()
         self.journal = journal if journal is not None else RouteJournal()
         self.timers = timers
+        self._write_blocked = False
         self.authorized = bool(authorized)
         self._log = log
         self._now = now
@@ -643,6 +644,9 @@ class RouteGuard:
         if not self.authorized:
             return self._refuse(record, RouteGuardError.NOT_AUTHORIZED,
                                 "未授权真实路由变更（需 --yes 显式授权、前台上人）")
+        if self._write_blocked:
+            return self._refuse(record, RouteGuardError.PERMISSION_DENIED,
+                                "此前路由写入权限失败：已停止自动重试，需人工处理")
         if target not in ROUTE_TARGETS:
             return self._refuse(record, RouteGuardError.INVALID_TARGET,
                                 "非法切换目标：%r（允许 %s）"
@@ -703,6 +707,7 @@ class RouteGuard:
         for change in changes:
             ok = self._write(change)
             if not ok:
+                self._write_blocked = True
                 rollback_ok = self._restore(applied)
                 record.rolled_back = rollback_ok
                 record.status = (RouteStatus.ROLLED_BACK if rollback_ok

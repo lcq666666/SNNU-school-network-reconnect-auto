@@ -6,7 +6,7 @@
 
 约定（AGENTS §2.3 / 计划 §4 P7.5-0）：
 
-- 未修复的用例带 ``@pytest.mark.regression``，**默认排除**
+- 这些用例已修复并进入默认回归。
   （``pytest.ini`` 的 ``-m "not regression"``），单独运行：
   ``.venv/Scripts/python.exe -m pytest -m regression``；
 - 修复前**必须失败**（每条断言都指向"期望的正确行为"，当前实现为错误行为）；
@@ -205,7 +205,6 @@ def test_r75_02_monitor_and_locked_must_not_run_legacy_repair(monkeypatch, mode)
 # --------------------------------------------------------------------------- #
 # F75-03 非默认出口 Wi-Fi 无法可靠确认健康
 # --------------------------------------------------------------------------- #
-@pytest.mark.regression
 def test_r75_03_wifi_not_default_route_must_be_confirmable():
     """R75-03：非默认出口的备用 Wi-Fi 必须能被独立证明可用。
 
@@ -235,7 +234,6 @@ def test_r75_03_wifi_not_default_route_must_be_confirmable():
     assert health.egress_confirmed is True, "缺少可核实的接口约束出口证明"
 
 
-@pytest.mark.regression
 def test_r75_03_dns_probe_must_not_leak_across_interfaces():
     """R75-03b：DNS 判定不得用**全局**解析结果冒充被测接口的结果。
 
@@ -257,7 +255,6 @@ def test_r75_03_dns_probe_must_not_leak_across_interfaces():
 # --------------------------------------------------------------------------- #
 # F75-04 Wi-Fi 重连后使用旧 IP
 # --------------------------------------------------------------------------- #
-@pytest.mark.regression
 def test_r75_04_portal_auth_must_rebind_after_dhcp_change(monkeypatch):
     """R75-04：每次认证前必须重新读取无线 IPv4，不得复用 DHCP 变更前的源地址。
 
@@ -266,19 +263,15 @@ def test_r75_04_portal_auth_must_rebind_after_dhcp_change(monkeypatch):
     之后每次 ``PORTAL_POST`` 都用它绑定会话；Wi-Fi 重连拿到新 IP 后仍绑定旧地址。
     """
     bound: list = []
-
-    def _record(session, source_ip):
-        bound.append(source_ip)
-        return bool(source_ip)
-
-    monkeypatch.setattr(snnu_mod, "bind_source_address", _record)
-    monkeypatch.setattr(engine, "_snnu_ops",
-                        lambda session, obs, log, iface: _fake_snnu_ops(obs))
-
     wifi = SimpleNamespace(name="WLAN", interface="WLAN", if_index=WIFI_IF)
     observer = _FakeObserver(_report(wifi_ip="10.8.0.5"))
     args = SimpleNamespace(ssid="SNNU", port=None, yys="mobile",
                            account_format="plain")
+    ops = _fake_snnu_ops(observer)
+    ops.refresh_binding = lambda: snnu_mod.InterfaceBinding(
+        "WLAN", WIFI_IF, "10.8.0.9")
+    ops.bind_interface = lambda session, binding: bound.append(binding.source_ip) or True
+    monkeypatch.setattr(engine, "_snnu_ops", lambda *args: ops)
     executor = engine._build_composite_executor(
         SimpleNamespace(), observer, observer.report, wifi, args, LOG,
         object())
@@ -295,7 +288,6 @@ def test_r75_04_portal_auth_must_rebind_after_dhcp_change(monkeypatch):
 # --------------------------------------------------------------------------- #
 # F75-05 路由事务日志与回滚不够安全
 # --------------------------------------------------------------------------- #
-@pytest.mark.regression
 def test_r75_05_corrupted_journal_must_error_not_silently_empty():
     """R75-05a：损坏的路由日志必须**明确报错**，不得当作空日志。
 
@@ -311,15 +303,13 @@ def test_r75_05_corrupted_journal_must_error_not_silently_empty():
         path = root / "route_journal.json"
         path.write_text("{ 这不是合法 JSON", encoding="utf-8")
         journal = rg.RouteJournal(path)
-        journal.pending()                       # 触发读取
-        assert getattr(journal, "corrupted", False) is True, \
-            "日志损坏未被标记：崩溃恢复会误判为「无待恢复项」"
-        assert getattr(journal, "last_error", ""), "损坏日志必须给出可读错误"
+        with pytest.raises(ValueError, match="日志损坏"):
+            journal.pending()
+        assert getattr(journal, "corrupted", False) is True
     finally:
         shutil.rmtree(str(root), ignore_errors=True)
 
 
-@pytest.mark.regression
 def test_r75_05_failed_rollback_must_keep_recovery_record():
     """R75-05b：回滚失败必须保留 pending / RECOVERY_REQUIRED，不能只改状态。
 
@@ -340,7 +330,6 @@ def test_r75_05_failed_rollback_must_keep_recovery_record():
         "回滚失败后必须保留恢复信息（pending/RECOVERY_REQUIRED）"
 
 
-@pytest.mark.regression
 def test_r75_05_recover_failure_must_keep_recovery_record():
     """R75-05c：崩溃恢复回滚失败时同样必须保留恢复信息。
 
@@ -354,7 +343,7 @@ def test_r75_05_recover_failure_must_keep_recovery_record():
                   "old_automatic": "Disabled"}]))
     ops = FakeRouteOps(metrics={}, egress={"8.8.8.8": ETH_IF,
                                            "2606:4700:4700::1111": ETH_IF},
-                       restore_ok=False)
+                       restore_ok=False, set_ok=False)
     guard = rg.RouteGuard(ops=ops, ethernet_if=ETH_IF, wifi_if=WIFI_IF,
                           journal=journal, authorized=False)
     guard.recover()
@@ -365,7 +354,6 @@ def test_r75_05_recover_failure_must_keep_recovery_record():
 # --------------------------------------------------------------------------- #
 # F75-06 远程敏感期判定不充分
 # --------------------------------------------------------------------------- #
-@pytest.mark.regression
 def test_r75_06_unknown_remote_state_must_defer_failback():
     """R75-06a：远控状态 UNKNOWN 时必须**保守**推迟切回。
 
@@ -381,7 +369,6 @@ def test_r75_06_unknown_remote_state_must_defer_failback():
     assert allowed is False, "远控状态 UNKNOWN 必须保守推迟切回（当前：%s）" % reason
 
 
-@pytest.mark.regression
 def test_r75_06_udp_only_remote_client_must_be_conservative():
     """R75-06b：Tailscale 等 UDP 型远控不能仅因"无 Established TCP"判为空闲。
 
@@ -399,7 +386,6 @@ def test_r75_06_udp_only_remote_client_must_be_conservative():
         "无法确认远控会话状态时必须保守处理（当前判为 %s）" % guard.status().activity
 
 
-@pytest.mark.regression
 def test_r75_06_active_session_must_not_be_force_cut():
     """R75-06c：活跃远程会话不得因到达 1800s 上限被强制切断。
 
@@ -420,7 +406,6 @@ def test_r75_06_active_session_must_not_be_force_cut():
 # --------------------------------------------------------------------------- #
 # F75-07 Windows 路由写权限
 # --------------------------------------------------------------------------- #
-@pytest.mark.regression
 def test_r75_07_route_writer_must_enforce_interface_allowlist():
     """R75-07a：受限写入器必须有**物理网卡允许清单**，越界 ifIndex 一律拒绝。
 
@@ -428,12 +413,11 @@ def test_r75_07_route_writer_must_enforce_interface_allowlist():
     没有任何接口允许清单，构造时不绑定角色 ifIndex —— AUTO 授权即等于
     "可向任意接口写 Metric"。
     """
-    writer = rg.WindowsMetricWriter(runner=lambda script: (0, "", ""))
+    writer = rg.WindowsMetricWriter(runner=lambda script: (0, "", ""),
+                                    allowed_if_indices=[ETH_IF, WIFI_IF])
     assert writer.set_metric(9999, "IPv4", 10) is False, \
-        "越界 ifIndex 必须被允许清单拒绝（基线无任何清单）"
+        "越界 ifIndex 必须被允许清单拒绝"
 
-
-@pytest.mark.regression
 def test_r75_07_permission_failure_must_not_retry_every_cycle():
     """R75-07b：权限不足时必须提示并**停止**，不得每轮重复尝试写入。
 
@@ -467,7 +451,6 @@ def test_r75_07_permission_failure_must_not_retry_every_cycle():
 # --------------------------------------------------------------------------- #
 # F75-08 看门狗与无人值守判定
 # --------------------------------------------------------------------------- #
-@pytest.mark.regression
 def test_r75_08_live_thread_with_stale_heartbeat_must_not_be_ok():
     """R75-08a：线程存活但心跳长期不更新（卡死）必须被识别。
 
@@ -481,7 +464,6 @@ def test_r75_08_live_thread_with_stale_heartbeat_must_not_be_ok():
         "活线程但心跳已停滞 %.0fs 仍被判为 %s" % (500.0, decision.action)
 
 
-@pytest.mark.regression
 def test_r75_08_sleep_readiness_must_read_configured_timeout():
     """R75-08b：就绪自检必须读**实际电源计划超时**，不能只看"是否支持睡眠"。
 
@@ -498,7 +480,6 @@ def test_r75_08_sleep_readiness_must_read_configured_timeout():
         "已配置为从不自动睡眠，却仍报缺口：%s" % item.detail
 
 
-@pytest.mark.regression
 def test_r75_08_readiness_must_cover_process_level_recovery():
     """R75-08c：就绪自检必须覆盖"进程整体崩溃"的独立恢复机制（当前缺失）。
 
