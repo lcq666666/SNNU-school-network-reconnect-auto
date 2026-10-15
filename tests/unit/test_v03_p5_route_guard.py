@@ -436,3 +436,14 @@ def test_u5_19_failed_recovery_keeps_pending_record(tmp_path):
     assert recovered.status is RouteStatus.RECOVERY_REQUIRED
     assert recovered.error == RouteGuardError.ROLLBACK_FAILED.value
     assert RouteJournal(path).pending() is not None
+
+
+def test_u5_20_metric_writer_enforces_physical_interface_allowlist():
+    calls = []
+    writer = WindowsMetricWriter(
+        runner=lambda script: calls.append(script) or (0, "", ""),
+        allowed_if_indices=[ETH_IF, WIFI_IF])
+    assert writer.set_metric(9999, "IPv4", 10) is False
+    assert calls == []
+    assert writer.set_metric(WIFI_IF, "IPv4", 50) is True
+    assert len(calls) == 1

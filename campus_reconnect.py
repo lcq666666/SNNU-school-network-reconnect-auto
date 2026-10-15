@@ -880,7 +880,10 @@ def _build_route_guard(observer: Any, runner: Any, eth: Any, wifi: Any,
         auth_cooldown=float(max(0, getattr(args, "auth_cooldown", 180))),
         switch_min_interval=float(max(0, getattr(args, "switch_min_interval", 300))))
     return RouteGuard(
-        ops=build_windows_route_ops(observer, runner),
+        ops=build_windows_route_ops(
+            observer, runner, allowed_if_indices=[value for value in (
+                getattr(eth, "if_index", None), getattr(wifi, "if_index", None))
+                if value is not None]),
         ethernet_if=eth.if_index if eth is not None else None,
         wifi_if=wifi.if_index if wifi is not None else None,
         policy=policy,

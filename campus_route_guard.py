@@ -1035,9 +1035,12 @@ class WindowsMetricWriter:
                          "-Confirm:$false")
 
     def __init__(self, runner: Optional[Callable[[str], Tuple[int, str, str]]]
-                 = None, timeout: float = 25.0) -> None:
+                 = None, timeout: float = 25.0,
+                 allowed_if_indices: Optional[Sequence[int]] = None) -> None:
         self.runner = runner or (lambda script: _default_write_runner(script,
                                                                      timeout))
+        self.allowed_if_indices = (None if allowed_if_indices is None else
+                                   frozenset(int(value) for value in allowed_if_indices))
 
     def _execute(self, script: str) -> bool:
         assert_write_allowed(script)
@@ -1048,13 +1051,17 @@ class WindowsMetricWriter:
         return int(rc) == 0
 
     def set_metric(self, if_index: int, family: str, metric: int) -> bool:
+        if (self.allowed_if_indices is not None
+                and int(if_index) not in self.allowed_if_indices):
+            return False
         return self._execute(self.SET_METRIC.format(
             if_index=int(if_index), family=str(family), metric=int(metric)))
-
     def restore_automatic(self, if_index: int, family: str) -> bool:
+        if (self.allowed_if_indices is not None
+                and int(if_index) not in self.allowed_if_indices):
+            return False
         return self._execute(self.RESTORE_AUTOMATIC.format(
             if_index=int(if_index), family=str(family)))
-
 
 def _default_write_runner(script: str, timeout: float) -> Tuple[int, str, str]:
     """默认写入执行器（Windows only；``powershell -Command``）。"""
@@ -1075,16 +1082,13 @@ def _default_write_runner(script: str, timeout: float) -> Tuple[int, str, str]:
 
 
 def build_windows_route_ops(observer: Any, runner: Any,
-                            writer: Optional[WindowsMetricWriter] = None
+                            writer: Optional[WindowsMetricWriter] = None,
+                            allowed_if_indices: Optional[Sequence[int]] = None
                             ) -> RouteOps:
-    """组装真实 :class:`RouteOps`：读经 P0 ``netdiag`` 只读管道，写经受限写入器。
-
-    ``observer`` 为 :class:`campus_network.NetworkObserver`（提供 ``route_lookup``），
-    ``runner`` 为只读命令执行器（``netdiag.PowerShellRunner`` 或假件）。
-    """
+    """组装真实 RouteOps：读经只读管道，写经受限写入器。"""
     from tools import netdiag
 
-    writer = writer or WindowsMetricWriter()
+    writer = writer or WindowsMetricWriter(allowed_if_indices=allowed_if_indices)
 
     def _read_metrics() -> Dict[int, MetricState]:
         rc, out, _err = runner.run("ip_interfaces",
