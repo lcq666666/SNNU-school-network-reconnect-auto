@@ -197,8 +197,15 @@ def test_i6_05_clash_untouched_during_switch():
 # --------------------------------------------------------------------------- #
 # I-6-06 托盘探测循环集成：MONITOR 照常 / AUTO 让位
 # --------------------------------------------------------------------------- #
-def test_i6_06_tray_probe_delegates_to_failover_in_auto(monkeypatch,
+def test_i6_06_tray_probe_never_runs_legacy_auto_repair(monkeypatch,
                                                         virtual_clock):
+    """I-6-06（V0.3 P7.5-1 修订）：**任何模式**下后台都不跑 V0.2 自动重连。
+
+    P7.5-1 前：MONITOR 下 ``_probe_tick`` 达阈值即 ``_run_repair()``
+    （Portal 认证 + Wi-Fi 重连），与 V0.3 调度器形成第二个副作用源（F75-02）。
+    P7.5-1 后：MONITOR / LOCKED / AUTO 三种模式的后台自动路径均为**零**，
+    只有显式手动命令（``reconnect``）才会走到 ``_run_repair``。
+    """
     app = _make_app(monkeypatch, interval=int(INTERVAL), threshold=3,
                     cooldown=180)
     virtual_clock.install(monkeypatch, tray)
@@ -214,22 +221,32 @@ def test_i6_06_tray_probe_delegates_to_failover_in_auto(monkeypatch,
     monkeypatch.setattr(app, "_run_repair",
                         lambda force=False: repairs.append(virtual_clock.monotonic()))
 
-    # MONITOR：V0.2 自动重连照常（第 3 次失败触发）
+    # MONITOR：连续 3 次失败 → 后台**零**认证
     nxt = app._probe_tick(0.0)
     for _ in range(2):
         virtual_clock.advance(INTERVAL)
         nxt = app._probe_tick(nxt)
-    assert repairs == [30.0], repairs
+    assert repairs == [], repairs
     assert app.failover_status is not None
 
-    # AUTO：副作用让位给故障切换单一副作用门 → 不再触发 V0.2 自动重连
+    # LOCKED：同样零后台副作用
+    app.apply_mode("LOCKED")
+    for _ in range(3):
+        virtual_clock.advance(INTERVAL)
+        nxt = app._probe_tick(nxt)
+    assert repairs == [], repairs
+
+    # AUTO：副作用统一由 P3 单一副作用门调度 → 仍不经由 V0.2 自动重连
     app.apply_mode("AUTO")
-    repairs.clear()
     for _ in range(3):
         virtual_clock.advance(INTERVAL)
         nxt = app._probe_tick(nxt)
     assert repairs == [], repairs
     assert app._failover_owns_actions() is True
+
+    # 唯一合法入口：用户显式手动重连（携带当前配置版本）
+    app._dispatch(("reconnect", True, app.config_version()), nxt)
+    assert len(repairs) == 1, repairs
 
 
 # --------------------------------------------------------------------------- #

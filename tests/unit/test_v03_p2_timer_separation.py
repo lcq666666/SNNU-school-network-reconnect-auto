@@ -191,7 +191,13 @@ def test_u2_06_watch_needs_user_still_probes(monkeypatch, virtual_clock):
 # --------------------------------------------------------------------------- #
 def test_u2_07_tray_probes_continue_through_auth_cooldown(monkeypatch,
                                                           virtual_clock):
-    """托盘 _probe_tick：冷却期探测照常进行，认证被单独门控。"""
+    """托盘 _probe_tick：冷却期探测照常进行，认证被单独门控（P7.5-1 后重述）。
+
+    P7.5-1（F75-02）后 ``_probe_tick`` 不再自动认证：认证只可能来自
+    ① 用户显式手动重连，或 ② P3 单一副作用门（AUTO + 已授权 + 快照可信）。
+    本用例因此先显式触发一次手动重连登记冷却，再断言：冷却期探测照常、
+    且**后台**不会再自动发起认证。
+    """
     app = _make_app(monkeypatch, interval=int(INTERVAL), threshold=1,
                     cooldown=int(COOLDOWN))
     virtual_clock.install(monkeypatch, tray)
@@ -206,9 +212,14 @@ def test_u2_07_tray_probes_continue_through_auth_cooldown(monkeypatch,
     monkeypatch.setattr(app, "_run_repair",
                         lambda force=False: attempts.append(virtual_clock.monotonic()))
 
-    nxt = app._probe_tick(0.0)                 # t=0：失败 → 认证
-    assert attempts == [0.0]
+    nxt = app._probe_tick(0.0)                 # t=0：失败，后台**不**认证
+    assert attempts == [], "后台自动认证入口已移除（F75-02）：%r" % attempts
     assert nxt == INTERVAL, "认证冷却推迟了探测：%r" % nxt
+
+    # 显式手动重连 → 登记 COOLDOWN 秒认证冷却
+    app._dispatch(("reconnect", False, app.config_version()), nxt)
+    assert attempts == [0.0]
+    assert app._timers.auth_ready_at == COOLDOWN, app._timers.auth_ready_at
 
     for expected_next in (30.0, 45.0, 60.0):   # t=15 / 30 / 45 照常探测
         virtual_clock.advance(INTERVAL)
@@ -217,10 +228,10 @@ def test_u2_07_tray_probes_continue_through_auth_cooldown(monkeypatch,
     assert probed == [0.0, 15.0, 30.0, 45.0], probed
     assert attempts == [0.0], "冷却期内重复认证：%r" % attempts
 
-    virtual_clock.advance(135.0)               # t=180：冷却结束 → 允许再次认证
+    virtual_clock.advance(135.0)               # t=180：冷却结束
     app._probe_tick(180.0)
-    assert len(attempts) == 2, attempts
-    assert attempts[1] - attempts[0] >= COOLDOWN, attempts
+    assert attempts == [0.0], ("后台不得自动认证（即使冷却已结束）：%r"
+                               % attempts)
 
 
 def test_u2_08_tray_manual_reconnect_registers_auth_cooldown_only(monkeypatch,
@@ -244,10 +255,14 @@ def test_u2_08_tray_manual_reconnect_registers_auth_cooldown_only(monkeypatch,
 # --------------------------------------------------------------------------- #
 def test_i2_01_offline_closed_loop_recovery_within_one_interval(monkeypatch,
                                                                virtual_clock):
-    """离线闭合回路：故障→认证→冷却窗口内恢复，探测不中断、认证不重复。
+    """离线闭合回路：故障持续→**后台零认证**→恢复被及时探测到（P7.5-1 后重述）。
 
-    剧本：t=0..30 全断（连续 3 次达阈值 → t=30 触发一次认证）；
-    t=45 起公网恢复。断言：探测每 15s 一次贯穿全程；认证全程仅一次。
+    剧本：t=0..30 全断（连续 3 次达阈值）；t=45 起公网恢复。断言：
+
+    - 探测每 15s 一次贯穿全程（与认证冷却无关，P2）；
+    - **后台自动认证次数为 0**（F75-02：``_probe_tick`` 不再自行认证）；
+    - 达到阈值后状态如实显示为 ``offline`` 并给出"不自动认证"的说明；
+    - 恢复在下一个 interval 内被发现（t=45）。
     """
     app = _make_app(monkeypatch, interval=int(INTERVAL), threshold=3,
                     cooldown=int(COOLDOWN))
@@ -266,14 +281,16 @@ def test_i2_01_offline_closed_loop_recovery_within_one_interval(monkeypatch,
 
     nxt = app._probe_tick(0.0)                 # t=0 失败（1/3）
     assert probed == [0.0] and attempts == []
-    for _ in range(2):                         # t=15（2/3）、t=30（3/3 → 认证）
+    for _ in range(2):                         # t=15（2/3）、t=30（3/3 达阈值）
         virtual_clock.advance(INTERVAL)
         nxt = app._probe_tick(nxt)
-    assert attempts == [30.0], attempts
+    assert attempts == [], ("达阈值后后台不得自动认证：%r" % attempts)
     assert probed == [0.0, 15.0, 30.0], probed
+    assert app.state["mode"] == "offline", app.state
+    assert "不自动认证" in app.state["detail"], app.state
 
-    virtual_clock.advance(INTERVAL)            # t=45：冷却期内探测 → 发现恢复
+    virtual_clock.advance(INTERVAL)            # t=45：探测 → 发现恢复
     nxt = app._probe_tick(nxt)
     assert probed == [0.0, 15.0, 30.0, 45.0], probed
     assert app.state["mode"] == "online", app.state
-    assert attempts == [30.0], "副作用清单：全程应仅一次认证：%r" % attempts
+    assert attempts == [], ("全程后台副作用清单应为空：%r" % attempts)

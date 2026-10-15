@@ -374,13 +374,23 @@ def test_u6_20_auto_requires_explicit_authorization(monkeypatch):
     assert app._current_mode() is FailoverMode.MONITOR
 
 
-def test_u6_21_failover_owns_actions_only_in_auto(monkeypatch):
+def test_u6_21_failover_owns_automatic_actions_in_all_modes(monkeypatch):
+    """U-6-21（V0.3 P7.5-1 修订）：**自动**副作用在**所有模式**下都由调度器独占。
+
+    P7.5-1 前：``_failover_owns_actions()`` 仅 AUTO 为真，于是 MONITOR/LOCKED
+    下 V0.2 自动重连照常触发认证（F75-02）。修复后该方法在任何模式都返回
+    ``True`` —— 含义是"后台自动副作用**只可能**来自 P3 单一副作用门"，
+    而 V0.2 自动重连路径已被整体移除（仅保留显式手动重连）。
+    """
     app = _make_app(monkeypatch)
-    assert app._failover_owns_actions() is False
+    assert app._failover_owns_actions() is True
     app.failover.set_mode("LOCKED")
-    assert app._failover_owns_actions() is False
+    assert app._failover_owns_actions() is True
     app.failover.set_mode("AUTO")
     assert app._failover_owns_actions() is True
+    # 桥接缺失（构造异常）时回退为 False，不臆断
+    app.failover = None
+    assert app._failover_owns_actions() is False
 
 
 # --------------------------------------------------------------------------- #

@@ -81,8 +81,11 @@ def test_watch_probes_continue_during_auth_cooldown(monkeypatch, virtual_clock):
 def test_tray_probes_continue_during_auth_cooldown(monkeypatch, virtual_clock):
     """托盘 _probe_tick：认证冷却期内探测**不暂停**（P2 修复后断言）。
 
-    P0 取证（缺陷）：t=0 失败→认证；t=15 的 tick 跳过探测；t=180 才恢复探测。
-    P2 修复后：t=15 照常探测；仅当 ``auth_allowed`` 为假时跳过**认证**。
+    P0 取证（缺陷）：t=0 失败→**自动**认证；t=15 的 tick 跳过探测；t=180 才恢复探测。
+    P2 修复后：t=15 照常探测，探测节奏与认证冷却解耦。
+    P7.5-1 修复后：``_probe_tick`` **不再**自动认证（F75-02），认证只来自显式
+    手动重连或 P3 单一副作用门；本用例因此改为先显式触发一次手动重连以登记冷却，
+    再断言冷却期内的探测节奏不受影响。
     """
     app = _make_app(monkeypatch, interval=INTERVAL, threshold=1,
                     cooldown=COOLDOWN)
@@ -98,9 +101,13 @@ def test_tray_probes_continue_during_auth_cooldown(monkeypatch, virtual_clock):
                         lambda force=False: attempts.append(virtual_clock.monotonic()))
     monkeypatch.setattr(tray, "internet_ok", fake_internet_ok)
 
-    nxt = app._probe_tick(0.0)                 # t=0：失败 → 认证
-    assert attempts == [0.0]
+    nxt = app._probe_tick(0.0)                 # t=0：探测失败，后台**不**认证
+    assert attempts == [], "后台自动认证入口已移除（F75-02）：%r" % attempts
     assert probed == [0.0]
+
+    # 显式手动重连（唯一合法入口）→ 登记 180s 认证冷却
+    app._dispatch(("reconnect", False, app.config_version()), nxt)
+    assert attempts == [0.0]
 
     virtual_clock.advance(INTERVAL)            # t=15：探测照常进行
     result = app._probe_tick(nxt)

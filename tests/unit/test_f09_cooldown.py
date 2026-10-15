@@ -125,7 +125,16 @@ def _make_app(monkeypatch, **overrides):
 
 
 def test_t20_tray_recovery_does_not_reset_cooldown(monkeypatch, virtual_clock):
-    """托盘：探测恢复后仍不得早于 cooldown 再次认证；冷却期探测不暂停（P2）。"""
+    """托盘：后台不再自动认证（P7.5-1 F75-02）；冷却期探测不暂停（P2）。
+
+    P7.5-1 前后对照：
+    - 修复前：``_probe_tick`` 在失败达到阈值后直接 ``_run_repair()``，
+      并把 ``max(now+interval, auth_ready_at)`` 叠加到探测节奏上（P0 取证缺陷）；
+    - 修复后：``_probe_tick`` **永不**自动认证，认证只可能来自
+      ① 用户**显式**手动重连（:meth:`on_reconnect`）或
+      ② P3 单一副作用门（AUTO 且已授权且快照可信）；
+      探测节奏恒为 ``now + interval``，与认证冷却无关。
+    """
     app = _make_app(monkeypatch, interval=int(INTERVAL), threshold=1, cooldown=180)
     virtual_clock.install(monkeypatch, tray)
     attempts: list = []
@@ -139,11 +148,16 @@ def test_t20_tray_recovery_does_not_reset_cooldown(monkeypatch, virtual_clock):
                         lambda force=False: attempts.append(virtual_clock.monotonic()))
     monkeypatch.setattr(tray, "internet_ok", fake_internet_ok)
 
-    nxt = app._probe_tick(0.0)          # t=0 失败 → 触发一次重连
-    assert attempts == [0.0]
+    nxt = app._probe_tick(0.0)          # t=0 失败：后台**不**自动认证
+    assert attempts == [], "MONITOR 下不得后台自动认证：%r" % attempts
     assert nxt == INTERVAL, "认证冷却推迟了探测：%r" % nxt
 
-    # 冷却期内：探测每 interval 一次照常进行，但不再认证
+    # 唯一合法的托盘认证入口：用户显式手动重连（登记认证冷却）
+    app._dispatch(("reconnect", False, app.config_version()), nxt)
+    assert attempts == [0.0]
+    assert app._timers.auth_ready_at == 180.0, app._timers.auth_ready_at
+
+    # 冷却期内：探测每 interval 一次照常进行，但不再自动认证
     for expected_next in (2 * INTERVAL, 3 * INTERVAL, 4 * INTERVAL):
         virtual_clock.advance(INTERVAL)
         nxt = app._probe_tick(nxt)
@@ -153,5 +167,5 @@ def test_t20_tray_recovery_does_not_reset_cooldown(monkeypatch, virtual_clock):
 
     virtual_clock.advance(135.0)        # t=180：冷却结束
     app._probe_tick(180.0)
-    assert len(attempts) == 2, attempts
-    assert attempts[1] - attempts[0] >= 180
+    assert attempts == [0.0], "后台自动认证入口已移除：%r" % attempts
+    assert probed[-1] == 180.0, probed
