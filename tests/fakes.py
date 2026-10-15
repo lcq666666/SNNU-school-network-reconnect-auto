@@ -822,7 +822,8 @@ class FakeRemoteAppOps:
 
     def __init__(self, processes=None, service=None, run_entries=None,
                  kill_results=True, launch_results=True, probe_error=None,
-                 service_error=None) -> None:
+                 service_error=None, launch_spawns=True, spawn_pid=9001,
+                 spawn_name="GameViewer.exe") -> None:
         # 内部存储刻意加下划线：属性名不得与方法名 ``run_entries`` 等冲突
         # （``campus_remote_app.discover`` 按 ``ops.run_entries()`` 调用）。
         self._processes = [dict(row) for row in (processes or [])]
@@ -832,6 +833,11 @@ class FakeRemoteAppOps:
         self.launch_results = launch_results
         self.probe_error = probe_error
         self.service_error = service_error
+        #: 启动命令成功执行后是否**真的**出现新进程（真机实测：stub 立刻退出、
+        #: 主程序另起，故"命令成功"≠"起来了"；``False`` 用来构造假成功）。
+        self.launch_spawns = launch_spawns
+        self.spawn_pid = int(spawn_pid)
+        self.spawn_name = spawn_name
         self.killed: List[int] = []
         self.launched: List[str] = []
         self.list_calls = 0
@@ -866,9 +872,19 @@ class FakeRemoteAppOps:
     # ---- 有副作用 ----
     def kill(self, pid: int) -> bool:
         self.killed.append(int(pid))
-        return self._result(self.kill_results, pid=pid)
+        success = self._result(self.kill_results, pid=pid)
+        if success:                       # 真实语义：清退成功后该进程不再出现
+            self._processes = [row for row in self._processes
+                               if int(row.get("pid", -1)) != int(pid)]
+        return success
 
     def launch(self, command: str) -> bool:
-        self.launched.append(str(command))
-        return self._result(self.launch_results)
+        self.launched.append(command)
+        success = self._result(self.launch_results)
+        if success and self.launch_spawns:   # 命令成功且**真的**起来了
+            self._processes = [{"pid": self.spawn_pid,
+                                "process_name": self.spawn_name,
+                                "path": r"C:\_study\GameViewer\bin\%s"
+                                        % self.spawn_name}]
+        return success
 

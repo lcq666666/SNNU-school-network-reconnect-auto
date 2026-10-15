@@ -62,6 +62,10 @@ def _attach_fake_restart(app, monkeypatch, **ops_kwargs):
     ops = _fake_ops(**ops_kwargs)
     app._remote_app_ops = ops
     monkeypatch.setattr(tray, "verify_internet", lambda session: (True, "ok"))
+    # 默认测试集零真实 sleep：确认轮询的休眠换成空操作（AGENTS §2.4）。
+    import campus_remote_app as cra
+
+    monkeypatch.setattr(cra, "_SLEEP", lambda seconds: None)
     return ops
 
 

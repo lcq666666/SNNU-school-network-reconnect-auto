@@ -66,6 +66,14 @@ GAMEVIEWER_PATTERNS: Tuple[str, ...] = ("gameviewer", "uuyc")
 #: 两次真实清退的最小间隔（秒）——方案 §3.3。
 DEFAULT_RESTART_COOLDOWN = 300.0
 
+#: 重启后**确认进程真的回来**的轮询次数与间隔（stub 会立刻退出、主程序另起，
+#: 故必须以"进程出现"为准；真机实测约 1–3s，给足余量）。
+RESTART_CONFIRM_ATTEMPTS = 4
+RESTART_CONFIRM_INTERVAL = 2.5
+
+#: 可注入的休眠：默认测试集**零真实 sleep**（AGENTS §2.4），由测试替换为空操作。
+_SLEEP = time.sleep
+
 def _norm(name: Any) -> str:
     """进程名归一：小写 + **去掉尾部 ``.exe``**。
 
@@ -389,7 +397,7 @@ class RestartResult:
     """一次清退/重启的结构化结果（如实报告，绝不谎报成功）。"""
 
     ok: bool
-    action: str                       # restart / noop / skipped / failed
+    action: str          # restart / noop / skipped / failed / unconfirmed
     detail: str
     killed: List[int] = field(default_factory=list)
     launched: str = ""
@@ -428,7 +436,8 @@ class RestartGuard:
 
 def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
                      guard: Optional[RestartGuard] = None,
-                     now: Optional[float] = None) -> RestartResult:
+                     now: Optional[float] = None,
+                     sleep: Optional[Callable[[float], None]] = None) -> RestartResult:
     """清退并重启 UU 远程**用户态**进程（方案 §3.2/§3.3）。
 
     行为约束（每条都对应一个单测）：
@@ -439,7 +448,10 @@ def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
     3. **找不到重启命令 ⇒ fail-closed**：一个进程都不清退（避免清退了却起不来）；
     4. **清退失败立即中止**且不启动新实例（避免两个实例抢会话）；
     5. **启动失败如实报告**（``action="failed"``，带明细）；
-    6. 冷却期内拒绝（``action="skipped"``），零副作用。
+    6. **启动成功 ≠ 起来了**：必须确认用户态进程真的出现；确认不到则补一次启动，
+       仍确认不到 ⇒ ``action="unconfirmed"`` 如实报失败（真机实测过"命令成功但
+       应用没回来"，见 `docs/V0.4…` §4.4）；
+    7. 冷却期内拒绝（``action="skipped"``），零副作用。
     """
     current = status if status is not None else discover(ops)
     pending = current.user_processes
@@ -471,14 +483,18 @@ def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
                        % (proc.name, proc.pid))
         killed.append(proc.pid)
 
-    try:
-        launched = bool(ops.launch(command))
-    except Exception:                                     # noqa: BLE001
-        launched = False
-    if not launched:
+    sleeper = sleep if sleep is not None else _SLEEP
+    outcome = _launch_and_confirm(ops, command, sleeper)
+    if outcome == "launch-failed":
         return RestartResult(
             ok=False, action="failed", killed=killed,
             detail="已清退 %d 个进程，但重启命令执行失败：%s" % (len(killed), command))
+    if outcome != "confirmed" and _launch_and_confirm(ops, command, sleeper) != "confirmed":
+        return RestartResult(
+            ok=False, action="unconfirmed", killed=killed, launched=command,
+            detail="已清退 %d 个用户态进程并执行了重启命令，但未确认到 UU 远程"
+                   "进程回来：请手动启动一次 UU 远程（下次登录自启也会拉起）"
+                   % len(killed))
 
     if guard is not None:
         guard.mark(now)
@@ -486,3 +502,25 @@ def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
                          launched=command,
                          detail="已清退 %d 个用户态进程并按自启项重新启动"
                                 % len(killed))
+
+
+def _launch_and_confirm(ops: Any, command: str,
+                        sleep: Callable[[float], None]) -> str:
+    """执行重启命令并**确认进程真的出现**（命令返回成功不算数）。
+
+    返回 ``"confirmed"``（真的起来了）/ ``"launch-failed"``（命令本身失败）/
+    ``"unconfirmed"``（命令成功但进程始终没出现）。
+    """
+    try:
+        if not ops.launch(command):
+            return "launch-failed"
+    except Exception:                                     # noqa: BLE001
+        return "launch-failed"
+    for _ in range(RESTART_CONFIRM_ATTEMPTS):
+        sleep(RESTART_CONFIRM_INTERVAL)
+        try:
+            if discover(ops).user_processes:
+                return "confirmed"
+        except Exception:                                 # noqa: BLE001 - 探测不可信
+            continue
+    return "unconfirmed"

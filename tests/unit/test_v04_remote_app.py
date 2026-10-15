@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 import campus_remote_app as cra
 from campus_remote import DEFAULT_REMOTE_CLIENTS
 from tests.fakes import FakeRemoteAppOps
@@ -26,6 +28,12 @@ from tests.fakes import FakeRemoteAppOps
 USER_PROCS = ("GameViewer.exe", "GameViewerLauncher.exe")
 SERVICE_PROCS = ("GameViewerServer.exe", "GameViewerHealthd.exe")
 OTHER_PROCS = ("uuyc-cli.exe", "uuyc-mux.exe")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    """默认测试集**零真实 sleep**（AGENTS §2.4）：确认轮询的休眠换成空操作。"""
+    monkeypatch.setattr(cra, "_SLEEP", lambda seconds: None)
 
 
 def _ops(**kwargs) -> FakeRemoteAppOps:
@@ -332,7 +340,9 @@ def test_v04_restart_guard_allows_after_cooldown():
     again = cra.restart_user_app(ops, guard=guard)
 
     assert again.ok is True and again.action == "restart"
-    assert len(ops.killed) == 4, "冷却期满未重新清退：%r" % (ops.killed,)
+    # 假件按真实语义：清退成功后该进程不再出现、启动后只出现一个新进程（9001），
+    # 故第二次清退的对象就是它。
+    assert again.killed == [ops.spawn_pid], "冷却期满未重新清退：%r" % (ops.killed,)
 
 
 def test_v04_restart_failed_attempt_does_not_start_cooldown():
@@ -343,6 +353,43 @@ def test_v04_restart_failed_attempt_does_not_start_cooldown():
     cra.restart_user_app(ops, guard=guard)
 
     assert guard.last_at is None, "失败也被计入冷却"
+
+
+def test_v04_restart_confirms_app_really_came_back():
+    """重启命令返回成功 **不等于** UU 起来了：必须确认进程真的出现。
+
+    真机实测（2026-10-16）：``GameViewer.exe`` 是个 stub，启动后**立刻退出**
+    并另起 ``bin\\GameViewer.exe``——所以 "命令执行成功" 与 "应用在跑" 是两件事。
+    """
+    ops = _restart_ops(launch_spawns=True)
+
+    result = cra.restart_user_app(ops)
+
+    assert result.ok is True and result.action == "restart"
+    assert len(ops.launched) == 1, "已确认起来了，不该重复启动"
+
+
+def test_v04_restart_reports_honestly_when_app_never_comes_back():
+    """命令成功但进程始终没回来 ⇒ 补一次启动；仍没有则**如实报失败** + 不计冷却。"""
+    guard = cra.RestartGuard(cooldown=300.0, clock=lambda: 1000.0)
+    ops = _restart_ops(launch_spawns=False)
+
+    result = cra.restart_user_app(ops, guard=guard)
+
+    assert result.ok is False, "假成功必须被识别为失败"
+    assert result.action == "unconfirmed"
+    assert len(ops.launched) == 2, "应补一次启动后放弃（不得无限重试）"
+    assert result.killed == [100, 200]
+    assert guard.last_at is None, "未确认成功不得计入冷却"
+
+
+def test_v04_restart_unconfirmed_tells_user_to_start_manually():
+    """失败的明细须能指导用户自救（手动启动 / 下次登录自启）。"""
+    ops = _restart_ops(launch_spawns=False)
+
+    detail = cra.restart_user_app(ops).detail
+
+    assert "手动" in detail and "UU" in detail
 
 
 # --------------------------------------------------------------------------- #
