@@ -35,6 +35,7 @@ import logging.handlers
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -61,8 +62,9 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          repair_service, resolve_url)
 from campus_failover import (FailoverMode, FailoverPolicy,
                              NetworkFailoverManager, format_tick)
-from campus_network import (NetworkObserver, WindowsProbeEngine, evaluate,
-                            format_snapshot, resolve_roles)
+from campus_network import (DEFAULT_TCP_TARGETS, NetworkObserver,
+                            WindowsProbeEngine, evaluate, format_snapshot,
+                            resolve_roles)
 from campus_route_guard import (CompositeExecutor, MetricExecutor, RouteGuard,
                                 RouteJournal, build_windows_route_ops,
                                 format_route_change, format_route_snapshot)
@@ -70,7 +72,7 @@ from campus_snnu import (InterfaceBinding, SnnuBackupExecutor, SnnuBackupLink,
                          SnnuOps, format_backup_result)
 from campus_windows import (CredentialStore, SingleInstanceGuard, WifiInterface,
                             parse_ipconfig_ipv4, parse_netsh_interfaces,
-                            wifi_state_from_text)
+                            tcp_probe, wifi_state_from_text)
 
 if os.name == "nt":
     import winreg
@@ -108,6 +110,32 @@ DEFAULT_PROBES = (
 )
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+
+#: 免 DNS 的 IP 级证据（F75-13②，2026-10-15 真机取证）。
+#:
+#: 本机**公网 IPv6 是黑洞**（全局 IPv6 只在 WLAN、IPv6 默认路由仅 WLAN；
+#: ``ping -6`` 100% 丢包、``curl -6`` 10s 超时，而 ``curl -4`` 200），
+#: 而三个 HTTP 探测点**全为域名**且 ``detectportal.firefox.com`` 会返回 AAAA：
+#: 任一次 DNS 抖动都会让三点同时失败 ⇒ 误判"掉线"并触发修复/认证路径，
+#: 而 IPv4 的 IP 级连通性可能完好。故补一条**不依赖 DNS** 的 TCP 证据
+#: （目标沿用 K-6 实机验证可达的 ``DEFAULT_TCP_TARGETS``）。
+IP_PROBE_TIMEOUT = 1.0
+#: IP 级探测实现（默认 :func:`campus_windows.tcp_probe`；测试注入假件以保证零真实网络）。
+IP_TCP_PROBE: Callable[[str, int, float], bool] = tcp_probe
+
+
+def _prefer_ipv4() -> None:
+    """让 requests/urllib3 只解析 IPv4（F75-13①）。
+
+    见上文 ``IP_PROBE_TIMEOUT`` 的真机取证：本机公网 IPv6 为黑洞，DNS 一旦返回 AAAA
+    就会先撞黑洞再回退（单点 3.25s；紧循环复现 5.12s 超时）。公网连通性语义本就是 IPv4
+    （``DEFAULT_TCP_TARGETS`` 为 IPv4 字面量，Portal 目标亦为 IPv4），故探测会话统一只解析 A 记录。
+    """
+    try:
+        from urllib3.util import connection as urllib3_connection
+    except ImportError:  # pragma: no cover - urllib3 是 requests 的硬依赖
+        return
+    urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 
 
 def setup_logging(verbose: bool) -> logging.Logger:
@@ -149,6 +177,7 @@ def direct_session() -> requests.Session:
     session = requests.Session()
     session.trust_env = False
     session.headers.update({"User-Agent": UA, "Cache-Control": "no-cache"})
+    _prefer_ipv4()
     return session
 
 
@@ -205,13 +234,41 @@ def _error_kind(exc: Exception) -> str:
     return "connection"
 
 
+def _probe_detail(result: ProbeResult) -> str:
+    """失败探测点的可读明细 ``主机(错误类型/状态码)``（F75-13③）。"""
+    try:
+        host = urlsplit(result.source).hostname or result.source
+    except ValueError:  # pragma: no cover - source 恒为探测点 URL
+        host = result.source
+    return "%s(%s)" % (host, result.error or result.status_code)
+
+
 def internet_ok(session: requests.Session,
                 probes=DEFAULT_PROBES) -> Tuple[bool, str]:
-    """直连(不走系统代理)探测公网。任一探测**严格匹配结构**通过即视为在线。"""
+    """直连(不走系统代理)判定公网可达，返回 ``(是否在线, 证据或失败明细)``。
+
+    判据（F75-13②）：**任一** HTTP 探测点严格结构匹配，**或任一** 免 DNS 的 IP 级
+    TCP 点（``DEFAULT_TCP_TARGETS``）可达 ⇒ 在线。前者防 Portal 劫持误判，后者防
+    DNS 抖动导致三点同时失败而误判掉线（有线正常时误判掉线会触发修复/认证）。
+
+    在线时第二项为通过的证据（探测点 URL 或 ``tcp://host:port``）；离线时为失败明细
+    （各失败探测点 + 错误类型，``；`` 分隔），供 :func:`watch` 记入日志（F75-13③）。
+    """
+    details: List[str] = []
     for result in probe_online(session, probes):
         if result.ok:
             return True, result.source
-    return False, ""
+        details.append(_probe_detail(result))
+    for host, port in DEFAULT_TCP_TARGETS:
+        try:
+            reachable = bool(IP_TCP_PROBE(host, port, IP_PROBE_TIMEOUT))
+        except Exception as exc:  # 探测自身异常只算"不可达"，不得中断监测循环
+            details.append("tcp://%s:%d(%s)" % (host, port, type(exc).__name__))
+            continue
+        if reachable:
+            return True, "tcp://%s:%d" % (host, port)
+        details.append("tcp://%s:%d(unreachable)" % (host, port))
+    return False, "；".join(details)
 
 
 def portal_base(port: int) -> str:
@@ -1284,7 +1341,7 @@ def watch(session: requests.Session, args: argparse.Namespace,
     needs_user = False
     while True:
         try:
-            online, _ = internet_ok(session)
+            online, via = internet_ok(session)
             if online:
                 if failures:
                     log.info("公网恢复。")
@@ -1294,9 +1351,11 @@ def watch(session: requests.Session, args: argparse.Namespace,
             else:
                 failures += 1
                 if failures < args.threshold:
-                    log.info("公网探测失败（%d/%d）。", failures, args.threshold)
+                    log.info("公网探测失败（%d/%d）：%s", failures, args.threshold,
+                             via or "无明细")
                 elif failures == args.threshold:
-                    log.warning("连续 %d 次失败，判定疑似掉线。", failures)
+                    log.warning("连续 %d 次失败，判定疑似掉线（%s）。", failures,
+                                via or "无明细")
                 if needs_user:
                     log.warning("需人工处理（凭据/验证码/Portal 结构），暂停自动重连。")
                 elif failures >= args.threshold and timers.auth_allowed(time.monotonic()):

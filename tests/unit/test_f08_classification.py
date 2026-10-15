@@ -57,6 +57,9 @@ def test_t18_internet_ok_rejects_arbitrary_200_with_success(monkeypatch):
     session = FakeSession()
     for spec in engine.DEFAULT_PROBES:
         session.route(spec.url, FakeResponse(200, "totally unrelated Success page"))
+    # F75-13②：本用例断言"HTTP 结构不匹配即不算在线"，故把 IP 级证据钉死为不可达
+    # （否则会打真实 TCP，违反零真实网络约定）。
+    monkeypatch.setattr(engine, "IP_TCP_PROBE", lambda host, port, timeout: False)
     ok, _ = engine.internet_ok(session)
     assert ok is False, "任意 200 含 Success 被错误认可"
 

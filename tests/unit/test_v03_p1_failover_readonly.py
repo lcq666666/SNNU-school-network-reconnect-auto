@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import campus_reconnect as engine
 from tests.fakes import (FakeProbeEngine, FakeResponse, FakeSession,
                          healthy_http_table, matching_http_response)
@@ -19,6 +21,12 @@ from tools import netdiag
 
 from campus_network import (DEFAULT_HTTP_TARGETS, DEFAULT_TCP_TARGETS,
                             HealthState, evaluate)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ip_probe(monkeypatch):
+    """F75-13②：离线剧本里 IP 级证据恒为不可达，保持零真实网络。"""
+    monkeypatch.setattr(engine, "IP_TCP_PROBE", lambda host, port, timeout: False)
 
 ETH_ADAPTER = {"Name": "以太网",
                "InterfaceDescription": "Intel(R) Ethernet Connection (16) I219-V",
