@@ -47,17 +47,20 @@ __all__ = [
     "SNAPSHOT_COLLECT_TIMEOUT", "SNAPSHOT_STALE", "SNAPSHOT_GENERATION",
     "SNAPSHOT_INCOMPLETE", "SNAPSHOT_EXTERNAL", "ObservationResult",
     "snapshot_signature", "is_full_snapshot", "TraySnapshotSource",
-    "RefusingExecutor", "format_observation",
+    "RefusingExecutor", "format_observation", "is_auto_executable_snapshot",
 ]
 
 CONTRACT_VERSION = "v03-p75-obs-1"
 
 #: 快照有效期（秒）：超过该年龄的快照不得用于 AUTO 决策。
-DEFAULT_MAX_AGE = 60.0
+# 保守初始值：缩短 AUTO 可消费的缓存窗口；尚无受控真机性能结论。
+DEFAULT_MAX_AGE = 8.0
 #: 单次采集的超时容忍（秒）：超时后放弃本轮并**丢弃**迟到的结果。
-DEFAULT_COLLECT_TIMEOUT = 25.0
+# 有限等待预算；实际接口探测性能留待后续受控验收。
+DEFAULT_COLLECT_TIMEOUT = 12.0
 #: 两次采集之间的最小间隔（秒）：限流，避免 PowerShell 诊断进程堆积。
-DEFAULT_MIN_INTERVAL = 10.0
+# 最小重采间隔，配合单飞与在途上限限制诊断任务堆积。
+DEFAULT_MIN_INTERVAL = 3.0
 
 #: 快照可信度结论取值。
 SNAPSHOT_OK = "OK"                              # 可信
@@ -179,6 +182,39 @@ def _is_complete(snapshot: Optional[NetworkHealthSnapshot]) -> bool:
             and getattr(snapshot, "wifi", None) is not None)
 
 
+def is_auto_executable_snapshot(snapshot: Optional[NetworkHealthSnapshot]
+                                ) -> Tuple[bool, str]:
+    """判定快照是否**足以作为 AUTO 执行网络副作用的依据**。
+
+    与 :func:`is_full_snapshot`（结构检查）和 :func:`_is_complete`（两轴检查）
+    不同，本函数进一步验证**角色身份**：AUTO 执行 Metric 写入或 Portal 认证前，
+    必须知道目标接口的物理身份（ifIndex），否则无法把动作约束到正确网卡。
+
+    返回 ``(ok, reason)``：
+
+    - ``ok=True``：三轴齐全 + 两轴都有有效 ifIndex + system 轴存在；
+    - ``ok=False``：``reason`` 说明缺少哪一项（日志/告警用）。
+    """
+    if not is_full_snapshot(snapshot):
+        return False, "快照结构不完整（缺少 recommendation/generated_at 或接口轴）"
+    eth = getattr(snapshot, "ethernet", None)
+    wifi = getattr(snapshot, "wifi", None)
+    system = getattr(snapshot, "system", None)
+    if eth is None or wifi is None:
+        return False, "AUTO 执行需要 Ethernet 与 Wi-Fi 两轴同时存在"
+    if system is None:
+        return False, "缺少 SYSTEM 轴"
+    eth_idx = getattr(eth, "if_index", None)
+    wifi_idx = getattr(wifi, "if_index", None)
+    if type(eth_idx) is not int or not 0 < eth_idx <= 0xFFFFFFFF:
+        return False, "Ethernet 轴缺少有效的 if_index（无法定位目标接口）"
+    if type(wifi_idx) is not int or not 0 < wifi_idx <= 0xFFFFFFFF:
+        return False, "Wi-Fi 轴缺少有效的 if_index（无法定位目标接口）"
+    if eth_idx == wifi_idx:
+        return False, "Ethernet 与 Wi-Fi 不得指向同一接口"
+    return True, ""
+
+
 def _default_spawn(func: Callable[[], None]) -> Any:
     """默认后台启动器：守护线程（崩溃不拖垮托盘，退出不阻塞）。"""
     thread = threading.Thread(target=func, name="campus-netdiag", daemon=True)
@@ -190,7 +226,7 @@ def _default_spawn(func: Callable[[], None]) -> Any:
 # 托盘三轴观测源
 # --------------------------------------------------------------------------- #
 class TraySnapshotSource:
-    """后台三轴观测源：**限流 + 单飞 + 超时 + 新鲜度 + 代次**。
+    """后台三轴观测源：**限流 + 单飞 + 超时 + 新鲜度 + 代次 + 任务 ID 防覆盖**。
 
     用法（托盘工作线程里每轮一次）::
 
@@ -204,7 +240,9 @@ class TraySnapshotSource:
     - 同一时刻**至多一个**采集在途（``_collecting``），配合 ``min_interval``
       限流，避免 netdiag 的 PowerShell 进程堆积；
     - 采集线程只**写**结果，UI/工作线程只**读**结果，全部经 ``_lock``；
-    - ``observe()`` 永不等待、永不 I/O，可在 Tk 主线程安全调用。
+    - ``observe()`` 永不等待、永不 I/O，可在 Tk 主线程安全调用；
+    - **任务 ID 匹配**：每个采集分配唯一递增 ID，完成时只修改与该 ID 匹配的
+      状态，防止超时/过期的旧任务覆盖新任务的快照、错误、计数或代次。
     """
 
     def __init__(self, *, collect: Optional[Callable[[], Any]] = None,
@@ -213,6 +251,7 @@ class TraySnapshotSource:
                  max_age: float = DEFAULT_MAX_AGE,
                  collect_timeout: float = DEFAULT_COLLECT_TIMEOUT,
                  min_interval: float = DEFAULT_MIN_INTERVAL,
+                 max_inflight: int = 3,
                  spawn: Optional[Callable[[Callable[[], None]], Any]] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self._collect = collect
@@ -221,6 +260,7 @@ class TraySnapshotSource:
         self.max_age = float(max(0.0, max_age))
         self.collect_timeout = float(max(0.1, collect_timeout))
         self.min_interval = float(max(0.0, min_interval))
+        self._max_inflight = int(max(1, max_inflight))
         self._spawn = spawn or _default_spawn
         self._log = log
         self._lock = threading.Lock()
@@ -235,13 +275,20 @@ class TraySnapshotSource:
         self._last_request_at: Optional[float] = None
         #: 内部代次（配置/网络变化或采集超时时自增）。
         self.generation = 0
+        #: 任务 ID 序列（每次发起采集时递增；_run 只接受匹配 _active_task_id 的结果）。
+        self._task_seq = 0
+        self._active_task_id = 0
+        #: 并发采集线程数（防止超时重试造成无限堆积）。
+        self._inflight_count = 0
         #: 统计（便于验收与告警）。
         self.collect_count = 0
         self.error_count = 0
         self.timeout_count = 0
         self.dropped_stale = 0
+        self.dropped_task_mismatch = 0
         self.request_count = 0
         self.throttled = 0
+        self.rejected_inflight_limit = 0
 
     # ---- 代次 ---- #
     def current_generation(self) -> Tuple[Any, int]:
@@ -276,23 +323,32 @@ class TraySnapshotSource:
         """必要时发起一次后台采集；返回是否真的发起。
 
         - 已有采集在途且未超时 → 直接返回 ``False``（单飞）；
-        - 在途已超时 → 记为超时、**自增代次**丢弃该在途结果，并允许重新发起；
+        - 在途已超时 → 记为超时、**提升任务 ID** 丢弃该在途结果，并允许重新发起；
+        - 并发采集线程数已达 ``max_inflight`` → 拒绝，防止超时重试造成堆积；
         - 距上次发起不足 ``min_interval`` → 限流，返回 ``False``。
         """
         stamp = self._clock() if now is None else float(now)
         with self._lock:
             self.request_count += 1
             if self._collecting:
-                started = self._collect_started_at or stamp
-                if (stamp - started) <= self.collect_timeout:
+                # BUGFIX P7.5-1A：起始时间为 0.0 时不能用 ``or``（0.0 是 falsy）。
+                started = (self._collect_started_at
+                           if self._collect_started_at is not None else stamp)
+                elapsed = stamp - started
+                if elapsed <= self.collect_timeout:
                     return False
-                # 超时：放弃本轮（线程仍在跑，其结局会被代次丢弃）
+                # 超时：提升任务 ID + 自增代次，确保旧线程结果一定被丢弃
                 self._collecting = False
                 self.timeout_count += 1
                 self.generation += 1
+                self._task_seq += 1
+                self._active_task_id = self._task_seq
                 self._error = "采集超时（>%.0fs）" % self.collect_timeout
                 self._note("三轴采集超时（%.0fs）：丢弃本轮结果"
                            % self.collect_timeout)
+            if self._inflight_count >= self._max_inflight:
+                self.rejected_inflight_limit += 1
+                return False
             if (self._last_request_at is not None
                     and (stamp - self._last_request_at) < self.min_interval):
                 self.throttled += 1
@@ -300,26 +356,53 @@ class TraySnapshotSource:
             self._last_request_at = stamp
             self._collecting = True
             self._collect_started_at = stamp
+            self._task_seq += 1
+            task_id = self._task_seq
+            self._active_task_id = task_id
+            self._inflight_count += 1
             started_generation = self.current_generation()
         try:
-            self._spawn(lambda: self._run(started_generation))
+            self._spawn(lambda: self._run(task_id, started_generation, stamp))
         except Exception as exc:                    # 起线程失败不得拖垮调用方
             with self._lock:
-                self._collecting = False
-                self.error_count += 1
-                self._error = "采集线程启动失败：%s" % type(exc).__name__
+                self._inflight_count = max(0, self._inflight_count - 1)
+                if task_id == self._active_task_id:
+                    self._collecting = False
+                    self.error_count += 1
+                    self._error = "采集线程启动失败：%s" % type(exc).__name__
             self._note("三轴采集线程启动失败：%s" % type(exc).__name__)
             return False
         return True
 
     def collect_now(self) -> Optional[NetworkHealthSnapshot]:
-        """**同步**执行一次采集并发布（启动预热 / 测试用；会阻塞调用方）。"""
-        self._run(self.current_generation())
+        """同步采集（预热/测试）；与后台入口共用单飞和在途上限。"""
+        stamp = self._clock()
+        with self._lock:
+            if self._collecting or self._inflight_count >= self._max_inflight:
+                return self._snapshot
+            if (self._last_request_at is not None
+                    and stamp - self._last_request_at < self.min_interval):
+                self.throttled += 1
+                return self._snapshot
+            self._last_request_at = stamp
+            self._task_seq += 1
+            task_id = self._task_seq
+            self._active_task_id = task_id
+            self._collecting = True
+            self._collect_started_at = stamp
+            self._inflight_count += 1
+            generation = self.current_generation()
+        self._run(task_id, generation, stamp)
         with self._lock:
             return self._snapshot
 
-    def _run(self, generation: Tuple[Any, int]) -> None:
-        """采集线程主体：异常一律转为 ``_error``，绝不向上抛。"""
+    def _run(self, task_id: int, generation: Tuple[Any, int],
+             started_at: float) -> None:
+        """采集线程主体：异常一律转为 ``_error``，绝不向上抛。
+
+        P7.5-1A 安全：完成时先核对 ``task_id == _active_task_id``，
+        不匹配则**不修改任何状态**（快照/错误/计数/代次均保持原样）。
+        """
         error = ""
         snapshot = None
         if self._collect is None:
@@ -330,7 +413,21 @@ class TraySnapshotSource:
             except Exception as exc:
                 error = "%s: %s" % (type(exc).__name__, exc)
         with self._lock:
+            self._inflight_count = max(0, self._inflight_count - 1)
+            # 任务 ID 匹配：只有当前活跃任务才能修改状态
+            if task_id != self._active_task_id:
+                self.dropped_task_mismatch += 1
+                self._note("丢弃过期采集结果（任务 %d != 当前 %d）"
+                           % (task_id, self._active_task_id))
+                return
             self._collecting = False
+            if self._clock() - started_at > self.collect_timeout:
+                self.timeout_count += 1
+                self.generation += 1
+                self._task_seq += 1
+                self._active_task_id = self._task_seq
+                self._error = "采集超时（>%.0fs）" % self.collect_timeout
+                return
             if error:
                 self.error_count += 1
                 self._error = error
@@ -346,6 +443,8 @@ class TraySnapshotSource:
             if self._signature and signature != self._signature:
                 # 网络身份变化（DHCP / 出口接口变化）：作废此后所有在途结果
                 self.generation += 1
+                self._task_seq += 1
+                self._active_task_id = self._task_seq
                 self._note("检测到网络身份变化 %r → %r：作废旧代次"
                            % (self._signature, signature))
             self._signature = signature
@@ -425,12 +524,22 @@ class TraySnapshotSource:
 # 不可信快照门禁执行器
 # --------------------------------------------------------------------------- #
 class RefusingExecutor:
-    """**拒绝执行**的占位执行器（P7.5-1 可信度门禁）。
+    """**拒绝执行**的占位执行器（P7.5-1A 可信度门禁）。
 
     AUTO 模式下若本轮快照不可信（缺失 / 过期 / 代次失效 / 结构不完整），
-    把单一副作用门的执行器替换为它：动作仍会被**如实登记为"已尝试但拒绝"**，
-    但 ``executed`` 恒为 ``False`` —— 即 Portal POST / Wi-Fi 重连 / Metric 写入
-    三类副作用**一个都不会发生**。
+    把单一副作用门的执行器替换为它。
+
+    P7.5-1A 语义修正：
+
+    - ``gate_passed=True``：通过了互斥串行和模式门禁；
+    - ``attempted=False``：**不是一次真正的执行尝试**，因此
+      **不消耗** Portal 认证冷却、Wi-Fi 重连冷却或 Metric 切换冷却；
+    - ``executed=False``：Portal POST / Wi-Fi 重连 / Metric 写入
+      三类副作用**一个都不会发生**；
+    - 审计日志通过 ``refused`` 列表和 ``_log`` 保留，便于排查。
+
+    这意味着：当快照重新变为可信后，状态机不会因为"虚假的冷却记录"
+    而被阻止执行必要的动作。
     """
 
     def __init__(self, reason: str = "", *,
@@ -443,13 +552,15 @@ class RefusingExecutor:
     def execute(self, request: Any) -> Any:
         from campus_failover import OpOutcome
 
-        self.refused.append(getattr(request, "kind", None))
+        kind = getattr(request, "kind", None)
+        self.refused.append(kind)
         if self._log is not None:
             self._log("拒绝执行 %s：%s"
-                      % (getattr(getattr(request, "kind", None), "value", "?"),
-                         self.reason))
-        return OpOutcome(getattr(request, "kind", None), gate_passed=True,
-                         attempted=True, executed=False,
+                      % (getattr(kind, "value", "?"), self.reason))
+        # P7.5-1A：attempted=False → 状态机 _decide 中不会调用
+        # _note_auth / _note_switch，冷却不被消耗。
+        return OpOutcome(kind, gate_passed=True, attempted=False,
+                         executed=False,
                          detail="拒绝执行：%s" % self.reason)
 
 

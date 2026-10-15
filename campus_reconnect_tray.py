@@ -72,6 +72,7 @@ from campus_windows import CredentialStore, ProxyController, default_refresh
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
                                   parse_lock, parse_mode, tray_mode_label)
 from campus_tray_observer import (ObservationResult, TraySnapshotSource,
+                                  is_auto_executable_snapshot,
                                   is_full_snapshot)
 from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
 from campus_remote import (MonitorWatchdog, RemoteSafetyGuard,
@@ -127,6 +128,10 @@ DEFAULT_CONFIG = {
     "remote_guard": True,             # 远控探测与远程会话敏感期（只读，默认开启）
     "remote_defer_failback": True,    # 远程会话敏感期推迟自动切回（默认开启）
     "remote_probe_interval": 30,      # 远控探测最小间隔秒数（节流）
+    # ---- V0.3 P7.5-1A：三轴观测参数（可配置，范围受限）----
+    "snapshot_max_age": 8,            # 快照有效期（秒）；依据见 campus_tray_observer
+    "snapshot_timeout": 12,           # 单次采集超时（秒）
+    "snapshot_interval": 3,           # 两次采集最小间隔（秒）
 }
 CONFIG_KEYS = tuple(DEFAULT_CONFIG)
 
@@ -262,6 +267,30 @@ def _read_remote_keys(text: str) -> dict:
             "remote_probe_interval": max(5, min(600, int(probe_interval)))}
 
 
+def _read_snapshot_keys(text: str) -> dict:
+    """读取 P7.5-1A 三轴观测参数（非法值一律回退安全默认）。
+
+    与 P6/P7 读取器分开，避免破坏既有整字典断言；
+    各参数限幅防止任意放宽安全门槛：
+    max_age 1..30s、timeout 3..60s、interval 1..30s。
+    """
+    raw = _raw_config(text)
+    max_age = raw.get("snapshot_max_age")
+    if not isinstance(max_age, int) or isinstance(max_age, bool):
+        max_age = DEFAULT_CONFIG["snapshot_max_age"]
+    timeout = raw.get("snapshot_timeout")
+    if not isinstance(timeout, int) or isinstance(timeout, bool):
+        timeout = DEFAULT_CONFIG["snapshot_timeout"]
+    interval = raw.get("snapshot_interval")
+    if not isinstance(interval, int) or isinstance(interval, bool):
+        interval = DEFAULT_CONFIG["snapshot_interval"]
+    return {
+        "snapshot_max_age": max(1, min(30, int(max_age))),
+        "snapshot_timeout": max(3, min(60, int(timeout))),
+        "snapshot_interval": max(1, min(30, int(interval))),
+    }
+
+
 def config_to_dict(config) -> dict:
     """把 :class:`campus_core.Config` 转成托盘内部 dict。"""
     return {
@@ -293,6 +322,7 @@ def load_config() -> dict:
     cfg["paused"] = _read_paused_flag(text)
     cfg.update(_read_failover_keys(text))
     cfg.update(_read_remote_keys(text))
+    cfg.update(_read_snapshot_keys(text))
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
@@ -620,9 +650,12 @@ class TrayApp:
                 collect=lambda: self._collect_health_snapshot(),
                 clock=lambda: time.monotonic(),
                 generation=lambda: self.config_version(),
-                max_age=SNAPSHOT_MAX_AGE,
-                collect_timeout=SNAPSHOT_COLLECT_TIMEOUT,
-                min_interval=SNAPSHOT_MIN_INTERVAL,
+                max_age=float(self.config.get("snapshot_max_age",
+                                              SNAPSHOT_MAX_AGE)),
+                collect_timeout=float(self.config.get("snapshot_timeout",
+                                                       SNAPSHOT_COLLECT_TIMEOUT)),
+                min_interval=float(self.config.get("snapshot_interval",
+                                                    SNAPSHOT_MIN_INTERVAL)),
                 spawn=spawn,
                 log=lambda message: self.log.info("[观测] %s", message))
         return self._snapshot_source
@@ -721,15 +754,23 @@ class TrayApp:
         snapshot = self._build_failover_snapshot(online)
         observation = getattr(self, "last_observation", None)
         trusted = bool(observation is not None and observation.trusted)
+        reason = observation.reason_text if observation is not None else ""
+        # P7.5-1A：AUTO 快照契约收紧 —— 仅结构可信不够，必须两轴都有有效
+        # if_index，否则无法把副作用约束到正确网卡。
+        if trusted and bridge.mode is FailoverMode.AUTO:
+            ok, auto_reason = is_auto_executable_snapshot(snapshot)
+            if not ok:
+                trusted = False
+                reason = "AUTO 快照契约不满足：%s" % auto_reason
+                self.log.warning(reason)
         # 可信度门禁（P7.5-1）：数据不足时 AUTO 一律拒绝执行网络副作用。
-        bridge.set_snapshot_trust(
-            trusted, observation.reason_text if observation is not None else "")
-        if not trusted and observation is not None:
+        bridge.set_snapshot_trust(trusted, reason)
+        if not trusted:
             self.log.info("三轴快照不可信（%s）：本轮不执行任何网络副作用",
-                          observation.reason_text)
+                          reason)
         result = bridge.tick(now, snapshot)
         self.failover_status = bridge.status()
-        if result.executed:
+        if result is not None and result.executed:
             self.log.info("故障切换已执行动作：%s",
                           ", ".join(o.kind.value for o in result.executed))
         return result

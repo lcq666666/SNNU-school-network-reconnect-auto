@@ -240,13 +240,14 @@ def _break_observation(app, monkeypatch, mode, collector, clock):
         return "采集抛错"
     if mode == "stale":
         # 禁止重新采集（限流窗口拉长），再把时钟推过有效期
-        monkeypatch.setattr(tray, "SNAPSHOT_MIN_INTERVAL", 10_000.0)
-        app._snapshot_source = None            # 用新限流参数重建观测源
+        app.config["snapshot_interval"] = 10_000
+        app.config["snapshot_max_age"] = 10
+        app._snapshot_source = None            # 用新参数重建观测源
         app._build_failover_snapshot(False)    # 先采到一份可信快照
-        clock.advance(tray.SNAPSHOT_MAX_AGE + 5.0)
+        clock.advance(15.0)                   # > max_age(10)
         return "快照过期"
     if mode == "generation":
-        monkeypatch.setattr(tray, "SNAPSHOT_MIN_INTERVAL", 10_000.0)
+        app.config["snapshot_interval"] = 10_000
         app._snapshot_source = None
         app._build_failover_snapshot(False)
         app.invalidate_snapshot("模式/配置已变更")
@@ -511,10 +512,14 @@ def test_i75_1_10_observation_module_has_no_side_effect_capability():
     for banned in ("import requests", "import winreg", "import subprocess",
                    "Set-NetIPInterface", "portal_login", "ProxyEnable"):
         assert banned not in source, "观测模块引入了副作用能力：%s" % banned
-    # 拒绝执行器恒为"已尝试但未执行"
+    # P7.5-1A：拒绝执行器返回 attempted=False（不是真正的执行尝试，
+    # 因此不消耗 Portal/Wi-Fi/Metric 冷却），但 gate_passed=True（通过了
+    # 互斥串行和模式门禁），executed=False（无副作用）。
     executor = tso.RefusingExecutor("测试")
     outcome = executor.execute(SimpleNamespace(kind=OpKind.METRIC_WRITE))
-    assert outcome.attempted is True and outcome.executed is False
+    assert outcome.gate_passed is True, "应通过互斥/模式门禁"
+    assert outcome.attempted is False, "P7.5-1A：attempted 必须为 False（不消耗冷却）"
+    assert outcome.executed is False, "不得执行副作用"
     assert executor.refused == [OpKind.METRIC_WRITE]
 
 
