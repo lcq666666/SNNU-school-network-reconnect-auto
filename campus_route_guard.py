@@ -42,7 +42,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 import sys
 import time
 import uuid
@@ -124,9 +126,10 @@ class EgressVerdict(Enum):
 class RouteStatus(Enum):
     """一次路由变更事务的状态（写入 journal 的 ``status`` 字段）。"""
 
-    PENDING = "PENDING"            # 已开始、尚未完成（崩溃恢复依据）
+    PENDING = "PENDING"            # 已开始、尚未完成
+    ROLLED_BACK = "ROLLED_BACK"    # 变更失败但回滚成功
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED" # 回滚失败，保留 pending 等待人工恢复
     COMPLETED = "COMPLETED"        # 变更生效并通过出口验证
-    ROLLED_BACK = "ROLLED_BACK"    # 变更失败/未通过验证，已按快照回滚
     REFUSED = "REFUSED"            # 未授权/非法目标/冷却中，未产生任何写入
 
 
@@ -405,6 +408,7 @@ class RouteJournal:
     def __init__(self, path: Optional[Any] = None) -> None:
         self.path = Path(path) if path else None
         self._memory: Dict[str, Any] = self._empty()
+        self.corrupted = False
 
     @staticmethod
     def _empty() -> Dict[str, Any]:
@@ -416,14 +420,15 @@ class RouteJournal:
             return self._memory
         try:
             raw = self.path.read_text(encoding="utf-8")
-        except (OSError, ValueError):
-            return self._empty()
-        try:
             data = json.loads(raw)
-        except (ValueError, TypeError):
+        except FileNotFoundError:
             return self._empty()
-        if not isinstance(data, dict):
-            return self._empty()
+        except (OSError, ValueError, TypeError) as exc:
+            self.corrupted = True
+            raise ValueError("路由日志损坏，拒绝按空日志处理") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("history", []), list):
+            self.corrupted = True
+            raise ValueError("路由日志结构损坏")
         data.setdefault("pending", None)
         data.setdefault("history", [])
         return data
@@ -432,12 +437,21 @@ class RouteJournal:
         if self.path is None:
             self._memory = data
             return
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=".route-journal-",
+                                         suffix=".tmp", dir=str(self.path.parent))
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            # 日志写入失败不得让路由事务继续"盲跑"：上抛由 RouteGuard 转为失败。
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.path)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
             raise
 
     def pending(self) -> Optional[Dict[str, Any]]:
@@ -691,12 +705,13 @@ class RouteGuard:
             if not ok:
                 rollback_ok = self._restore(applied)
                 record.rolled_back = rollback_ok
-                record.status = RouteStatus.ROLLED_BACK
-                record.error = RouteGuardError.PERMISSION_DENIED.value
+                record.status = (RouteStatus.ROLLED_BACK if rollback_ok
+                                 else RouteStatus.RECOVERY_REQUIRED)
+                record.error = (RouteGuardError.PERMISSION_DENIED.value
+                                if rollback_ok else RouteGuardError.ROLLBACK_FAILED.value)
                 record.detail = ("写入 InterfaceMetric 失败（ifIndex=%s %s）："
                                  "可能权限不足（需管理员）；已按快照回滚=%s"
-                                 % (change["if_index"], change["family"],
-                                    rollback_ok))
+                                 % (change["if_index"], change["family"], rollback_ok))
                 self._note(record.detail)
                 self._finish(record)
                 return record
@@ -708,12 +723,13 @@ class RouteGuard:
         if not verification.ok:
             rollback_ok = self._restore(applied)
             record.rolled_back = rollback_ok
-            record.status = RouteStatus.ROLLED_BACK
-            record.error = _EGRESS_ERROR[verification.verdict].value
+            record.status = (RouteStatus.ROLLED_BACK if rollback_ok
+                             else RouteStatus.RECOVERY_REQUIRED)
+            record.error = (_EGRESS_ERROR[verification.verdict].value
+                            if rollback_ok else RouteGuardError.ROLLBACK_FAILED.value)
             record.detail = ("出口验证未通过（%s）：%s；已按快照回滚=%s"
                              % (verification.verdict.value, verification.detail,
                                 rollback_ok))
-            self._note(record.detail)
             self._finish(record)
             return record
 
@@ -735,7 +751,7 @@ class RouteGuard:
                                 "未授权：拒绝回滚路由变更")
         ok = self._restore(record.changes)
         record.rolled_back = ok
-        record.status = RouteStatus.ROLLED_BACK
+        record.status = RouteStatus.ROLLED_BACK if ok else RouteStatus.RECOVERY_REQUIRED
         record.ok = False
         record.error = None if ok else RouteGuardError.ROLLBACK_FAILED.value
         record.detail = ("按快照回滚%s：%s" % ("成功" if ok else "失败",
@@ -772,10 +788,12 @@ class RouteGuard:
             self._finish(record)
             return record
         rollback_ok = self._restore(record.changes)
-        record.status = RouteStatus.ROLLED_BACK
+        record.status = (RouteStatus.ROLLED_BACK if rollback_ok
+                         else RouteStatus.RECOVERY_REQUIRED)
         record.ok = False
         record.rolled_back = rollback_ok
-        record.error = RouteGuardError.RECOVERED.value
+        record.error = (RouteGuardError.RECOVERED.value if rollback_ok
+                        else RouteGuardError.ROLLBACK_FAILED.value)
         record.detail = ("崩溃恢复：检测到未完成事务 %s，当前出口未达目标，"
                          "已按快照回滚（回滚成功=%s）"
                          % (record.operation_id, rollback_ok))
@@ -794,6 +812,10 @@ class RouteGuard:
                                     self.policy.switch_min_interval)
 
     def _finish(self, record: RouteChangeRecord) -> None:
+        if record.status is RouteStatus.RECOVERY_REQUIRED:
+            self._note("路由事务需要人工恢复：保留 pending（%s）"
+                       % record.operation_id)
+            return
         try:
             self.journal.record_finished(record)
         except Exception as exc:

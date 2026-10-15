@@ -417,3 +417,22 @@ def test_u5_17_rollback_restores_automatic_metric():
     assert ops.restores, "原 AutomaticMetric=Enabled 的项应恢复为自动"
     assert ops.metrics[ETH_IF]["ipv4_automatic"] == "Enabled"
     assert ops.metrics[ETH_IF]["ipv6_automatic"] == "Enabled"
+
+
+def test_u5_18_corrupted_journal_is_not_treated_as_empty(tmp_path):
+    path = tmp_path / "route_journal.json"
+    path.write_text("{ broken", encoding="utf-8")
+    journal = RouteJournal(path)
+    with pytest.raises(ValueError, match="日志损坏"):
+        journal.pending()
+    assert journal.corrupted is True
+
+def test_u5_19_failed_recovery_keeps_pending_record(tmp_path):
+    path = tmp_path / "route_journal.json"
+    ops = _ops(set_ok=False, restore_ok=False)
+    guard = _guard(ops, journal=RouteJournal(path))
+    RouteJournal(path).record_pending(_pending_record(guard))
+    recovered = _guard(ops, journal=RouteJournal(path)).recover()
+    assert recovered.status is RouteStatus.RECOVERY_REQUIRED
+    assert recovered.error == RouteGuardError.ROLLBACK_FAILED.value
+    assert RouteJournal(path).pending() is not None
