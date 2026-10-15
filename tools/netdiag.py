@@ -52,7 +52,7 @@ REMOTE_CLIENT_PATTERN = ("ToDesk|SunloginClient|AnyDesk|RustDesk|TeamViewer|"
                          "Parsec|Radmin|Splashtop|LiteManager|AnyViewer|"
                          "AweSun|Iperius|VncViewer|UltraVNC|TightVNC|"
                          "WinVNC|Ammyy|Netman|tmremoteclient|RemoteDesktop|"
-                         "Tailscale|tailscaled")
+                         "Tailscale|tailscaled|GameViewer|uuyc")
 
 #: 虚拟网卡描述关键字（Virtual 标志缺失时的兜底判定）。
 VIRTUAL_DESCRIPTION_HINTS = ("tap-", "tun", "hyper-v", "wsl", "virtual",

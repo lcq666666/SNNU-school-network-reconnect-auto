@@ -802,3 +802,73 @@ class FakeInterfaceBinder:
         session.mount("http://", object())
         session.mount("https://", object())
         return True
+
+
+# --------------------------------------------------------------------------- #
+# UU 远程（GameViewer）用户态清退/重启能力假件（V0.4-2/3）
+# --------------------------------------------------------------------------- #
+class FakeRemoteAppOps:
+    """可编排的假「UU 远程后台清退/重启」能力集合，**零真实进程操作**。
+
+    - ``processes``：``[{"pid", "process_name", "path"}]``（与
+      ``campus_remote_app.AppProcess`` / netdiag 解析同构）；
+    - ``service`` / ``run_entries``：服务状态与自启项（只读发现用）；
+    - ``kill_results`` / ``launch_results``：``bool``、``Exception`` 或按序弹出的
+      ``list``；``False`` 表示该次操作**失败但未抛错**；
+    - ``probe_error``：让 ``list_processes`` 抛错（构造"探测源故障"）；
+    - 记录 ``killed``（pid 列表）、``launched``（命令列表）、各调用计数，
+      供断言"只读发现不产生副作用""清退顺序""失败即中止"。
+    """
+
+    def __init__(self, processes=None, service=None, run_entries=None,
+                 kill_results=True, launch_results=True, probe_error=None,
+                 service_error=None) -> None:
+        # 内部存储刻意加下划线：属性名不得与方法名 ``run_entries`` 等冲突
+        # （``campus_remote_app.discover`` 按 ``ops.run_entries()`` 调用）。
+        self._processes = [dict(row) for row in (processes or [])]
+        self._service = dict(service or {})
+        self._run_entries = [dict(row) for row in (run_entries or [])]
+        self.kill_results = kill_results
+        self.launch_results = launch_results
+        self.probe_error = probe_error
+        self.service_error = service_error
+        self.killed: List[int] = []
+        self.launched: List[str] = []
+        self.list_calls = 0
+        self.service_calls = 0
+        self.run_calls = 0
+
+    def _result(self, scripted, *, pid=None):
+        value = scripted
+        if isinstance(value, list):
+            value = value.pop(0) if value else True
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
+
+    # ---- 只读 ----
+    def list_processes(self) -> List[Dict[str, Any]]:
+        self.list_calls += 1
+        if self.probe_error is not None:
+            raise self.probe_error
+        return [dict(row) for row in self._processes]
+
+    def service_state(self) -> Dict[str, Any]:
+        self.service_calls += 1
+        if self.service_error is not None:
+            raise self.service_error
+        return dict(self._service)
+
+    def run_entries(self) -> List[Dict[str, Any]]:
+        self.run_calls += 1
+        return [dict(row) for row in self._run_entries]
+
+    # ---- 有副作用 ----
+    def kill(self, pid: int) -> bool:
+        self.killed.append(int(pid))
+        return self._result(self.kill_results, pid=pid)
+
+    def launch(self, command: str) -> bool:
+        self.launched.append(str(command))
+        return self._result(self.launch_results)
+

@@ -66,8 +66,8 @@ import campus_reconnect as engine
 from campus_reconnect import (direct_session, edge_fallback,
                               ensure_single_instance, get_credentials,
                               internet_ok, portal_login, portal_reachable,
-                              resolve_port, setup_logging, wifi_reconnect,
-                              wifi_state)
+                              resolve_port, setup_logging, verify_internet,
+                              wifi_reconnect, wifi_state)
 from campus_windows import CredentialStore, ProxyController, default_refresh
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
                                   parse_lock, parse_mode, tray_mode_label)
@@ -128,6 +128,9 @@ DEFAULT_CONFIG = {
     "remote_guard": True,             # 远控探测与远程会话敏感期（只读，默认开启）
     "remote_defer_failback": True,    # 远程会话敏感期推迟自动切回（默认开启）
     "remote_probe_interval": 30,      # 远控探测最小间隔秒数（节流）
+    # ---- V0.4-3：确认在线后清退重启 UU 远程（方案 §3.3）----
+    "remote_restart_enabled": False,  # **默认关闭**：不主动调用即零副作用
+    "remote_restart_cooldown": 300,   # 两次真实清退最小间隔秒数
     # ---- V0.3 P7.5-1A：三轴观测参数（可配置，范围受限）----
     "snapshot_max_age": 8,            # 快照有效期（秒）；依据见 campus_tray_observer
     "snapshot_timeout": 12,           # 单次采集超时（秒）
@@ -291,6 +294,24 @@ def _read_snapshot_keys(text: str) -> dict:
     }
 
 
+def _read_remote_app_keys(text: str) -> dict:
+    """读取 V0.4-3「确认在线后清退重启 UU 远程」两键（非法值一律回退安全默认）。
+
+    与 P6/P7 的读取器分开实现，保持既有读取器返回值稳定（既有测试按整字典断言）：
+    - ``remote_restart_enabled``：非 bool ⇒ **False**（默认关闭，fail-closed）；
+    - ``remote_restart_cooldown``：限幅 60..3600s（防止把冷却压没或设成一天）。
+    """
+    raw = _raw_config(text)
+    enabled = raw.get("remote_restart_enabled")
+    if not isinstance(enabled, bool):
+        enabled = DEFAULT_CONFIG["remote_restart_enabled"]
+    cooldown = raw.get("remote_restart_cooldown")
+    if not isinstance(cooldown, int) or isinstance(cooldown, bool):
+        cooldown = DEFAULT_CONFIG["remote_restart_cooldown"]
+    return {"remote_restart_enabled": enabled,
+            "remote_restart_cooldown": max(60, min(3600, int(cooldown)))}
+
+
 def config_to_dict(config) -> dict:
     """把 :class:`campus_core.Config` 转成托盘内部 dict。"""
     return {
@@ -323,6 +344,7 @@ def load_config() -> dict:
     cfg.update(_read_failover_keys(text))
     cfg.update(_read_remote_keys(text))
     cfg.update(_read_snapshot_keys(text))
+    cfg.update(_read_remote_app_keys(text))
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
@@ -521,6 +543,9 @@ class TrayApp:
         self._last_result = None
         #: Edge 兜底：同一故障周期只自动打开一次（F19）；手动按钮可再次打开。
         self._edge_opened_this_cycle = False
+        #: V0.4-1：**本「在线段」**是否已做过连接后真实上网校验（进入在线段校验一次，
+        #: 判为离线时重置 ⇒ 掉线后再连上/重连成功会重新校验）。
+        self._online_verified = False
         #: 三表分离计时器（V0.3 P2）：网络检测 / Portal 认证冷却 / 网卡切换冷却
         #: 互不干涉；认证冷却只限制 ``_run_repair``，绝不推迟探测（F09 修复）。
         self._timers = TimerTable()
@@ -848,6 +873,98 @@ class TrayApp:
         self.apply_defer_failback(
             not bool(self.config.get("remote_defer_failback", True)))
 
+    # ---------- V0.4-3：确认在线后清退重启 UU 远程 ----------
+    def apply_remote_restart(self, enabled: bool) -> bool:
+        """开关「确认在线后清退重启 UU 远程后台」（方案 §3.3，**默认关闭**）。"""
+        value = bool(enabled)
+        self.update_config({"remote_restart_enabled": value})
+        if not save_config(self.config):
+            self.notify("保存失败", "UU 远程重启设置未能写入配置（已保留原文件）")
+        self.notify("连上后重启 UU 远程已%s" % ("开启" if value else "关闭"),
+                    "确认**真的**连上（连接后上网校验通过）后，清退用户态 "
+                    "GameViewer 进程并按自启项重启（不动服务）"
+                    if value else "不再自动清退 UU 远程后台")
+        if self.icon is not None:
+            self.icon.update_menu()
+        return value
+
+    def on_toggle_remote_restart(self, icon=None, item=None):
+        self.apply_remote_restart(
+            not bool(self.config.get("remote_restart_enabled", False)))
+
+    def _get_remote_app_ops(self):
+        """惰性构建真实清退能力（**默认关闭时不构建、不探测**）。
+
+        注意：方法名刻意**不**叫 ``_remote_app_ops`` —— 实例属性 ``_remote_app_ops``
+        才是可注入的能力对象，同名会在类方法/实例属性之间互相遮蔽。
+        """
+        ops = getattr(self, "_remote_app_ops", None)
+        if ops is None:
+            from campus_remote_app import build_windows_remote_app_ops
+
+            ops = self._remote_app_ops = build_windows_remote_app_ops()
+        return ops
+
+    def _get_restart_guard(self):
+        """清退冷却守卫（进程内保存；冷却值每次按最新配置刷新）。"""
+        guard = getattr(self, "_remote_restart_guard", None)
+        if guard is None:
+            from campus_remote_app import RestartGuard
+
+            guard = self._remote_restart_guard = RestartGuard()
+        from campus_remote_app import DEFAULT_RESTART_COOLDOWN
+
+        guard.cooldown = float(self.config.get("remote_restart_cooldown",
+                                               DEFAULT_RESTART_COOLDOWN))
+        return guard
+
+    def _maybe_restart_remote_app(self):
+        """确认**真的**连上后清退重启 UU 远程后台（V0.4-3）。
+
+        触发点 = 连接后真实上网校验通过（V0.4-1）：「校验通过」本身就是"真的连上"
+        的定义。**默认关闭**：不开开关时本方法直接返回，不构建能力、不探测、零副作用。
+        """
+        if not bool(self.config.get("remote_restart_enabled", False)):
+            return
+        try:
+            ops = self._get_remote_app_ops()
+            guard = self._get_restart_guard()
+        except Exception as exc:       # 能力构建失败不得影响校验线程
+            self.log.warning("UU 远程清退能力不可用: %s", type(exc).__name__)
+            return
+        self._restart_remote_app_async(ops, guard)
+
+    def _restart_remote_app_async(self, ops, guard):
+        """在独立短命线程里执行清退/重启（绝不阻塞监测与校验线程）。"""
+        busy = getattr(self, "_restart_busy", None)
+        if busy is None:
+            busy = self._restart_busy = threading.Event()
+        if busy.is_set():
+            return
+        busy.set()
+
+        def _run():
+            try:
+                from campus_remote_app import restart_user_app
+
+                result = restart_user_app(ops, guard=guard)
+                if result.action == "restart":
+                    self.log.info("UU 远程后台已清退重启：%s（%s）",
+                                  result.detail, result.launched)
+                elif result.ok:
+                    self.log.info("UU 远程后台无需重启：%s", result.detail)
+                else:
+                    self.log.warning("UU 远程后台未重启：%s（%s）",
+                                     result.detail, result.action)
+                    self.notify("UU 远程后台未重启", result.detail)
+            except Exception as exc:   # 清退不得影响监测主流程（防御性边界）
+                self.log.warning("UU 远程清退异常: %s", type(exc).__name__)
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-uu-restart").start()
+
     def _remote_text(self, item=None):
         """菜单中的远程保障摘要（只读）。"""
         status = getattr(self, "remote", None)
@@ -1154,6 +1271,8 @@ class TrayApp:
             self.state["last_ok"] = datetime.now().strftime("%H:%M:%S")
             self.set_state("online", detail)
             self._edge_opened_this_cycle = False   # 网络恢复 → 重置 Edge 限频周期
+            # V0.4-1：重连成功即视为「刚连上」⇒ 做一次真实上网校验（不可只依赖探测跃迁）。
+            self._maybe_verify_online()
             allow = cfg.get("clash_auto_proxy")
             if allow is None:
                 token = self._consent_version
@@ -1387,9 +1506,13 @@ class TrayApp:
         if online:
             if self.state["mode"] != "online":
                 self.set_state("online", "网络正常")
+            # V0.4-1：每个「在线段」做一次真实上网校验（防「连着 Wi-Fi 却打不开网页」）。
+            self._maybe_verify_online()
             self.state["failures"] = 0
             self._edge_opened_this_cycle = False
             return self._next_probe_time(now)
+        # V0.4-1：判为离线即结束本在线段 ⇒ 下次连上重新校验。
+        self._online_verified = False
         self.state["failures"] += 1
         threshold = self._threshold()
         if self.state["failures"] < threshold:
@@ -1406,6 +1529,50 @@ class TrayApp:
         if self.state["mode"] != "offline" or self.state["detail"] != detail:
             self.set_state("offline", detail)
         return self._next_probe_time(now)
+
+    def _maybe_verify_online(self):
+        """一个「在线段」内只做一次连接后校验（V0.4-1）。
+
+        ``_after_repair`` 成功时会**直接**把状态置为 online（不经过 ``_probe_tick`` 的
+        状态跃迁），因此重连成功必须**单独**调用本方法，否则「重连成功」这一需求核心
+        场景会被漏掉。离线时由 :meth:`_probe_tick` 重置标记。
+        """
+        if getattr(self, "_online_verified", False):
+            return
+        self._online_verified = True
+        self._verify_online_async()
+
+    def _verify_online_async(self):
+        """连接后真实上网校验（V0.4-1）——独立短命线程，绝不阻塞监测/重连循环。
+
+        用**专用** :func:`direct_session`（不与工作线程共享 Session，避免并发复用连接池）；
+        结果只记日志/气泡，**不影响**状态机、不触发重认证与路由切换（V0.4 边界）。
+        """
+        busy = getattr(self, "_verify_busy", None)
+        if busy is None:
+            busy = self._verify_busy = threading.Event()
+        if busy.is_set():
+            return
+        busy.set()
+
+        def _run():
+            try:
+                ok, detail = verify_internet(direct_session())
+                if ok:
+                    self.log.info("连接后上网校验通过：%s", detail)
+                    # V0.4-3：确认真连通后清退重启 UU 远程后台（默认关闭）
+                    self._maybe_restart_remote_app()
+                else:
+                    self.log.warning("连接后上网校验未通过，疑似「假死」：%s", detail)
+                    self.notify("网络校验未通过",
+                                "已连上校园网，但真实网页访问失败（疑似假死）：\n%s"
+                                % detail)
+            except Exception as exc:   # 校验不得影响工作线程（防御性边界）
+                self.log.warning("连接后上网校验异常: %s", type(exc).__name__)
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_run, daemon=True, name="campus-verify").start()
 
     def _offline_detail(self) -> str:
         """达到失败阈值后的说明（按模式如实区分，不谎称"正在重连"）。"""
@@ -1754,6 +1921,9 @@ class TrayApp:
             pystray.MenuItem("远程会话中推迟切回", self.on_toggle_defer_failback,
                              checked=lambda item: bool(
                                  self.config.get("remote_defer_failback", True))),
+            pystray.MenuItem("连上后重启 UU 远程后台", self.on_toggle_remote_restart,
+                             checked=lambda item: bool(
+                                 self.config.get("remote_restart_enabled", False))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("立即重连", self.on_reconnect),
             pystray.MenuItem(self._pause_text, self.on_toggle_pause),

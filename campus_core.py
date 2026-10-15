@@ -718,6 +718,8 @@ def validate_config(raw: Any) -> ConfigLoadResult:
         "paused", "failover_mode", "failover_lock", "clash_keep",
         "auto_switch_authorized", "remote_guard", "remote_defer_failback",
         "remote_probe_interval",
+        # V0.4-3：确认在线后清退重启 UU 远程（默认关闭，方案 §3.3）。
+        "remote_restart_enabled", "remote_restart_cooldown",
     }
     unknown_keys = tuple(sorted(k for k in raw if k not in known))
     for key in unknown_keys:

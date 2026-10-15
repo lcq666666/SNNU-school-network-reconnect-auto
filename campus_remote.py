@@ -103,6 +103,8 @@ DEFAULT_REMOTE_CLIENTS: Tuple[RemoteClientSpec, ...] = (
     RemoteClientSpec("rustdesk", "RustDesk", ("rustdesk",)),
     RemoteClientSpec("teamviewer", "TeamViewer", ("teamviewer",)),
     RemoteClientSpec("parsec", "Parsec", ("parsec",)),
+    RemoteClientSpec("gameviewer", "UU 远程（网易 GameViewer）",
+                     ("gameviewer", "uuyc")),
     RemoteClientSpec("rdp", "远程桌面（RDP）", ("rdpclip",)),
 )
 
