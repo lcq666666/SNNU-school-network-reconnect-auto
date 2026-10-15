@@ -117,7 +117,17 @@
 
 ## 4. 环境约定（本机）
 
-- 项目隔离 venv：`.venv/`（由托管 Python 3.13.14 创建）。
+- 项目隔离 venv：`.venv/`（**实测 = CPython 3.14.0**；`pyvenv.cfg` 的 `home` 指向
+  `...\Programs\Python\Python314`。早期文档写的"3.13"已过时，勿据此推断）。
+- **已知环境噪声（未修，非产品缺陷）**：全量 `pytest` 偶发 `Windows fatal exception:
+  code 0x80000003`（STATUS_BREAKPOINT）**中断整轮**；`faulthandler` 堆栈两处均落在
+  `tests/unit/test_f13_save.py::test_t25_concurrent_saves_leave_a_valid_file`
+  → `campus_reconnect_tray.save_config`（多线程并发原子保存的**压力用例**）。
+  单独跑该用例、或 `gc.disable()` 后跑全量均**不复现**；产品运行路径（托盘 UI 线程保存）未见。
+  证据：`snapshots/v04_1_pytest_stdout.txt`（含堆栈）、`v04_1_pytest_gcon.txt`、`gc_repro_attempt1.txt`。
+  定性为解释器/环境层问题（3.14.0 为 3.14 首版），**未改产品代码**；是否固定回 3.13.x 待用户决定。
+- **全量回归的可靠命令**（出"全绿"证据一律用这条，避免被上述噪声打断）：
+  `.venv/Scripts/python.exe -c "import gc; gc.disable(); import pytest, sys; sys.exit(pytest.main(['-q','--junitxml=snapshots/<名称>.xml']))"`
 - 运行/测试/静态检查一律使用 venv 内显式路径：
   - 运行测试：`.venv/Scripts/python.exe -m pytest`
   - 静态检查：`.venv/Scripts/ruff.exe check .`
