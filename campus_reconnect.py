@@ -53,7 +53,8 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          E_PORTAL_UNREACHABLE, MAX_BODY_BYTES, PROBE_EXACT,
                          PROBE_HTML_TITLE, BrowserLaunchResult, PortalResolution,
                          PortalStatus, ProbeResult, ProbeSpec, RepairAdapters,
-                         RepairOptions, RepairResult, LoginOutcome, TimerTable,
+                         RepairOptions, RepairResult, LoginOutcome,
+                         StatusPageResult, TimerTable,
                          check_redirect_target, classify_network,
                          extract_error_hint, parse_status_page, probe_matches,
                          repair_service, resolve_url)
@@ -479,11 +480,33 @@ def configure() -> None:
 def read_status_page(session: requests.Session, port: int,
                      log: Optional[logging.Logger] = None
                      ) -> Optional[object]:
-    """只读获取状态页并解析（不发凭据，F06/F08）。不可达/无法解析返回 ``None``。"""
+    """只读获取状态页并解析（不发凭据，F06/F08）。
+
+    不可达/无法解析返回 ``None``。
+
+    F75-10：未认证的 SNNU 链路上 ``userstatus.jsp`` 会 **302 跳转到 ``login.jsp``**
+    （真机实测），这本身就是「需要认证」的确凿信号；旧实现只接受 2xx，把它当作
+    「无法解析」返回 ``None``，导致只读模式在网络确实需要认证时恒报「未识别」，
+    也让 ``classify_network`` 无法判为需认证。这里对**同源且落在 Portal 流程内**
+    （``login.jsp`` / ``userstatus.jsp``）的 301/302/303 直接判为 ``AUTH_REQUIRED``，
+    **不跟随跳转、不发送任何凭据**；非同源 / 流程外的跳转仍按不可解析处理
+    （fail-closed，不臆断「需要认证」）。
+    """
+    base = portal_base(port)
     try:
-        resp = session.get(portal_base(port) + USERSTATUS_JSP,
-                           timeout=(3, 6), allow_redirects=False)
+        resp = session.get(base + USERSTATUS_JSP, timeout=(3, 6),
+                           allow_redirects=False)
     except requests.RequestException:
+        return None
+    if resp.status_code in (301, 302, 303):
+        ok, _target, reason = check_redirect_target(
+            resp.headers.get("Location", ""), base,
+            allowed_paths=(USERSTATUS_JSP, LOGIN_JSP))
+        if ok:
+            return StatusPageResult(PortalStatus.AUTH_REQUIRED, marker_found=False,
+                                    detail="状态页跳转到登录页，判定需要认证")
+        if log is not None:
+            log.info("状态页重定向未被信任，按不可解析处理：%s", reason)
         return None
     if not 200 <= resp.status_code < 300:
         return None

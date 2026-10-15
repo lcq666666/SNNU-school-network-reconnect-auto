@@ -113,6 +113,53 @@ def test_t17_wifi_disconnected():
     assert classify_network(None, "SNNU", _failing()) is PortalStatus.WIFI_DISCONNECTED
 
 
+# --------------------------------------------------------------------------- #
+# F75-10：只读状态页对"跳转到登录页"的判定（真机实测：302 → login.jsp）
+# --------------------------------------------------------------------------- #
+def _status_url(port=8601):
+    return engine.portal_base(port) + engine.USERSTATUS_JSP
+
+
+def test_f75_10_status_page_redirect_to_login_means_auth_required():
+    """未认证链路上 userstatus.jsp 会 302 到 login.jsp ⇒ 应判「需要认证」。"""
+    from tests.fakes import FakeResponse, FakeSession
+    session = FakeSession()
+    session.route(_status_url(), FakeResponse(
+        302, "", headers={"Location": engine.portal_base(8601) + engine.LOGIN_JSP}))
+    page = engine.read_status_page(session, 8601)
+    assert page is not None, "跳转到登录页被当成「不可解析」，丢失了需要认证的信号"
+    assert page.status is PortalStatus.AUTH_REQUIRED
+    assert page.marker_found is False
+
+
+def test_f75_10_redirect_path_sends_no_credentials():
+    from tests.fakes import FakeResponse, FakeSession
+    session = FakeSession()
+    session.route(_status_url(), FakeResponse(
+        302, "", headers={"Location": engine.portal_base(8601) + engine.LOGIN_JSP}))
+    engine.read_status_page(session, 8601)
+    assert session.posts() == [], "只读识别绝不应发出 POST 凭据"
+    assert len(session.calls) == 1, "判明跳转后不应再跟随请求"
+
+
+def test_f75_10_untrusted_redirect_stays_unparsed():
+    """非同源 / 非 Portal 流程内的跳转不得被臆断为需要认证（fail-closed）。"""
+    from tests.fakes import FakeResponse, FakeSession
+    for location in ("http://evil.example/snnuportal/login.jsp",
+                     engine.portal_base(8601) + "/snnuportal/other.jsp"):
+        session = FakeSession()
+        session.route(_status_url(), FakeResponse(302, "", headers={"Location": location}))
+        assert engine.read_status_page(session, 8601) is None, location
+
+
+def test_f75_10_plain_200_without_marker_is_auth_required():
+    from tests.fakes import FakeResponse, FakeSession
+    session = FakeSession()
+    session.route(_status_url(), FakeResponse(200, "<html>hello</html>"))
+    page = engine.read_status_page(session, 8601)
+    assert page is not None and page.status is PortalStatus.AUTH_REQUIRED
+
+
 def test_diagnose_network_uses_probe_and_status_page(monkeypatch):
     from tests.fakes import FakeResponse, FakeSession
     monkeypatch.setattr(engine, "wifi_state", lambda: ("SNNU", "已连接"))
