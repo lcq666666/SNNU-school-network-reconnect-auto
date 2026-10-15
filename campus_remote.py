@@ -361,8 +361,8 @@ class RemoteSafetyGuard:
 
         if probe.error:
             activity = ACTIVITY_UNKNOWN
-            sensitive = bool(self._last_sensitive_at is not None)
-            reason = "探测失败（%s）：按保守处理（不假定无远程会话）" % probe.error
+            sensitive = True
+            reason = "探测失败：远控状态 UNKNOWN，按保守策略保持敏感期"
         elif established:
             activity = ACTIVITY_ACTIVE
             sensitive = True
@@ -370,6 +370,10 @@ class RemoteSafetyGuard:
                       % (established,
                          ", ".join(sorted({str(r.get("remote_address") or "-")
                                            for r in established_rows}))))
+        elif probe.udp_endpoints and keys:
+            activity = ACTIVITY_UNKNOWN
+            sensitive = True
+            reason = "检测到远控客户端与 UDP 端点，无法确认会话状态，按保守策略处理"
         else:
             activity = ACTIVITY_IDLE
             sensitive = False
@@ -422,9 +426,8 @@ class RemoteSafetyGuard:
             deferred = max(0.0, now - self._defer_since)
             self.defer_count += 1
             if deferred >= self.max_defer_seconds:
-                return True, ("远程会话已持续 %.0fs（≥上限 %.0fs）：按方案 §4.3 "
-                              "放行切回（有线恢复优先，会话可能瞬断）"
-                              % (deferred, self.max_defer_seconds))
+                return False, ("远控状态仍为敏感/未知：超过等待上限，转人工确认，"
+                               "不自动强制切回")
             return False, ("远程会话敏感期（%s）：推迟自动切回 %.0fs/%.0fs"
                            % (status.reason, deferred, self.max_defer_seconds))
         self._defer_since = None
@@ -462,8 +465,11 @@ class RemoteSafetyGuard:
         items.append(self._tray_autostart_item(data))
         items.append(self._credentials_item())
         items.append(RemoteReadinessItem(
-            "remote_reconnect", "远控客户端无人值守/自动重连",
-            False,
+            "external_recovery", "外部进程恢复机制", False,
+            "进程内看门狗无法应对整个进程崩溃：需人工配置并验证独立启动/服务恢复机制",
+            manual=True, severity="manual"))
+        items.append(RemoteReadinessItem(
+            "remote_reconnect", "远控客户端无人值守/自动重连", False,
             "需人工确认：远控客户端允许无人值守访问，且断线后能自动重连"
             "（无法程序化验证）",
             manual=True, severity="manual"))
@@ -483,11 +489,18 @@ class RemoteSafetyGuard:
                 "sleep", "睡眠/休眠", False,
                 "睡眠状态查询失败或无输出：请在电源选项中人工确认已关闭睡眠/休眠",
                 severity="warn")
-        if standby or hibernate:
+        ac_timeout = sleep.get("sleep_timeout_ac")
+        dc_timeout = sleep.get("sleep_timeout_dc")
+        if (standby or hibernate) and (ac_timeout not in (0, "0")
+                                        or dc_timeout not in (0, "0")):
             return RemoteReadinessItem(
                 "sleep", "睡眠/休眠", False,
-                "Standby 可用=%s、休眠可用=%s：无人值守需在电源选项中关闭睡眠/休眠"
-                % (standby, hibernate), severity="warn")
+                "睡眠能力可用且实际电源计划存在超时配置：需关闭睡眠/休眠",
+                severity="warn")
+        if standby or hibernate:
+            return RemoteReadinessItem(
+                "sleep", "睡眠/休眠", True,
+                "系统支持睡眠但实际交流/电池超时均为 0（不自动睡眠）")
         return RemoteReadinessItem(
             "sleep", "睡眠/休眠", True, "睡眠/休眠均不可用（不会因待机失联）")
 
@@ -640,9 +653,14 @@ class MonitorWatchdog:
                 reason="时间跳变 %.0fs ≥%.0fs（睡眠/待机恢复）"
                        % (gap, self.resume_gap),
                 resumed=True)
+        age = float("inf") if heartbeat_age is None else float(heartbeat_age)
+        if alive and age >= self.heartbeat_timeout:
+            return WatchdogDecision(
+                action="RESTART_MONITOR",
+                reason="监测线程仍存活但心跳已陈旧 %.0fs（>%.0fs）"
+                       % (age, self.heartbeat_timeout))
         if alive:
             return WatchdogDecision(action="OK", reason="监测线程存活")
-        age = float("inf") if heartbeat_age is None else float(heartbeat_age)
         if age < self.heartbeat_timeout:
             return WatchdogDecision(
                 action="OK",

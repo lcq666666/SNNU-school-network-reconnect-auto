@@ -101,7 +101,7 @@ def test_u7_03_sensitive_uses_established_not_listen():
 
     udp_only = guard.observe(_probe(clients=[_proc()], udp_endpoints=[
         {"local_address": "0.0.0.0", "local_port": 41641, "pid": 6864}]), now=1.0)
-    assert udp_only.active is False and udp_only.sensitive is False
+    assert udp_only.active is False and udp_only.sensitive is True
     assert udp_only.udp_endpoints == 1
 
     busy = guard.observe(_probe(clients=[_proc()], ports=[_port()]), now=2.0)
@@ -165,8 +165,8 @@ def test_u7_08_max_defer_releases_failback():
     still = guard.failback_gate(now=599.0)
     assert still[0] is False
     capped, why = guard.failback_gate(now=601.0)
-    assert capped is True
-    assert "上限" in why and "会话可能瞬断" in why
+    assert capped is False
+    assert "人工确认" in why and "上限" in why
 
 
 def test_u7_09_disabled_defer_and_gate_exception():
@@ -223,9 +223,10 @@ def test_u7_11_readiness_full_pass():
     assert report.ok is True, report.warnings
     assert [i.key for i in report.items] == ["sleep", "auto_logon",
                                               "remote_client", "tray_autostart",
-                                              "credentials", "remote_reconnect"]
+                                              "credentials", "external_recovery",
+                                              "remote_reconnect"]
     manual = [i for i in report.items if i.manual]
-    assert len(manual) == 1 and manual[0].key == "remote_reconnect"
+    assert len(manual) == 2
     payload = report.to_dict()
     assert payload["ok"] is True and payload["items"]
 

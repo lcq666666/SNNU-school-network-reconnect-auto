@@ -372,9 +372,8 @@ def test_i7_06_single_side_effect_gate_holds_throughout():
     executed = [o.kind for r in results for o in r.executed]
     assert set(planned) <= {OpKind.METRIC_WRITE}
     assert set(executed) <= {OpKind.METRIC_WRITE}
-    # 接管 1 次 + 切回 2 次（第一次切回未过出口验证被撤销后重试成功）
-    assert len(executed) == 3
-    assert len(ops.writes) == 4
-    # 安全阀：1 次推迟后达到上限放行，且此后不再重复推迟
-    assert manager.failback_deferred == 1
-    assert any("≥上限" in n for n in results[12].notes)
+    # P7.5-5：敏感期超过等待上限后转人工，不强制切回，不破坏远控会话。
+    assert len(executed) == 1
+    assert len(ops.writes) == 2
+    assert manager.failback_deferred > 0
+    assert all("≥上限" not in n for r in results for n in r.notes)
