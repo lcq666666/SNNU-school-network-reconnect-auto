@@ -48,13 +48,16 @@ DEFAULT_TCP_TARGETS: Tuple[Tuple[str, int], ...] = (
     ("1.1.1.1", 443), ("8.8.8.8", 443))
 
 #: HTTP/HTTPS 内容探测点（严格匹配，复用 V0.2 ProbeSpec/probe_matches）。
+#: P8/K-5（2026-10-15 真机取证）：原先的 ``www.msftconnecttest.com``（http 与 https 两条）
+#: 在本校园网 **3/3 不可达**（DNS/连接失败），已换成实测可达的等价目标（各 3/3 通过）。
+#: 保留 ``http://`` 与 ``https://`` 双 scheme，并分属三家不同供应商（Mozilla/Apple/Microsoft）。
 DEFAULT_HTTP_TARGETS: Tuple[ProbeSpec, ...] = (
-    ProbeSpec("https://www.msftconnecttest.com/connecttest.txt",
-              "Microsoft Connect Test", PROBE_EXACT),
+    ProbeSpec("https://detectportal.firefox.com/success.txt",
+              "success", PROBE_EXACT),
     ProbeSpec("https://captive.apple.com/hotspot-detect.html",
               "Success", PROBE_HTML_TITLE),
-    ProbeSpec("http://www.msftconnecttest.com/connecttest.txt",
-              "Microsoft Connect Test", PROBE_EXACT),
+    ProbeSpec("http://www.msftncsi.com/ncsi.txt",
+              "Microsoft NCSI", PROBE_EXACT),
 )
 
 #: DNS 探测名（任一成功即认为解析器工作）。

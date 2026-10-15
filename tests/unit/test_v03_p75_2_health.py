@@ -87,6 +87,21 @@ def test_plain_http_portal_probe_is_available_without_disabling_tls():
     assert any(spec.url.startswith("https://") for spec in DEFAULT_HTTP_TARGETS)
 
 
+def test_p8_k5_axis_http_targets_avoid_unreachable_host_and_keep_diversity():
+    """P8/K-5（2026-10-15 真机取证）：``www.msftconnecttest.com`` 在本校园网 **3/3 不可达**
+    （DNS/连接失败），不得再留在分轴探测点表里——否则每个轴恒有一条失败证据、每次多付
+    一次连接失败。同时必须保留 ``http://`` 与 ``https://`` 两种 scheme 且目标互不重复
+    （"任一 http 命中即健康"，单点失败不得判全网断）。
+    """
+    from campus_network import DEFAULT_HTTP_TARGETS
+    urls = [spec.url for spec in DEFAULT_HTTP_TARGETS]
+    assert len(urls) >= 3, urls
+    assert len(set(urls)) == len(urls), urls
+    assert all("msftconnecttest.com" not in url for url in urls), urls
+    assert any(url.startswith("http://") for url in urls), urls
+    assert any(url.startswith("https://") for url in urls), urls
+
+
 def test_p75_3_binding_refresh_replaces_dhcp_source_before_auth():
     from campus_snnu import InterfaceBinding, SnnuBackupLink, SnnuOps
     from tests.fakes import FakeInterfaceBinder, FakeSnnuLink
