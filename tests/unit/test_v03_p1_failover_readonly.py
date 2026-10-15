@@ -17,7 +17,8 @@ from tests.fakes import (FakeProbeEngine, FakeResponse, FakeSession,
                          healthy_http_table, matching_http_response)
 from tools import netdiag
 
-from campus_network import DEFAULT_HTTP_TARGETS, HealthState, evaluate
+from campus_network import (DEFAULT_HTTP_TARGETS, DEFAULT_TCP_TARGETS,
+                            HealthState, evaluate)
 
 ETH_ADAPTER = {"Name": "以太网",
                "InterfaceDescription": "Intel(R) Ethernet Connection (16) I219-V",
@@ -105,7 +106,7 @@ def _engine(wifi_state: str, *, best_route_if_index: int = 10) -> FakeProbeEngin
     if wifi_state == "down":
         # 仅 Wi-Fi 源地址的公网探测失败（以太网路径不受影响）
         wifi_src = ("10.252.37.88", 0)
-        for host, port in (("1.1.1.1", 443), ("8.8.8.8", 443)):
+        for host, port in DEFAULT_TCP_TARGETS:   # P8/K-6：跟随真实探测点表
             eng.tcp[(host, port, wifi_src)] = False
     eng.dns.update({"default": True})
     # 出口证明：系统最佳路由（以太网在线时为 10，断开后为 5）

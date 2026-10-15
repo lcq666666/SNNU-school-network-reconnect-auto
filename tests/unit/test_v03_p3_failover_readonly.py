@@ -19,7 +19,8 @@ from types import SimpleNamespace
 import campus_reconnect as engine
 from campus_failover import (FailoverMode, FailoverPolicy, FailoverState,
                              NetworkFailoverManager)
-from campus_network import CONTRACT_VERSION as HEALTH_CONTRACT, DEFAULT_HTTP_TARGETS, evaluate
+from campus_network import (CONTRACT_VERSION as HEALTH_CONTRACT,
+                            DEFAULT_HTTP_TARGETS, DEFAULT_TCP_TARGETS, evaluate)
 from tests.fakes import (FakeProbeEngine, FakeResponse, FakeSession,
                          healthy_http_table, matching_http_response)
 from tools import netdiag
@@ -98,7 +99,7 @@ def _engine(wifi_state: str, *, best_route_if_index: int = 10) -> FakeProbeEngin
                           "login.jsp")
     if wifi_state == "down":
         wifi_src = ("10.252.37.88", 0)
-        for host, port in (("1.1.1.1", 443), ("8.8.8.8", 443)):
+        for host, port in DEFAULT_TCP_TARGETS:   # P8/K-6：跟随真实探测点表
             eng.tcp[(host, port, wifi_src)] = False
     eng.dns.update({"default": True})
     eng.routes.update({

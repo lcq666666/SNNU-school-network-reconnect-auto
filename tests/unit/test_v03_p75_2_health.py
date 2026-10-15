@@ -102,6 +102,24 @@ def test_p8_k5_axis_http_targets_avoid_unreachable_host_and_keep_diversity():
     assert any(url.startswith("https://") for url in urls), urls
 
 
+def test_p8_k6_axis_tcp_targets_avoid_blocked_hosts_and_keep_diversity():
+    """P8/K-6（2026-10-15 真机取证）：``1.1.1.1:443`` 与 ``8.8.8.8:443`` 在本校园网
+    **2/2 超时不可达**（各 4s 超时），不得再留在分轴 TCP 探测点表里——否则每个轴恒有
+    一条失败证据、每轮多付两次连接超时。换为实测可达（~15ms）且分属两家不同供应商的
+    公共 DoH 端点（裸 IP，不依赖 DNS），且必须保留双点聚合（单点失败不得判全网断）。
+    """
+    from campus_network import DEFAULT_TCP_TARGETS
+    hosts = [host for host, _port in DEFAULT_TCP_TARGETS]
+    assert len(DEFAULT_TCP_TARGETS) >= 2, DEFAULT_TCP_TARGETS
+    assert len(set(hosts)) == len(hosts), "TCP 探测点重复：%r" % (DEFAULT_TCP_TARGETS,)
+    for blocked in ("1.1.1.1", "8.8.8.8"):
+        assert blocked not in hosts, \
+            "真机实测不可达的 TCP 探测点仍在列表中：%r" % (DEFAULT_TCP_TARGETS,)
+    assert set(hosts) == {"223.5.5.5", "120.53.53.53"}, \
+        "TCP 探测点不是真机实测可达的两家不同供应商端点：%r" % (DEFAULT_TCP_TARGETS,)
+    assert all(port == 443 for _host, port in DEFAULT_TCP_TARGETS), DEFAULT_TCP_TARGETS
+
+
 def test_p75_3_binding_refresh_replaces_dhcp_source_before_auth():
     from campus_snnu import InterfaceBinding, SnnuBackupLink, SnnuOps
     from tests.fakes import FakeInterfaceBinder, FakeSnnuLink

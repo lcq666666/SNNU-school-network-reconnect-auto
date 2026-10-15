@@ -13,7 +13,8 @@ from types import SimpleNamespace
 
 from tools import netdiag
 
-from campus_network import (CONTRACT_VERSION, DEFAULT_HTTP_TARGETS, HealthAxis,
+from campus_network import (CONTRACT_VERSION, DEFAULT_HTTP_TARGETS,
+                            DEFAULT_TCP_TARGETS, HealthAxis,
                             HealthState, evaluate, recommend_path, resolve_roles)
 from tests.fakes import healthy_http_table, matching_http_response
 
@@ -182,9 +183,13 @@ def test_u1_02_probes_use_source_address_binding(fake_engine):
     assert fake_engine.calls["tcp"], "未执行 TCP 探测"
     wifi_source = ("10.252.37.88", 0)
     eth_source = ("192.168.124.9", 0)
+    # P8/K-6：探测点表可能调整，断言用真实表推导，避免改表即挂。
+    tcp_host, tcp_port = DEFAULT_TCP_TARGETS[0]
     # Wi-Fi 轴探测绑定 Wi-Fi 源地址，以太网轴绑定以太网源地址
-    assert any(c == ("1.1.1.1", 443, wifi_source) for c in fake_engine.calls["tcp"])
-    assert any(c == ("1.1.1.1", 443, eth_source) for c in fake_engine.calls["tcp"])
+    assert any(c == (tcp_host, tcp_port, wifi_source)
+               for c in fake_engine.calls["tcp"])
+    assert any(c == (tcp_host, tcp_port, eth_source)
+               for c in fake_engine.calls["tcp"])
     assert any(c[0].startswith("https://") and c[1] == wifi_source
                for c in fake_engine.calls["http"])
     assert all(c[2] in (wifi_source, eth_source)
@@ -196,7 +201,7 @@ def test_u1_02_probes_use_source_address_binding(fake_engine):
 # --------------------------------------------------------------------------- #
 def test_u1_03_single_site_failure_keeps_healthy(fake_engine):
     _healthy_engine(fake_engine)
-    fake_engine.tcp[("1.1.1.1", 443)] = False                      # 一个 TCP 点失败
+    fake_engine.tcp[DEFAULT_TCP_TARGETS[0]] = False                # 一个 TCP 点失败
     fake_engine.http["https://captive.apple.com/hotspot-detect.html"] = \
         {"status_code": 0, "redirected": False, "body": "",
          "error": "timeout"}                                       # 一个 HTTP 点失败
