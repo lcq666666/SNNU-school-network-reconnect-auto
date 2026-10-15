@@ -85,6 +85,21 @@ def _wire(monkeypatch, *, status=PortalStatus.AUTH_REQUIRED, reachable=True,
             return SimpleNamespace(if_index=5, source_ip="10.252.37.88")
 
     monkeypatch.setattr(engine, "NetworkObserver", lambda runner: _Observer())
+    class _Scoped:
+        interface_bound = True
+        def bind_session(self, session):
+            session.trust_env = False
+            session.mount("http://", object())
+            session.mount("https://", object())
+            return True
+        def tcp_connect(self, host, port, timeout=None):
+            return True
+        def http_probe(self, url, timeout=None):
+            return SimpleNamespace(status_code=200, redirected=False,
+                                   final_url=url, body="Microsoft Connect Test", error="")
+        def dns_resolve(self, name):
+            return True
+    probe_engine.for_interface = lambda if_index, source_ip, dns=(): _Scoped()
     monkeypatch.setattr(engine, "WindowsProbeEngine", lambda: probe_engine)
     monkeypatch.setattr(engine, "internet_ok",
                         lambda session: (True, "msftconnecttest"))

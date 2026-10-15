@@ -13,16 +13,14 @@
 - 复用 V0.2 既有能力：``tools/netdiag`` 只读取证管道（P0）、
   ``campus_core.probe_matches`` 严格内容匹配（F08/T18）、
   ``campus_reconnect.internet_ok`` 全局探测语义（由调用方注入）；
-- 不做 Windows 出口臆断：每接口探测**绑定源地址**，且必须用
-  Find-NetRoute 证明目标路由与被测接口一致；无法证明时判
-  :attr:`HealthState.PROBE_UNRELIABLE`（不假定成功，方案 §3.2）；
+- 指定接口探测使用 IP_UNICAST_IF 回读确认 + 源地址绑定；系统最佳路由仅描述
+  当前系统出口，不冒充备用接口的传输证据。约束失败则 PROBE_UNRELIABLE。
 - 多站点聚合：任何单一探测点失败都不构成"全网断"结论；
 - 危险动作黑名单同样适用：本模块没有任何写操作入口。
 """
 from __future__ import annotations
 
-import re
-import socket
+import ipaddress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -55,12 +53,14 @@ DEFAULT_HTTP_TARGETS: Tuple[ProbeSpec, ...] = (
               "Microsoft Connect Test", PROBE_EXACT),
     ProbeSpec("https://captive.apple.com/hotspot-detect.html",
               "Success", PROBE_HTML_TITLE),
+    ProbeSpec("http://www.msftconnecttest.com/connecttest.txt",
+              "Microsoft Connect Test", PROBE_EXACT),
 )
 
 #: DNS 探测名（任一成功即认为解析器工作）。
 DEFAULT_DNS_TARGETS: Tuple[str, ...] = ("www.baidu.com", "www.qq.com")
 
-#: 网关探测端口（连接被拒绝也算"主机可达"）。
+#: 网关端口仅用于诊断；不响应不能单独判定网关不可达。
 DEFAULT_GATEWAY_PORTS: Sequence[int] = (443, 80)
 
 #: Portal 劫持特征（命中重定向目标即判 CAPTIVE_PORTAL）。
@@ -318,64 +318,16 @@ def bind_source_address(session: Any, source_ip: Optional[str]) -> bool:
 
 
 class WindowsProbeEngine:
-    """真实探测引擎（仅 Windows 实机使用；零配置信任环境）。
-
-    - TCP：``socket.create_connection`` + ``source_address`` 绑定；
-      连接被拒绝视为"主机可达"（网关探测据此区分拒绝与超时）；
-    - HTTP：``requests.Session(trust_env=False)`` + 源地址绑定适配器；
-    - DNS：``getaddrinfo``；
-    - 路由查询：由 :class:`NetworkObserver` 提供（不在本类）。
-    """
+    """只提供指定接口的受限探测工厂，不提供全局 DNS 回退。"""
 
     def __init__(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
         self.timeout = timeout
 
-    def tcp_connect(self, host: str, port: int, timeout: Optional[float] = None,
-                    source_address: Optional[Tuple[str, int]] = None) -> bool:
-        try:
-            socket.create_connection((host, port),
-                                     timeout=self.timeout if timeout is None
-                                     else timeout,
-                                     source_address=source_address)
-        except ConnectionRefusedError:
-            return True          # 主机可达（端口拒绝连接）
-        except OSError:
-            return False         # 超时 / 网络不可达 / 绑定失败
-        return True
+    def for_interface(self, if_index, source_ip, dns_servers=()):
+        from campus_transport import InterfaceTransport
+        return InterfaceTransport(if_index, source_ip, dns_servers,
+                                  timeout=self.timeout)
 
-    def http_probe(self, url: str, timeout: Optional[float] = None,
-                   source_address: Optional[Tuple[str, int]] = None) -> Any:
-        import requests
-        from types import SimpleNamespace
-
-        session = requests.Session()
-        session.trust_env = False
-        if source_address:
-            _SourceAddressAdapter(source_address).mount(session)
-        try:
-            resp = session.get(url, allow_redirects=False,
-                               timeout=(self.timeout,
-                                        2 * self.timeout),
-                               headers={"User-Agent":
-                                        "CampusReconnect-netdiag/1.0"})
-        except requests.RequestException as exc:
-            return SimpleNamespace(status_code=0, redirected=False,
-                                   final_url="", body="",
-                                   error=type(exc).__name__)
-        body = resp.text[:512] if resp.status_code == 200 else ""
-        return SimpleNamespace(status_code=resp.status_code,
-                               redirected=bool(resp.is_redirect or
-                                               300 <= resp.status_code < 400
-                                               and "Location" in resp.headers),
-                               final_url=resp.url or "",
-                               body=body, error="")
-
-    def dns_resolve(self, name: str) -> bool:
-        try:
-            socket.getaddrinfo(name, None)
-        except OSError:
-            return False
-        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -389,13 +341,12 @@ def _attr(value: Any, name: str, default: Any = None) -> Any:
 
 
 def _valid_ipv4(address: Optional[str]) -> bool:
-    """可用 IPv4：非空、非 APIPA、非回环、非 0.0.0.0。"""
-    if not address:
+    """严格验证非 APIPA/回环/组播/未指定的 IPv4 源地址。"""
+    try:
+        ip = ipaddress.IPv4Address(address)
+    except (ValueError, TypeError, ipaddress.AddressValueError):
         return False
-    text = str(address).strip()
-    if text.startswith(APIPA_PREFIX) or text.startswith("127."):
-        return False
-    return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", text))
+    return not (ip.is_link_local or ip.is_loopback or ip.is_unspecified or ip.is_multicast)
 
 
 def _pick_ipv4(report: Any, if_index: Optional[int]) -> Optional[str]:
@@ -417,6 +368,15 @@ def _default_route(report: Any, if_index: Optional[int]) -> Optional[Any]:
                 and row.get("address_family") == "IPv4"):
             return row
     return None
+
+
+def _interface_dns(report: Any, if_index: Optional[int]) -> List[str]:
+    """仅取该接口的 IPv4 DNS 配置；不回退系统全局解析器。"""
+    servers = []
+    for row in getattr(report, "dns_servers", []):
+        if row.get("if_index") == if_index:
+            servers.extend(row.get("server_addresses") or [])
+    return servers
 
 
 def _portal_hit(redirected: bool, final_url: str, body: str) -> bool:
@@ -448,158 +408,97 @@ class InterfaceHealthChecker:
         self.remote_targets = tuple(remote_targets)
         self.timeout = timeout
 
-    # ---- 单层 ---- #
-    def _tcp(self, host: str, port: int, source: Tuple[str, int]) -> bool:
-        return bool(self.engine.tcp_connect(host, port, timeout=self.timeout,
-                                            source_address=source))
-
-    def _http(self, spec: ProbeSpec, source: Tuple[str, int]) -> Any:
-        return self.engine.http_probe(spec.url, timeout=self.timeout,
-                                      source_address=source)
-
     def check(self, axis: HealthAxis, adapter: Any, report: Any,
               route_lookup: Optional[Callable[[str], Any]] = None
               ) -> InterfaceHealth:
+        # route_lookup 只描述系统最佳路由，不作为指定接口传输的证明。
         evidence: List[str] = []
         layers: List[ProbeOutcome] = []
+        name = getattr(adapter, "name", "")
+        index = getattr(adapter, "if_index", None)
+        ipv4 = _pick_ipv4(report, index)
+        confirmed = None
 
-        def _record(layer: str, target: str, ok: bool, detail: str = "",
-                    kind: str = "") -> None:
+        def record(layer, target, ok, detail="", kind=""):
             layers.append(ProbeOutcome(layer, target, ok, detail, kind))
             if not ok:
-                evidence.append("%s 层探测失败：%s%s" %
-                                (layer, target,
-                                 ("（%s）" % detail) if detail else ""))
+                evidence.append("%s 层：%s（%s）" % (layer, target, detail))
 
-        # 1) 链路
-        status = str(getattr(adapter, "status", "") or "").strip().lower()
+        def result(state):
+            return InterfaceHealth(axis, name, index, state, evidence, layers,
+                                   confirmed, ipv4)
+
+        status = str(getattr(adapter, "status", "")).lower()
+        record("link", name, status == "up", "Status=%s" % status)
         if status != "up":
-            evidence.insert(0, "网卡状态非 Up：%s" % (adapter.status or "未知"))
-            _record("link", str(getattr(adapter, "name", "")), False,
-                    "Status=%s" % (adapter.status or "未知"))
-            return InterfaceHealth(axis, getattr(adapter, "name", ""),
-                                   getattr(adapter, "if_index", None),
-                                   HealthState.LINK_DOWN, evidence, layers,
-                                   None, None)
-        _record("link", str(adapter.name), True, "Status=Up")
-
-        # 2) IP
-        ipv4 = _pick_ipv4(report, getattr(adapter, "if_index", None))
+            return result(HealthState.LINK_DOWN)
+        record("ip", str(ipv4 or ""), _valid_ipv4(ipv4))
         if not _valid_ipv4(ipv4):
-            _record("ip", str(ipv4 or "(无 IPv4 地址)"), False,
-                    "APIPA/无有效地址" if ipv4 else "无 IPv4 地址")
-            evidence.insert(0, "%s：无有效 IPv4（%s）" %
-                            (adapter.name, ipv4 or "未获取"))
-            return InterfaceHealth(axis, adapter.name, adapter.if_index,
-                                   HealthState.NO_IP, evidence, layers,
-                                   None, ipv4)
-        source: Tuple[str, int] = (str(ipv4), 0)
-        _record("ip", ipv4, True)
+            return result(HealthState.NO_IP)
+        route = _default_route(report, index)
+        gateway = str(route.get("next_hop") or "") if route else ""
+        if not gateway or gateway == "0.0.0.0":
+            record("gateway", "(无默认路由)", False, "接口无有效 IPv4 默认路由")
+            return result(HealthState.GATEWAY_UNREACHABLE)
 
-        # 3) 网关：默认路由 + 可达性
-        route = _default_route(report, adapter.if_index)
-        next_hop = str(route.get("next_hop") or "") if route else ""
-        if route is None or not next_hop or next_hop == "0.0.0.0":
-            _record("gateway", "(无默认路由)", False,
-                    "该接口无有效 IPv4 默认路由")
-            return InterfaceHealth(axis, adapter.name, adapter.if_index,
-                                   HealthState.GATEWAY_UNREACHABLE, evidence,
-                                   layers, None, ipv4)
-        gateway_ok = False
+        factory = getattr(self.engine, "for_interface", None)
+        try:
+            scoped = factory(index, ipv4, _interface_dns(report, index)) if callable(factory) else None
+            confirmed = getattr(scoped, "interface_bound", None)
+        except Exception as exc:
+            scoped = None
+            evidence.append("接口约束失败：%s" % type(exc).__name__)
+        record("route", "ifIndex=%s" % index, confirmed is True,
+               "IP_UNICAST_IF + 源地址绑定（不是系统最佳路由）")
+        if confirmed is not True:
+            return result(HealthState.PROBE_UNRELIABLE)
+
+        # 网关不一定开放 TCP 端口；仅作为诊断提示，不截断公网验证。
         for port in self.gateway_ports:
-            if self._tcp(next_hop, port, source):
-                gateway_ok = True
-                _record("gateway", "%s:%d" % (next_hop, port), True)
+            ok = scoped.tcp_connect(gateway, port, timeout=self.timeout)
+            record("gateway", "%s:%d" % (gateway, port), bool(ok),
+                   "端口不响应不等同网关不可达" if not ok else "")
+            if ok:
                 break
-            _record("gateway", "%s:%d" % (next_hop, port), False, "超时/不可达")
-        if not gateway_ok:
-            return InterfaceHealth(axis, adapter.name, adapter.if_index,
-                                   HealthState.GATEWAY_UNREACHABLE, evidence,
-                                   layers, None, ipv4)
-
-        # 4) 出口确认（方案 §3.2：无法证明实际出口 → 不假定成功）
-        confirmed: Optional[bool] = None
-        if route_lookup is not None:
-            target = self.tcp_targets[0][0]
-            egress = route_lookup(target)
-            if egress is None:
-                _record("route", target, False, "路由查询失败，无法证明实际出口")
-            else:
-                egress_if = _attr(egress, "if_index")
-                confirmed = (egress_if == adapter.if_index)
-                _record("route", target, confirmed,
-                        "系统最佳出口 ifIndex=%s（被测接口 ifIndex=%s）"
-                        % (egress_if, adapter.if_index))
-        else:
-            _record("route", "(未提供路由查询)", False, "无出口确认手段")
-
-        # 5) 公网 TCP（多点）
         tcp_ok = 0
         for host, port in self.tcp_targets:
-            if self._tcp(host, port, source):
-                tcp_ok += 1
-                _record("tcp", "%s:%d" % (host, port), True)
-            else:
-                _record("tcp", "%s:%d" % (host, port), False, "连接失败/超时")
-
-        # 6) HTTP 内容（多点，严格匹配；重定向到 Portal → CAPTIVE_PORTAL）
-        http_ok = 0
-        portal_hits = 0
+            ok = bool(scoped.tcp_connect(host, port, timeout=self.timeout))
+            tcp_ok += int(ok)
+            record("tcp", "%s:%d" % (host, port), ok)
+        http_ok = portal_hits = 0
         for spec in self.http_targets:
-            probe = self._http(spec, source)
+            probe = scoped.http_probe(spec.url, timeout=self.timeout)
             status_code = _attr(probe, "status_code", 0) or 0
             redirected = bool(_attr(probe, "redirected", False))
             body = str(_attr(probe, "body", "") or "")
-            error = str(_attr(probe, "error", "") or "")
             final_url = str(_attr(probe, "final_url", "") or "")
-            if probe_matches(spec, status_code, body, redirected=redirected):
-                http_ok += 1
-                _record("http", spec.url, True)
-            elif _portal_hit(redirected, final_url, body):
-                portal_hits += 1
-                _record("http", spec.url, False, "重定向至 Portal：%s"
-                        % (final_url or "未知"), "captive")
-            else:
-                _record("http", spec.url, False,
-                        error or ("status=%s" % status_code),
-                        "http_status" if status_code else error or "unknown")
-
-        # 7) DNS（任一成功即可）
+            ok = probe_matches(spec, status_code, body, redirected=redirected)
+            portal = _portal_hit(redirected, final_url, body)
+            http_ok += int(ok)
+            portal_hits += int(portal)
+            record("http", spec.url, ok,
+                   "Portal 重定向" if portal else str(_attr(probe, "error", "")),
+                   "captive" if portal else "")
         dns_ok = 0
-        for name in self.dns_targets:
-            if self.engine.dns_resolve(name):
-                dns_ok += 1
-                _record("dns", name, True)
-            else:
-                _record("dns", name, False, "解析失败", "dns")
-
-        # 8) 可选：远控服务可达性（仅记录，不参与判定）
+        for target in self.dns_targets:
+            ok = bool(scoped.dns_resolve(target))
+            dns_ok += int(ok)
+            record("dns", target, ok, "" if ok else "本接口 DNS 解析失败", "dns")
         for host, port in self.remote_targets:
-            ok = self._tcp(host, port, source)
-            _record("remote", "%s:%d" % (host, port), ok,
-                    "" if ok else "不可达")
+            record("remote", "%s:%d" % (host, port),
+                   bool(scoped.tcp_connect(host, port, timeout=self.timeout)))
 
-        # 分类（保守优先：不可证 > 不可达 > 内容层 > 健康）
-        if confirmed is not True:
-            state = HealthState.PROBE_UNRELIABLE
-            evidence.append("无法证明探测经由本接口出口（源地址已绑定，但路由"
-                            "确认缺失或指向其他接口）")
-        elif tcp_ok == 0:
-            state = HealthState.INTERNET_UNREACHABLE
-        elif dns_ok == 0:
-            state = HealthState.DNS_FAILURE
-        elif portal_hits > 0 and http_ok == 0:
+        if portal_hits and not http_ok:
             state = HealthState.CAPTIVE_PORTAL
-        elif http_ok > 0:
+        elif dns_ok == 0:
+            state = HealthState.DNS_FAILURE if tcp_ok or http_ok else HealthState.INTERNET_UNREACHABLE
+        elif http_ok:
             state = HealthState.HEALTHY
             if tcp_ok < len(self.tcp_targets) or http_ok < len(self.http_targets):
                 evidence.append("部分探测失败（多站点聚合后仍判健康）")
         else:
             state = HealthState.INTERNET_UNREACHABLE
-            evidence.append("TCP 可达但 HTTP 内容层全部失败（矛盾，按不可用处理）")
-
-        return InterfaceHealth(axis, adapter.name, adapter.if_index, state,
-                               evidence, layers, confirmed, ipv4)
+        return result(state)
 
 
 def _state_text(state: Optional[HealthState]) -> str:

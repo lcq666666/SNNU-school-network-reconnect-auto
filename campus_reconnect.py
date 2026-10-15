@@ -774,6 +774,14 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         return repair_service(bound_session, options, time.monotonic,
                               _cli_adapters(), get_credentials, log=log)
 
+    def _bind_interface(bound_session, binding):
+        from campus_network import _interface_dns
+        report = observer.observe(target_ssid="SNNU")
+        transport = WindowsProbeEngine().for_interface(
+            binding.if_index, binding.source_ip,
+            _interface_dns(report, binding.if_index))
+        return transport.bind_session(bound_session)
+
     return SnnuOps(
         wifi_state=lambda: wifi_state(interface),
         wifi_reconnect=lambda ssid: wifi_reconnect(ssid, log,
@@ -784,6 +792,7 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         portal_reachable=portal_reachable,
         read_status=lambda sess, port: read_status_page(sess, port, log),
         repair=_repair,
+        bind_interface=_bind_interface,
     )
 
 

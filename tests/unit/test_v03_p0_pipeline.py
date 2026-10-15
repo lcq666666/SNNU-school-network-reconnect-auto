@@ -30,6 +30,7 @@ FULL_STUB = {
     "cim_adapters": CIM_ADAPTERS_JSON,
     "ip_interfaces": IP_INTERFACES_JSON,
     "ip_addresses": IP_ADDRESSES_JSON,
+    "dns_servers": '[{"InterfaceIndex":5,"ServerAddresses":["10.0.0.1"]}]',
     "default_routes": DEFAULT_ROUTES_JSON,
     "egress_v4": EGRESS_V4_JSON,
     "egress_v6": EGRESS_V6_JSON,

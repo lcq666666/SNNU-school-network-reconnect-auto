@@ -113,6 +113,9 @@ _COMMANDS: Dict[str, str] = {
         "Get-NetIPAddress | Select-Object ifIndex,InterfaceAlias,AddressFamily,"
         "IPAddress,PrefixLength,PrefixOrigin,SuffixOrigin,AddressState | "
         "ConvertTo-Json -Depth 2 -Compress"),
+    "dns_servers": (
+        "Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object "
+        "InterfaceIndex,ServerAddresses | ConvertTo-Json -Depth 3 -Compress"),
     "default_routes": (
         "Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction "
         "SilentlyContinue | Select-Object ifIndex,InterfaceAlias,"
@@ -471,6 +474,17 @@ def parse_ip_addresses(payload: Any) -> List[Dict[str, Any]]:
     return rows
 
 
+def parse_dns_servers(payload: Any) -> List[Dict[str, Any]]:
+    rows = []
+    for row in _as_list(payload):
+        addresses = _pick(row, "ServerAddresses") or []
+        if isinstance(addresses, str):
+            addresses = [addresses]
+        rows.append({"if_index": _as_int(_pick(row, "InterfaceIndex", "ifIndex")),
+                     "server_addresses": list(addresses)})
+    return rows
+
+
 def parse_default_routes(payload: Any) -> List[Dict[str, Any]]:
     """解析默认路由（0.0.0.0/0 与 ::/0）；地址族由前缀推导。"""
     rows: List[Dict[str, Any]] = []
@@ -825,6 +839,7 @@ class DiagReport:
     remote_control: Dict[str, Any] = field(default_factory=dict)
     errors: List[Dict[str, str]] = field(default_factory=list)
     commands_executed: List[str] = field(default_factory=list)
+    dns_servers: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -835,6 +850,7 @@ class DiagReport:
             "adapters": [a.to_dict() for a in self.adapters],
             "ip_interfaces": list(self.ip_interfaces),
             "ip_addresses": list(self.ip_addresses),
+            "dns_servers": list(self.dns_servers),
             "default_routes": list(self.default_routes),
             "egress": dict(self.egress),
             "wifi": dict(self.wifi),
@@ -1033,6 +1049,7 @@ def collect(runner: Any, *, target_ssid: str = DEFAULT_TARGET_SSID,
     adapters = parse_adapters(_out("adapters"), _out("cim_adapters"))
     ip_interfaces = parse_ip_interfaces(_out("ip_interfaces"))
     ip_addresses = parse_ip_addresses(_out("ip_addresses"))
+    dns_servers = parse_dns_servers(_out("dns_servers"))
     routes = parse_default_routes(_out("default_routes"))
 
     egress: Dict[str, Any] = {}
@@ -1078,6 +1095,7 @@ def collect(runner: Any, *, target_ssid: str = DEFAULT_TARGET_SSID,
         adapters=adapters,
         ip_interfaces=ip_interfaces,
         ip_addresses=ip_addresses,
+        dns_servers=dns_servers,
         default_routes=routes,
         egress=egress,
         wifi=wifi,

@@ -24,7 +24,7 @@ from campus_snnu import (AUTH_PATH_UNCONFIRMED_TEXT, BackupLinkResult,
                          SnnuBackupExecutor, SnnuBackupLink, SnnuLinkState,
                          SnnuOps, classify_snnu_link, confirm_egress,
                          format_backup_result)
-from tests.fakes import FakeSession, FakeSnnuLink
+from tests.fakes import FakeInterfaceBinder, FakeSession, FakeSnnuLink
 
 PORT = 8601
 WIFI_IF = 5
@@ -49,6 +49,7 @@ def _ops(fake: FakeSnnuLink, *, route=None, resolve=(PORT, "测试端口"),
         portal_reachable=lambda session, port: reachable,
         read_status=lambda session, port: status,
         repair=repair,
+        bind_interface=FakeInterfaceBinder(allowed=route is None),
     )
 
 

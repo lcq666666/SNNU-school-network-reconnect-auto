@@ -371,6 +371,7 @@ class FakeProbeEngine:
         self.http: Dict[Any, Any] = {}
         self.dns: Dict[Any, Any] = {}
         self.routes: Dict[Any, Any] = {}
+        self.proof = {"default": True}
         self.calls: Dict[str, List[Any]] = {"tcp": [], "http": [], "dns": [],
                                             "route": []}
 
@@ -404,9 +405,9 @@ class FakeProbeEngine:
             return SimpleNamespace(**value)
         return SimpleNamespace(body=str(value))
 
-    def dns_resolve(self, name: str) -> bool:
-        self.calls["dns"].append(name)
-        value = self._resolve(self.dns, name)
+    def dns_resolve(self, name: str, source_address: Any = None) -> bool:
+        self.calls["dns"].append((name, source_address))
+        value = self._resolve(self.dns, name, source_address)
         if isinstance(value, Exception):
             raise value
         return bool(value)
@@ -417,6 +418,15 @@ class FakeProbeEngine:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def for_interface(self, if_index, source_ip, dns_servers=()):
+        source = (source_ip, 0)
+        return SimpleNamespace(
+            interface_bound=self.proof.get(if_index, self.proof.get("default")),
+            tcp_connect=lambda host, port, timeout=None: self.tcp_connect(
+                host, port, timeout, source),
+            http_probe=lambda url, timeout=None: self.http_probe(url, timeout, source),
+            dns_resolve=lambda name: self.dns_resolve(name, source))
 
 
 # --------------------------------------------------------------------------- #
@@ -743,3 +753,20 @@ class FakeMetricWriter:
         self.calls.append(("restore_automatic", int(if_index), str(family)))
         return self._result(self.restore_ok)
 
+
+
+class FakeInterfaceBinder:
+    """显式模拟接口约束成功/失败；不创建 socket。"""
+
+    def __init__(self, allowed=True):
+        self.allowed = allowed
+        self.calls = []
+
+    def __call__(self, session, binding):
+        self.calls.append(binding)
+        if not self.allowed or not binding.ok:
+            return False
+        session.trust_env = False
+        session.mount("http://", object())
+        session.mount("https://", object())
+        return True

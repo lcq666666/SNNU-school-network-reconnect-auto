@@ -122,7 +122,8 @@ def test_u1_01_gateway_probe_timeout(fake_engine):
     fake_engine.tcp[("10.252.1.1", 80)] = False
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     snapshot = evaluate(report, engine=fake_engine)
-    assert snapshot.wifi.state == HealthState.GATEWAY_UNREACHABLE
+    # P7.5-2：公网已证实可用时，网关端口关闭不能判全网故障。
+    assert snapshot.wifi.state == HealthState.HEALTHY
 
 
 def test_u1_01_internet_unreachable(fake_engine):
@@ -130,6 +131,7 @@ def test_u1_01_internet_unreachable(fake_engine):
     # 网关可达，但全部公网 TCP 失败
     fake_engine.tcp[("10.252.1.1", 443)] = True
     fake_engine.tcp.update({"default": False})
+    fake_engine.http = {"default": {"status_code": 0, "error": "timeout"}}
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     snapshot = evaluate(report, engine=fake_engine)
     assert snapshot.wifi.state == HealthState.INTERNET_UNREACHABLE
@@ -162,6 +164,7 @@ def test_u1_01_dns_failure(fake_engine):
 def test_u1_02_unconfirmed_egress_is_never_healthy(fake_engine):
     _healthy_engine(fake_engine)
     fake_engine.routes.update({"default": None})   # 路由查询失败
+    fake_engine.proof = {"default": None}  # 无接口约束证据，不依赖系统路由
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     snapshot = evaluate(report, engine=fake_engine)
     assert snapshot.wifi.state == HealthState.PROBE_UNRELIABLE
@@ -173,6 +176,7 @@ def test_u1_02_egress_via_other_interface_is_unreliable(fake_engine):
     # 系统最佳出口是以太极（ifIndex=10），不能把成功归因于 Wi-Fi
     fake_engine.routes.update({"default": SimpleNamespace(if_index=10,
                                                           source_ip="192.168.124.9")})
+    fake_engine.proof = {"default": False}
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     snapshot = evaluate(report, engine=fake_engine)
     assert snapshot.wifi.state == HealthState.PROBE_UNRELIABLE
@@ -216,6 +220,7 @@ def test_u1_03_all_sites_fail_is_internet_unreachable(fake_engine):
     _healthy_engine(fake_engine)
     fake_engine.tcp[("10.252.1.1", 443)] = True   # 网关可达
     fake_engine.tcp.update({"default": False})
+    fake_engine.http = {"default": {"status_code": 0, "error": "timeout"}}
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     snapshot = evaluate(report, engine=fake_engine)
     assert snapshot.wifi.state == HealthState.INTERNET_UNREACHABLE
@@ -295,6 +300,7 @@ def test_u1_05_recommendation_branches(fake_engine):
         if wifi_state == "unreachable":
             fake_engine.tcp[("10.252.1.1", 443)] = True   # 网关可达
             fake_engine.tcp.update({"default": False})
+            fake_engine.http = {"default": {"status_code": 0, "error": "timeout"}}
         report = _report(eth=eth, wifi=wifi, ips=ips, routes=routes)
         return evaluate(report, engine=fake_engine)
 
@@ -325,6 +331,7 @@ def test_u1_05_unknown_axis_blocks_recommendation(fake_engine):
     """任一主轴 UNKNOWN/PROBE_UNRELIABLE 时不得给出切换建议。"""
     _healthy_engine(fake_engine)
     fake_engine.routes.update({"default": None})
+    fake_engine.proof = {"default": None}
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     snapshot = evaluate(report, engine=fake_engine)
     assert snapshot.ethernet.state == HealthState.PROBE_UNRELIABLE

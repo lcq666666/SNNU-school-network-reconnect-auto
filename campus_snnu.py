@@ -40,7 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from campus_core import PortalResolution, PortalStatus, RepairOptions, RepairResult
 from campus_failover import OpKind
-from campus_network import bind_source_address
+from campus_network import _valid_ipv4
 
 __all__ = [
     "CONTRACT_VERSION", "DEFAULT_TARGET_SSID", "PORTAL_TARGET",
@@ -132,7 +132,8 @@ class InterfaceBinding:
     @property
     def ok(self) -> bool:
         """是否具备绑定所需的全部要素（源地址 + ifIndex）。"""
-        return bool(self.source_ip) and self.if_index is not None
+        return (_valid_ipv4(self.source_ip) and type(self.if_index) is int
+                and 0 < self.if_index <= 0xFFFFFFFF)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"interface": self.interface, "if_index": self.if_index,
@@ -271,6 +272,7 @@ class SnnuOps:
     portal_reachable: Callable[[Any, int], bool]
     read_status: Callable[[Any, int], Any]
     repair: Optional[Callable[[Any, RepairOptions], RepairResult]] = None
+    bind_interface: Optional[Callable[[Any, InterfaceBinding], bool]] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -408,24 +410,22 @@ class SnnuBackupLink:
                                    if_index=self.if_index,
                                    source_ip=self.source_ip)
         result.binding = binding
-        egress = confirm_egress(self.ops.route_lookup, self.if_index)
-        result.egress = egress
         result.stage = BackupStage.EGRESS
-        result.evidence.append("出口证明：%s（%s）"
-                               % (egress.proof.value, egress.detail))
-        if not egress.proof.ok:
-            return self._fail(
-                result, SnnuAuthError.AUTH_PATH_UNCONFIRMED,
-                "%s：Portal 目标 %s 的实际出口未确认为 SNNU 接口，"
-                "按 AGENTS §3.6 不发送真实凭据"
-                % (AUTH_PATH_UNCONFIRMED_TEXT, egress.target))
-        if not bind_source_address(self.session, self.source_ip):
-            return self._fail(
-                result, SnnuAuthError.AUTH_PATH_UNCONFIRMED,
-                "%s：无有效源地址可绑定，不发送真实凭据"
-                % AUTH_PATH_UNCONFIRMED_TEXT)
-        result.evidence.append("会话已绑定源地址 %s（ifIndex=%s）"
-                               % (self.source_ip, self.if_index))
+        bound = False
+        if binding.ok and self.ops.bind_interface is not None:
+            try:
+                bound = self.ops.bind_interface(self.session, binding) is True
+            except Exception as exc:
+                result.evidence.append("接口绑定失败：%s" % type(exc).__name__)
+        result.egress = EgressEvidence(
+            PORTAL_TARGET, EgressProof.CONFIRMED if bound else EgressProof.UNAVAILABLE,
+            self.if_index if bound else None, self.source_ip if bound else None,
+            "IP_UNICAST_IF 回读 + 源地址约束" if bound else AUTH_PATH_UNCONFIRMED_TEXT)
+        if not bound:
+            return self._fail(result, SnnuAuthError.AUTH_PATH_UNCONFIRMED,
+                              AUTH_PATH_UNCONFIRMED_TEXT + "：受限会话未建立，不发送凭据")
+        result.evidence.append("会话已按 ifIndex=%s 与源地址 %s 限定接口"
+                               % (self.if_index, self.source_ip))
 
         if not self.allow_auth:
             return self._identify(result)

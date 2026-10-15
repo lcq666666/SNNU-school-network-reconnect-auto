@@ -130,19 +130,17 @@ def _engine(wifi_state: str, *, best_route_if_index: int = 10) -> FakeProbeEngin
 def test_i1_01_script_states_and_zero_side_effects():
     """I-1-01：闭合剧本逐帧断言状态序列，全程零认证 POST。
 
-    关键保守语义：帧 1/帧 5（双网卡并存、最佳路由为以太网）下 Wi-Fi 的
-    公网路径**不可证**（源绑定探测无法归因），判 PROBE_UNRELIABLE 而非
-     HEALTHY；以太网断开后最佳路由改走 Wi-Fi，此时 Wi-Fi 才可被证实。
+    P7.5-2：指定接口的约束探测独立于系统最佳路由；双网并存时均可证明健康。
     """
     session = _session(online=True)
     system_probe = lambda: engine.internet_ok(session)  # noqa: E731
 
-    # 帧 1：双网正常，系统在线；Wi-Fi 路径不可证（最佳路由为以太网）
+    # 帧 1：双网正常，系统默认有线；Wi-Fi 的接口受限探测也正常。
     eng = _engine("healthy", best_route_if_index=10)
     snap = evaluate(_report(), engine=eng, system_probe=system_probe)
     assert snap.ethernet.state == HealthState.HEALTHY
-    assert snap.wifi.state == HealthState.PROBE_UNRELIABLE
-    assert snap.wifi.egress_confirmed is False
+    assert snap.wifi.state == HealthState.HEALTHY
+    assert snap.wifi.egress_confirmed is True
     assert snap.system.online is True
     assert snap.recommendation.preferred == "ethernet"
     assert snap.recommendation.would_switch is False
@@ -189,7 +187,7 @@ def test_i1_01_script_states_and_zero_side_effects():
     eng = _engine("healthy", best_route_if_index=10)
     snap = evaluate(_report(), engine=eng, system_probe=system_probe)
     assert snap.ethernet.state == HealthState.HEALTHY
-    assert snap.wifi.state == HealthState.PROBE_UNRELIABLE
+    assert snap.wifi.state == HealthState.HEALTHY
     assert snap.recommendation.preferred == "ethernet"
     assert snap.recommendation.would_switch is False
 

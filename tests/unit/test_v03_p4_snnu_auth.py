@@ -20,7 +20,8 @@ from types import SimpleNamespace
 import campus_reconnect as engine
 from campus_core import PortalStatus, RepairAdapters, repair_service
 from campus_snnu import (BackupStage, SnnuAuthError, SnnuBackupLink, SnnuOps)
-from tests.fakes import (FakeResponse, FakeSession, FakeSnnuLink, VirtualClock)
+from tests.fakes import (FakeInterfaceBinder, FakeResponse, FakeSession,
+                         FakeSnnuLink, VirtualClock)
 
 LOG = logging.getLogger("campus")
 PORT = 8601
@@ -85,6 +86,7 @@ def _link(session, clock, probe, *, allow_auth=True, if_index=WIFI_IF,
         portal_reachable=lambda s, port: True,
         read_status=lambda s, port: status,
         repair=repair if repair is not None else _default_repair,
+        bind_interface=FakeInterfaceBinder(allowed=route is None),
     )
     return SnnuBackupLink(
         ops=ops, session=session, target_ssid="SNNU", if_index=if_index,
