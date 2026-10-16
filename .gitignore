@@ -20,5 +20,8 @@ coverage.xml
 htmlcov/
 *.egg-info/
 
+# ---- 工具产物（agent 工具目录）----
+.sisyphus/
+
 # ---- 真机验收本地证据（快照/日志/探针输出，不入库）----
 snapshots/
