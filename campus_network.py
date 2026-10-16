@@ -153,6 +153,10 @@ class InterfaceHealth:
     layers: List[ProbeOutcome] = field(default_factory=list)
     egress_confirmed: Optional[bool] = None   # True/False/None(无法证明)
     source_ip: Optional[str] = None
+    #: V0.5-4：该接口自己的 IPv4 DNS 配置（**不回退**系统全局解析器）。
+    #: 接口受限验证（``campus_reconnect.PathVerificationRequest``）必须带上它，
+    #: 否则无法在「只走这张网卡」的前提下解析域名 —— 缺 DNS ⇒ fail-closed。
+    dns_servers: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"axis": self.axis.value, "interface": self.interface,
@@ -160,7 +164,8 @@ class InterfaceHealth:
                 "evidence": list(self.evidence),
                 "layers": [p.to_dict() for p in self.layers],
                 "egress_confirmed": self.egress_confirmed,
-                "source_ip": self.source_ip}
+                "source_ip": self.source_ip,
+                "dns_servers": list(self.dns_servers)}
 
 
 @dataclass
@@ -435,7 +440,7 @@ class InterfaceHealthChecker:
 
         def result(state):
             return InterfaceHealth(axis, name, index, state, evidence, layers,
-                                   confirmed, ipv4)
+                                   confirmed, ipv4, _interface_dns(report, index))
 
         status = str(getattr(adapter, "status", "")).lower()
         record("link", name, status == "up", "Status=%s" % status)

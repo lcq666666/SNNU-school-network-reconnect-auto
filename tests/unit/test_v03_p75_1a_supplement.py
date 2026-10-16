@@ -20,7 +20,7 @@ import campus_tray_observer as tso
 from campus_failover import FailoverMode, OpKind
 from campus_network import (EgressInfo, HealthState, InterfaceHealth,
                             NetworkHealthSnapshot, SystemHealth)
-from tests.fakes import FakeOpExecutor, VirtualClock
+from tests.fakes import FakeOpExecutor, VirtualClock, seed_path_verification
 
 LOG = logging.getLogger("campus")
 
@@ -337,6 +337,10 @@ def test_tray_auto_contract_is_enforced_in_actual_tick(monkeypatch, variant):
     app._sync_failover_from_config()
     executed = []
     for _ in range(20):
+        # V0.5-4：路由切换前必须先有「新鲜的接口受限验证通过」证据；
+        # 真机由后台验证线程产出，这里离线登记（零真实网络）。
+        seed_path_verification(app.dual_path, "wifi",
+                               now=clock.monotonic(), source_ip="10.8.0.5")
         result = app._failover_tick(clock.monotonic(), False)
         executed.extend(result.executed)
         clock.advance(5)

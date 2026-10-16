@@ -581,6 +581,14 @@ class TrayApp:
         #: 最近一次故障切换展示状态（由 :meth:`_failover_tick` 更新）。
         self.failover_status = None
 
+        # ---- V0.5-4 双链路恢复整合（接口受限验证 + 恢复协调器 + UU 恢复）----
+        #: 整合控制器（惰性接线；**构造零 I/O**，真正的接口受限探测在后台线程）。
+        self.dual_path = None
+        #: 最近一次整合判定（供日志 / 后续 UI；由 :meth:`_failover_tick` 更新）。
+        self.dual_path_tick = None
+        #: 接口受限验证能力（惰性构造；注入点便于离线测试替换）。
+        self._path_verifier = None
+
         # ---- V0.3 P7 远程保障（默认未接线；由 :meth:`enable_remote_guard` 接入）----
         #: 远控只读探测能力（``None`` = 未接线：不产生任何子进程/文件 I/O）。
         self._remote_ops = None
@@ -611,6 +619,7 @@ class TrayApp:
             detection_interval=float(self._interval()),
             failure_threshold=int(self._threshold()),
             auth_cooldown=float(self._cooldown()))
+        controller = self._build_dual_path_controller()
         return TrayFailoverBridge(
             mode=cfg.get("failover_mode", "MONITOR"),
             lock_target=cfg.get("failover_lock"),
@@ -620,7 +629,50 @@ class TrayApp:
             policy=policy, timer_table=self._timers,
             remote_guard=getattr(self, "remote", None),
             defer_failback=bool(cfg.get("remote_defer_failback", True)),
+            action_gate=(controller.gate if controller is not None else None),
             log=lambda message: self.log.info("[failover] %s", message))
+
+    # ---------- V0.5-4 双链路恢复整合（构造，零 I/O）----------
+    def _build_dual_path_controller(self):
+        """构造 V0.5-4 双链路恢复整合层（**构造零 I/O**）。
+
+        只把「接口受限验证（V0.5-1）+ 恢复协调器（V0.5-2）+ UU 恢复（V0.5-3）」
+        接成一条流水线；**真实探测不在这里发生**，而在后台短命线程
+        （:meth:`_verify_paths_async` / :meth:`_uu_recovery_async`）。
+
+        构造失败时返回 ``None``：此时桥接不接入验证前置门（行为与 P6 一致），
+        如实记日志，绝不让托盘崩溃。
+        """
+        if self.dual_path is not None:
+            return self.dual_path
+        try:
+            from campus_dual_path import DualPathRecoveryController
+
+            verifier = self._build_path_verifier()
+            controller = DualPathRecoveryController(
+                verifier=verifier.verify, gate_verifier=verifier.verify_gate,
+                uu_restart_enabled=lambda: bool(
+                    self.get_config().get("remote_restart_enabled", False)),
+                # 与托盘其余接线同源：整合层与验证前置门共用**本进程**时钟
+                # （测试用 VirtualClock 替换 ``tray.time`` 时保持一致）。
+                clock=lambda: time.monotonic(),
+                log=lambda message: self.log.info("[恢复] %s", message))
+        except Exception as exc:                     # 接线失败不得让托盘崩溃
+            self.log.warning("双链路恢复整合层构造失败：%s", type(exc).__name__)
+            return None
+        self.dual_path = controller
+        self.log.info("双链路恢复整合层已接线：接口受限验证 + 恢复协调器 + UU 恢复"
+                      "（UU 自动恢复默认关闭；路由切换须先通过接口受限验证）")
+        return controller
+
+    def _build_path_verifier(self):
+        """接口受限验证能力（``PathVerifier`` + ``WindowsProbeEngine``，零 I/O 构造）。"""
+        if self._path_verifier is None:
+            from campus_network import WindowsProbeEngine
+            from campus_reconnect import PathVerifier
+
+            self._path_verifier = PathVerifier(WindowsProbeEngine())
+        return self._path_verifier
 
     def _build_auto_executor(self):
         """构造 P5 真实组合执行器（**仅**在 AUTO + 显式授权时被调用）。
@@ -798,7 +850,137 @@ class TrayApp:
         if result is not None and result.executed:
             self.log.info("故障切换已执行动作：%s",
                           ", ".join(o.kind.value for o in result.executed))
+        # V0.5-4：把本轮迁移交给恢复整合层（零 I/O 判定；需要验证时起后台线程）。
+        self._dual_path_step(now, snapshot, trusted=trusted, result=result)
         return result
+
+    # ---------- V0.5-4：双链路恢复整合（路径验证 + 恢复协调器 + UU 恢复）----------
+    def _dual_path_step(self, now, snapshot, *, trusted, result):
+        """本轮整合判定（纯逻辑）：把状态迁移翻译成恢复事件与验证安排。
+
+        快照不可信时整合层**什么都不做**（fail-closed）：不安排验证、不产生 UU 重启
+        请求；此时桥接的单一副作用门也已换成拒绝执行器（P7.5-1），双保险。
+        """
+        controller = getattr(self, "dual_path", None)
+        if controller is None or result is None:
+            return None
+        try:
+            tick = controller.tick(result, snapshot, trusted=bool(trusted), now=now)
+        except Exception as exc:                     # 判定故障不得影响监测主流程
+            self.log.warning("恢复整合层判定异常：%s", type(exc).__name__)
+            return None
+        self.dual_path_tick = tick
+        if tick.verify_requests:
+            self._verify_paths_async(tick.verify_requests)
+        return tick
+
+    def _verify_paths_async(self, requests):
+        """在独立短命线程里**依次**做本轮要求的接口受限验证，并交回整合层（V0.5-4）。
+
+        同一时刻只允许一轮在途验证（``busy``）；某个接口的验证失败/异常一律如实记
+        日志，**不**影响监测与状态机主流程，也不影响同一轮里另一条链路的验证。
+        """
+        busy = getattr(self, "_verify_path_busy", None)
+        if busy is None:
+            busy = self._verify_path_busy = threading.Event()
+        if busy.is_set():
+            self.log.info("[恢复] 已有接口受限验证在途：本次跳过（下一轮重试）")
+            return
+        busy.set()
+        controller = self.dual_path
+
+        def _run():
+            try:
+                verifier = self._build_path_verifier()
+                for request in requests:
+                    result = verifier.verify(request)
+                    if result.allows_recovery:
+                        self.log.info("[恢复] %s 接口受限验证通过：%s",
+                                      request.role, result.reason)
+                    else:
+                        self.log.warning("[恢复] %s 接口受限验证未通过：%s",
+                                         request.role, result.reason)
+                    follow = controller.on_verification(
+                        result, now=time.monotonic())
+                    self._uu_recovery_after_verification(follow, result)
+            except Exception as exc:   # 验证不得影响监测主流程（防御性边界）
+                self.log.warning("[恢复] 接口受限验证异常：%s", type(exc).__name__)
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-path-verify").start()
+
+    def _uu_recovery_after_verification(self, follow, verification):
+        """恢复流水线的**最后一步**：验证通过 ⇒ 清退重启 UU 远程（默认关闭）。"""
+        request = getattr(follow, "uu_request", None)
+        if request is None:
+            return
+        if not getattr(follow, "schedules_uu_restart", False):
+            self.log.info("[恢复] 已满足恢复条件，但 UU 自动恢复未开启"
+                          "（remote_restart_enabled=False）：不清退")
+            return
+        self._uu_recovery_async(request, verification)
+
+    def _uu_recovery_async(self, request, verification):
+        """后台执行一次「验证通过后的 UU 恢复」（复用 V0.5-3 与既有冷退能力）。"""
+        busy = getattr(self, "_uu_recovery_busy", None)
+        if busy is None:
+            busy = self._uu_recovery_busy = threading.Event()
+        if busy.is_set():
+            self.log.info("[恢复] 已有 UU 恢复在途：本次跳过")
+            return
+        busy.set()
+        try:
+            ops = self._get_remote_app_ops()
+            guard = self._get_restart_guard()
+            ledger = self._uu_recovery_ledger()
+        except Exception as exc:       # 能力构建失败不得影响监测线程
+            busy.clear()
+            self.log.warning("[恢复] UU 清退能力不可用：%s", type(exc).__name__)
+            return
+        controller = self.dual_path
+        recheck = controller.build_recheck(request.active_path)
+
+        def _run():
+            try:
+                from campus_remote_app import restart_after_verified_recovery
+
+                outcome = restart_after_verified_recovery(
+                    ops, active_path=request.active_path,
+                    network_epoch=request.network_epoch, verification=verification,
+                    reason=request.reason, enabled=True, guard=guard,
+                    ledger=ledger, recheck=recheck)
+                if outcome.restarted:
+                    self.log.info("[恢复] UU 远程已清退重启：%s", outcome.detail)
+                    self.notify("UU 远程已重启",
+                                "网络恢复且接口受限验证通过：已清退重启 UU 远程后台")
+                elif outcome.ok:
+                    self.log.info("[恢复] UU 远程无需重启：%s", outcome.detail)
+                else:
+                    self.log.warning("[恢复] UU 远程未重启：%s（%s）",
+                                     outcome.detail, outcome.action)
+                    self.notify("UU 远程未重启", outcome.detail)
+                controller.note_uu_outcome(bool(outcome.restarted),
+                                           detail=outcome.detail)
+            except Exception as exc:       # 清退不得影响监测主流程（防御性边界）
+                self.log.warning("[恢复] UU 远程恢复异常：%s", type(exc).__name__)
+                controller.note_uu_outcome(
+                    False, detail="异常：%s" % type(exc).__name__)
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-uu-recovery").start()
+
+    def _uu_recovery_ledger(self):
+        """UU 恢复的**世代去重**台账（进程内；与冷却守卫正交，方案 §31）。"""
+        ledger = getattr(self, "_uu_restart_ledger", None)
+        if ledger is None:
+            from campus_remote_app import RecoveryRestartLedger
+
+            ledger = self._uu_restart_ledger = RecoveryRestartLedger()
+        return ledger
 
     # ---------- 远程保障（V0.3 P7）----------
     def enable_remote_guard(self, ops=None) -> Optional[RemoteSafetyGuard]:

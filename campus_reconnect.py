@@ -591,20 +591,24 @@ class PathVerifier:
         return self.session_factory()
 
     # ---- 主流程 ----
-    def verify(self, path: PathVerificationRequest) -> PathVerificationResult:
-        started = time.monotonic()
+    def _open_scoped(self, path: PathVerificationRequest, started: float
+                     ) -> Tuple[Any, Optional[PathVerificationResult]]:
+        """校验路径描述 + 建**已绑定接口**的会话；失败返回「不可信」结果（fail-closed）。
 
+        返回 ``(session, None)`` 表示可以发请求；``(None, result)`` 表示一个请求都
+        不允许发（路径非法 / 接口约束失败 / 未证明已绕开环境代理）。
+        """
         problem = _path_problem(path)
         if problem is not None:
-            return self._unreliable(path, problem, started)
+            return None, self._unreliable(path, problem, started)
 
         try:
             scoped = self._scoped_for(path)
         except Exception as exc:                             # noqa: BLE001 - 能力不可信
-            return self._unreliable(path, "接口约束失败：%s" % type(exc).__name__,
-                                    started)
+            return None, self._unreliable(
+                path, "接口约束失败：%s" % type(exc).__name__, started)
         if getattr(scoped, "interface_bound", None) is not True:
-            return self._unreliable(
+            return None, self._unreliable(
                 path, "接口约束未证实（IP_UNICAST_IF 未回读确认）", started)
 
         session = self._new_session()
@@ -616,9 +620,19 @@ class PathVerifier:
         if not bound or getattr(session, "trust_env", None) is not False:
             # fail-closed：未证明接口约束或可能经环境代理 ⇒ 一个请求都不发
             _close_quietly(session)
-            return self._unreliable(
+            return None, self._unreliable(
                 path, "会话未绑定到指定接口或可能经环境代理（未发请求）", started)
+        return session, None
 
+    def verify(self, path: PathVerificationRequest) -> PathVerificationResult:
+        """完整验证：闸门（百度）+ 交叉站点（≥2）**全部经指定接口**发出。"""
+        started = time.monotonic()
+
+        session, failure = self._open_scoped(path, started)
+        if failure is not None:
+            return failure
+
+        portal = False
         try:
             gate_result, portal = _scoped_site_probe(session, self.gate, self.timeout)
             cross_results = []
@@ -630,6 +644,44 @@ class PathVerifier:
             _close_quietly(session)
 
         return self._build_result(path, gate_result, cross_results, portal, started)
+
+    def verify_gate(self, path: PathVerificationRequest) -> PathVerificationResult:
+        """**轻量**闸门确认（V0.5-4）：只跑闸门一站，用于「清退 UU 前最后再确认」。
+
+        与 :meth:`verify` 的边界：
+
+        - 同样的接口约束与 ``trust_env=False`` 前置（未证实 ⇒ 一个请求都不发）；
+        - **不跑**交叉站点，因此**不能**用来判定「Internet 可用」（判据仍是
+          闸门 + 交叉 ≥2）；它只回答"这条接口此刻还能不能经接口受限通道完成
+          一次真实公网请求"（方案 §5.4 步骤 5 的"轻量再确认"）;
+        - 结果**不进入**任何验证台账/缓存（调用方只把它当作一次性的即时确认）。
+        """
+        started = time.monotonic()
+
+        session, failure = self._open_scoped(path, started)
+        if failure is not None:
+            return failure
+
+        try:
+            gate_result, portal = _scoped_site_probe(session, self.gate, self.timeout)
+        finally:
+            _close_quietly(session)
+
+        ok = bool(gate_result.ok)
+        if ok:
+            reason = "接口受限轻量确认通过（闸门 PASS；未跑交叉站点）"
+        elif portal:
+            reason = "%s：疑似校园网门户劫持（闸门未通过）" % PATH_CAPTIVE_PORTAL
+        else:
+            reason = "闸门未通过（%s）" % _probe_detail(gate_result)
+        host = _site_host(gate_result.source)
+        return PathVerificationResult(
+            verified=ok, role=path.role, interface_index=path.interface_index,
+            source_ip=path.source_ip, gate_result=gate_result, cross_results=(),
+            successful_sites=(host,) if ok else (),
+            failed_sites=() if ok else (host,),
+            elapsed=time.monotonic() - started, reason=reason, reliability=PATH_OK,
+            captive_portal=bool(portal), detail=reason)
 
     # ---- 结果构造 ----
     def _build_result(self, path, gate_result, cross_results, portal, started):

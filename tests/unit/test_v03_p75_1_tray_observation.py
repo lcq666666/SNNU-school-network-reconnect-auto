@@ -43,7 +43,7 @@ import campus_tray_failover as tf
 import campus_tray_observer as tso
 from campus_failover import FailoverMode, FailoverState, OpKind
 from campus_network import HealthState, evaluate
-from tests.fakes import FakeProbeEngine, healthy_http_table
+from tests.fakes import FakeProbeEngine, healthy_http_table, seed_path_verification
 
 LOG = logging.getLogger("campus")
 
@@ -166,13 +166,25 @@ def _attach(app, *, collector, executor=None, authorized=True, mode="AUTO",
     return app
 
 
-def _drive(app, clock, frames: int, *, online: bool = False):
-    """推进若干轮 ``_failover_tick``（隔离故障切换链路，不含 _probe_tick）。"""
+def _drive(app, clock, frames: int, *, online: bool = False, before=None):
+    """推进若干轮 ``_failover_tick``（隔离故障切换链路，不含 _probe_tick）。
+
+    ``before`` 在每轮之前调用：用于在断言"状态机接线"的用例里登记 V0.5-4
+    验证前置门所需的**新鲜**放行证据（真机由后台验证线程产出）。
+    """
     results = []
     for index in range(frames):
+        if before is not None:
+            before()
         results.append(app._failover_tick(clock.monotonic(), online))
         clock.advance(INTERVAL)
     return results
+
+
+def _seed_verified_switch_target(app, clock):
+    """为「以太网故障 → 切到 Wi-Fi」的切换目标登记刚通过的接口受限验证证据。"""
+    seed_path_verification(app.dual_path, engine.PATH_ROLE_WIFI,
+                           now=clock.monotonic(), source_ip=WIFI_IP)
 
 
 # --------------------------------------------------------------------------- #
@@ -256,7 +268,8 @@ def _break_observation(app, monkeypatch, mode, collector, clock):
 
 
 def test_i75_1_03_trusted_snapshot_can_execute(monkeypatch, virtual_clock):
-    """对照组：快照可信时 AUTO 确实会执行（证明门禁不是"永远拒绝"）。"""
+    """对照组：快照可信 + 目标路径已通过接口受限验证时 AUTO 确实会执行
+    （证明门禁不是"永远拒绝"）。"""
     app = _make_app(monkeypatch, failover_mode="AUTO",
                     auto_switch_authorized=True)
     virtual_clock.install(monkeypatch, tray)
@@ -264,9 +277,10 @@ def test_i75_1_03_trusted_snapshot_can_execute(monkeypatch, virtual_clock):
                               system_online=False)
     executor = RecordingExecutor()
     _attach(app, collector=collector, executor=executor)
-    _drive(app, virtual_clock, 8, online=False)
+    _drive(app, virtual_clock, 8, online=False,
+           before=lambda: _seed_verified_switch_target(app, virtual_clock))
     assert any(kind is OpKind.METRIC_WRITE for kind in executor.calls), \
-        "可信快照下应执行 Metric 写入：%r" % executor.calls
+        "可信快照 + 目标路径已验证时应执行 Metric 写入：%r" % executor.calls
 
 
 @pytest.mark.parametrize("mode", ("no_result", "collect_error", "stale",
@@ -309,20 +323,25 @@ def test_i75_1_04_mode_change_detaches_executor_and_invalidates(monkeypatch,
                               system_online=False)
     executor = RecordingExecutor()
     _attach(app, collector=collector, executor=executor)
-    _drive(app, virtual_clock, 8, online=False)
+
+    def seed():
+        _seed_verified_switch_target(app, virtual_clock)
+
+    _drive(app, virtual_clock, 8, online=False, before=seed)
     baseline = len(executor.calls)
     assert baseline > 0, "前置条件：AUTO 下已发生切换动作"
 
-    # 切到 LOCKED：作废旧代次 + 摘除执行器
+    # 切到 LOCKED：作废旧代次 + 摘除执行器（仍持续登记新鲜验证证据，
+    # 确保"零执行"只可能来自模式隔离，而不是验证证据过期）
     app.apply_mode(FailoverMode.LOCKED)
-    after = _drive(app, virtual_clock, 8, online=False)
+    after = _drive(app, virtual_clock, 8, online=False, before=seed)
     assert len(executor.calls) == baseline, \
         "模式改变后仍用旧采集结果执行动作：%r" % executor.calls[baseline:]
     assert all(r.executed == [] for r in after)
 
     # 切到 MONITOR 同样零执行
     app.apply_mode(FailoverMode.MONITOR)
-    after = _drive(app, virtual_clock, 8, online=False)
+    after = _drive(app, virtual_clock, 8, online=False, before=seed)
     assert len(executor.calls) == baseline
     assert all(r.executed == [] for r in after)
 
@@ -406,6 +425,7 @@ def test_i75_1_07_auto_never_calls_legacy_run_repair(monkeypatch,
     nxt = app._probe_tick(0.0)
     for _ in range(9):
         virtual_clock.advance(INTERVAL)
+        _seed_verified_switch_target(app, virtual_clock)
         nxt = app._probe_tick(nxt)
     assert repairs == [], "AUTO 下仍调用了 V0.2 自动重连：%r" % repairs
     # 自动副作用只可能来自单一副作用门（经由 RecordingExecutor 记录）

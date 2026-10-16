@@ -338,6 +338,7 @@ class TrayFailoverBridge:
                  timer_table: Optional[Any] = None,
                  remote_guard: Optional[Any] = None,
                  defer_failback: bool = True,
+                 action_gate: Optional[Any] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.mode = parse_mode(mode)
         self.lock_target = parse_lock(lock_target)
@@ -346,13 +347,18 @@ class TrayFailoverBridge:
         self.executor_factory = executor_factory
         self.policy = policy or FailoverPolicy()
         self._log = log
+        #: V0.5-4：**验证前置门**（``campus_dual_path.VerifiedActionGate``，本身即
+        #: ``NetworkOpScheduler`` 子类）。为 ``None`` 时行为与 P6 完全一致（零变化）；
+        #: 非 ``None`` 时由它充当单一副作用门，从而在"动作即将执行"的位置追加
+        #: 「目标路径必须已通过接口受限验证」这一条（方案 §1 需求 3）。
+        self.action_gate = action_gate
         #: V0.3 P7 远程保障守卫（``campus_remote.RemoteSafetyGuard``）；为 ``None``
         #: 时不接入远程会话延迟切回，展示层保持 P6 语义（零行为变化）。
         self.remote_guard = remote_guard
         self.defer_failback = bool(defer_failback)
         self.manager = NetworkFailoverManager(
             policy=self.policy, mode=self.mode, timer_table=timer_table,
-            executor=None, lock_target=self.lock_target,
+            scheduler=action_gate, executor=None, lock_target=self.lock_target,
             failback_gate=self._failback_gate(), log=log)
         self.last_switch_at: Optional[float] = None
         self.last_switch_reason: str = ""

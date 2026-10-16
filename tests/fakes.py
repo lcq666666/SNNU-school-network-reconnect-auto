@@ -972,3 +972,26 @@ class FakePathEngine:
         self.transports.append(transport)
         return transport
 
+
+# --------------------------------------------------------------------------- #
+# V0.5-4 验证前置门放行证据
+# --------------------------------------------------------------------------- #
+def seed_path_verification(controller: Any, role: str, *, now: float,
+                           source_ip: str = "",
+                           reason: str = "测试：接口受限验证通过"
+                                                  "（离线放行证据，零真实网络）") -> Any:
+    """给 V0.5-4「验证前置门」登记一条**刚通过**的接口受限验证证据。
+
+    真机上这条证据由后台 :class:`campus_reconnect.PathVerifier` 线程在探测通过后
+    产出（``Connected ≠ Internet``）；只有关心「状态机 / 单一副作用门接线」而不关心
+    探测本身的离线用例才用本函数直接放行 —— 免得为了一个路由动作去跑真实 HTTP。
+
+    返回整合层的跟进判定（:class:`campus_dual_path.DualPathTick`），调用方通常忽略。
+    """
+    from campus_reconnect import PATH_OK, PathVerificationResult
+
+    return controller.on_verification(
+        PathVerificationResult(verified=True, role=role, source_ip=source_ip,
+                               reason=reason, reliability=PATH_OK),
+        now=now)
+
