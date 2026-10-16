@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -39,7 +40,7 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -63,7 +64,7 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          repair_service, resolve_url)
 from campus_failover import (FailoverMode, FailoverPolicy,
                              NetworkFailoverManager, format_tick)
-from campus_network import (DEFAULT_TCP_TARGETS, NetworkObserver,
+from campus_network import (DEFAULT_TCP_TARGETS, PORTAL_HINTS, NetworkObserver,
                             WindowsProbeEngine, evaluate, format_snapshot,
                             resolve_roles)
 from campus_route_guard import (CompositeExecutor, MetricExecutor, RouteGuard,
@@ -372,6 +373,315 @@ def _verify_after_connect(session: requests.Session, log: logging.Logger) -> boo
     else:
         log.warning("连接后上网校验未通过，疑似「假死」（浏览器可能无法上网）：%s", detail)
     return ok
+
+
+# --------------------------------------------------------------------------- #
+# V0.5-1：接口受限（path-scoped）真实上网验证
+# --------------------------------------------------------------------------- #
+#: 接口角色（主语义，与 ``campus_network.resolve_roles`` 的键一致）。
+PATH_ROLE_ETHERNET = "ethernet"
+PATH_ROLE_WIFI = "wifi"
+#: ``PathVerificationResult.reliability`` 取值：探测可信 / 不可信（fail-closed）。
+PATH_OK = "ok"
+PATH_PROBE_UNRELIABLE = "PROBE_UNRELIABLE"
+#: 单站判定结果可附加的「校园网门户劫持」定性。
+PATH_CAPTIVE_PORTAL = "CAPTIVE_PORTAL"
+
+
+@dataclass(frozen=True)
+class PathVerificationRequest:
+    """一次**接口受限**验证的输入描述（V0.5-1，方案 §3）。
+
+    语义：在 ``interface_index`` 指向的物理接口上、以 ``source_ip`` 为源地址、
+    用该接口自己的 ``dns_servers`` 解析，去访问公网站点。**不是**「用系统最佳出口」。
+
+    ``network_generation`` 是该接口的「代」计数：接口重连/换 IP 时由调用方递增，
+    用于让**旧 transport 作废**（见 :class:`PathVerifier`）。
+    """
+
+    role: str
+    interface_index: int
+    source_ip: str
+    interface_alias: str = ""
+    gateway: str = ""
+    ssid: Optional[str] = None
+    network_generation: int = 0
+    dns_servers: Tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        """脱敏后的可日志快照（不含任何凭据；IP/SSID 可入日志）。"""
+        return {"role": self.role, "interface_index": self.interface_index,
+                "interface_alias": self.interface_alias,
+                "source_ip": self.source_ip, "gateway": self.gateway,
+                "ssid": self.ssid,
+                "network_generation": self.network_generation,
+                "dns_servers": list(self.dns_servers)}
+
+
+@dataclass(frozen=True)
+class PathVerificationResult:
+    """一次接口受限验证的结构化结果（V0.5-1，方案 §25）。
+
+    ``verified`` 只表示「该接口**确实**能直连访问公网」；``reliability`` 表示这次
+    探测本身是否**可信**（接口约束/绕过代理失败时 = ``PROBE_UNRELIABLE``）。
+    下游（恢复协调器 / 故障切换）**只允许**消费 :attr:`allows_recovery`，
+    避免把「探测不可信」当成「网络可用」或「网络不可用」。
+    """
+
+    verified: bool
+    role: str = ""
+    interface_index: Optional[int] = None
+    source_ip: str = ""
+    gate_result: Optional[ProbeResult] = None
+    cross_results: Tuple[ProbeResult, ...] = ()
+    successful_sites: Tuple[str, ...] = ()
+    failed_sites: Tuple[str, ...] = ()
+    elapsed: float = 0.0
+    reason: str = ""
+    reliability: str = PATH_OK
+    captive_portal: bool = False
+    detail: str = ""
+
+    @property
+    def allows_recovery(self) -> bool:
+        """是否允许据此触发**破坏性动作**（路由切换 / UU 重启）。
+
+        只有「探测可信 **且** 该接口真的能上公网」才为真；``PROBE_UNRELIABLE``
+        一律为假（fail-closed，方案 §26 T12）。
+        """
+        return bool(self.verified and self.reliability == PATH_OK)
+
+    def to_dict(self) -> dict:
+        return {"verified": self.verified, "role": self.role,
+                "interface_index": self.interface_index,
+                "source_ip": self.source_ip, "reason": self.reason,
+                "reliability": self.reliability,
+                "captive_portal": self.captive_portal,
+                "successful_sites": list(self.successful_sites),
+                "failed_sites": list(self.failed_sites),
+                "elapsed": self.elapsed,
+                "allows_recovery": self.allows_recovery}
+
+
+def _site_host(source: str) -> str:
+    try:
+        return urlsplit(source).hostname or source
+    except ValueError:  # pragma: no cover - source 恒为探测点 URL
+        return source
+
+
+def _valid_source_ipv4(address: Optional[str]) -> bool:
+    """严格验证可作为绑定源地址的 IPv4（排除 APIPA/回环/未指定/组播）。"""
+    try:
+        ip = ipaddress.IPv4Address(address)
+    except (ValueError, TypeError, ipaddress.AddressValueError):
+        return False
+    return not (ip.is_link_local or ip.is_loopback or ip.is_unspecified
+                or ip.is_multicast)
+
+
+def _path_problem(path: PathVerificationRequest) -> Optional[str]:
+    """校验路径描述本身是否可用于**受限探测**；不可用则返回原因（fail-closed）。"""
+    if path.role not in (PATH_ROLE_ETHERNET, PATH_ROLE_WIFI):
+        return "未知接口角色 %r" % (path.role,)
+    if type(path.interface_index) is not int or not 0 < path.interface_index < 2 ** 24:
+        return "接口索引无效（%r）" % (path.interface_index,)
+    if not _valid_source_ipv4(path.source_ip):
+        return "源地址无效（%r）" % (path.source_ip,)
+    if not path.dns_servers:
+        return "缺少该接口的 DNS 配置（不回退系统全局解析器）"
+    return None
+
+
+def _close_quietly(session: Any) -> None:
+    closer = getattr(session, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:                                   # noqa: BLE001 - 关闭失败不影响结论
+            pass
+
+
+def _captive_portal_hit(final_url: str, body: str) -> bool:
+    """Portal 劫持判定（V0.5-1）：最终 URL 或正文命中校园网门户特征。
+
+    与 :func:`campus_network._portal_hit` 的区别：这里已**跟随重定向**，故不能再用
+    ``redirected`` 标志，改为直接看**落到哪里**。
+    """
+    text = "%s %s" % (final_url or "", body or "")
+    return any(hint in text for hint in PORTAL_HINTS)
+
+
+def _scoped_site_probe(session: Any, spec: ProbeSpec,
+                       timeout: Tuple[float, float]
+                       ) -> Tuple[ProbeResult, bool]:
+    """在**已绑定接口**的会话上抓单个站点（V0.5-1）。
+
+    与 :func:`verify_site` 同样跟随重定向并做严格结构匹配；额外返回是否命中
+    校园网门户劫持特征。任何异常都**只算该站失败**，绝不向上抛出。
+    """
+    start = time.monotonic()
+    try:
+        resp = session.get(spec.url, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.Timeout:
+        return ProbeResult(False, spec.url, error="timeout",
+                           elapsed=time.monotonic() - start), False
+    except requests.RequestException as exc:
+        return ProbeResult(False, spec.url, error=_error_kind(exc),
+                           elapsed=time.monotonic() - start), False
+    except Exception as exc:  # 非 requests 异常（含假件实现缺陷）：只算该站失败
+        return ProbeResult(False, spec.url, error=type(exc).__name__,
+                           elapsed=time.monotonic() - start), False
+    body = decode_body(resp) or ""
+    final_url = str(getattr(resp, "url", "") or "")
+    ok = probe_matches(spec, resp.status_code, body, redirected=False)
+    portal = bool(not ok and _captive_portal_hit(final_url, body))
+    return ProbeResult(ok, spec.url, status_code=resp.status_code,
+                       elapsed=time.monotonic() - start), portal
+
+
+class PathVerifier:
+    """把「接口受限直连验证」做成可复用对象（V0.5-1）。
+
+    **复用** ``InterfaceTransport``（经 ``engine.for_interface`` 构造），不重新实现
+    socket / 绑定；本类只负责三件事：
+
+    1. **接口约束**：只接受 :class:`PathVerificationRequest` 指定的 ifIndex / 源地址；
+       构造失败或 ``interface_bound`` 未被证实 ⇒ ``PROBE_UNRELIABLE``；
+    2. **绕开环境代理**：绑定后的会话必须 ``trust_env is False``，否则**一个请求都不发**；
+    3. **transport 作废**：``(if_index, source_ip, dns)`` 任一变化即丢弃旧 transport
+       （方案 §26 T4），避免「换了 IP 还在用旧绑定」。
+    """
+
+    def __init__(self, engine: Any = None, *, session_factory: Any = None,
+                 gate: ProbeSpec = VERIFY_GATE,
+                 cross: Tuple[ProbeSpec, ...] = VERIFY_CROSS,
+                 min_cross: int = VERIFY_MIN_CROSS,
+                 timeout: Tuple[float, float] = VERIFY_TIMEOUT) -> None:
+        self.engine = engine
+        self.session_factory = session_factory
+        self.gate = gate
+        self.cross = tuple(cross)
+        self.min_cross = int(min_cross)
+        self.timeout = timeout
+        self._scoped: Any = None
+        self._key: Optional[Any] = None
+
+    # ---- transport 复用与作废 ----
+    def _scoped_for(self, path: PathVerificationRequest) -> Any:
+        key = (path.interface_index, path.source_ip, tuple(path.dns_servers))
+        if self._scoped is None or key != self._key:
+            self._scoped = self._build_scoped(path)   # 旧 transport（如有）在此作废
+            self._key = key
+        return self._scoped
+
+    def _build_scoped(self, path: PathVerificationRequest) -> Any:
+        engine = self.engine
+        if engine is None:
+            engine = self.engine = WindowsProbeEngine()
+        factory = getattr(engine, "for_interface", None)
+        if not callable(factory):
+            raise OSError("探测引擎不提供接口受限工厂")
+        return factory(path.interface_index, path.source_ip,
+                       tuple(path.dns_servers))
+
+    def _new_session(self) -> Any:
+        if self.session_factory is None:
+            return direct_session()
+        return self.session_factory()
+
+    # ---- 主流程 ----
+    def verify(self, path: PathVerificationRequest) -> PathVerificationResult:
+        started = time.monotonic()
+
+        problem = _path_problem(path)
+        if problem is not None:
+            return self._unreliable(path, problem, started)
+
+        try:
+            scoped = self._scoped_for(path)
+        except Exception as exc:                             # noqa: BLE001 - 能力不可信
+            return self._unreliable(path, "接口约束失败：%s" % type(exc).__name__,
+                                    started)
+        if getattr(scoped, "interface_bound", None) is not True:
+            return self._unreliable(
+                path, "接口约束未证实（IP_UNICAST_IF 未回读确认）", started)
+
+        session = self._new_session()
+        binder = getattr(scoped, "bind_session", None)
+        try:
+            bound = bool(binder(session)) if callable(binder) else False
+        except Exception:                                    # noqa: BLE001 - 能力不可信
+            bound = False
+        if not bound or getattr(session, "trust_env", None) is not False:
+            # fail-closed：未证明接口约束或可能经环境代理 ⇒ 一个请求都不发
+            _close_quietly(session)
+            return self._unreliable(
+                path, "会话未绑定到指定接口或可能经环境代理（未发请求）", started)
+
+        try:
+            gate_result, portal = _scoped_site_probe(session, self.gate, self.timeout)
+            cross_results = []
+            for spec in self.cross:
+                result, hit = _scoped_site_probe(session, spec, self.timeout)
+                cross_results.append(result)
+                portal = portal or hit
+        finally:
+            _close_quietly(session)
+
+        return self._build_result(path, gate_result, cross_results, portal, started)
+
+    # ---- 结果构造 ----
+    def _build_result(self, path, gate_result, cross_results, portal, started):
+        hits = sum(1 for result in cross_results if result.ok)
+        verified = bool(gate_result.ok and hits >= self.min_cross)
+        results = (gate_result,) + tuple(cross_results)
+        successful = tuple(_site_host(r.source) for r in results if r.ok)
+        failed = tuple(_site_host(r.source) for r in results if not r.ok)
+        lines = ["闸门 %s" % _probe_detail(gate_result)]
+        lines += ["交叉 %s" % _probe_detail(r) for r in cross_results]
+        detail = "；".join(lines)
+        if verified:
+            reason = "界面受限验证通过（闸门 + 交叉 %d/%d）" % (
+                hits, len(cross_results))
+        elif portal:
+            reason = "%s：疑似校园网门户劫持（闸门未通过）" % PATH_CAPTIVE_PORTAL
+        elif not gate_result.ok:
+            reason = "闸门未通过（%s）" % _probe_detail(gate_result)
+            lines.append("交叉命中 %d/%d（需 ≥%d）" % (hits, len(cross_results),
+                                                    self.min_cross))
+            detail = "；".join(lines)
+        else:
+            reason = "交叉命中不足（%d/%d，需 ≥%d）" % (
+                hits, len(cross_results), self.min_cross)
+        return PathVerificationResult(
+            verified=verified, role=path.role, interface_index=path.interface_index,
+            source_ip=path.source_ip, gate_result=gate_result,
+            cross_results=tuple(cross_results), successful_sites=successful,
+            failed_sites=failed, elapsed=time.monotonic() - started,
+            reason=reason, reliability=PATH_OK, captive_portal=bool(portal),
+            detail=detail)
+
+    def _unreliable(self, path, reason, started) -> PathVerificationResult:
+        return PathVerificationResult(
+            verified=False, role=getattr(path, "role", ""),
+            interface_index=getattr(path, "interface_index", None),
+            source_ip=getattr(path, "source_ip", ""), elapsed=time.monotonic() - started,
+            reason="%s：%s" % (PATH_PROBE_UNRELIABLE, reason),
+            reliability=PATH_PROBE_UNRELIABLE, detail=reason)
+
+
+def verify_interface_internet(path: PathVerificationRequest, **kwargs: Any
+                              ) -> PathVerificationResult:
+    """**接口受限**的一次性真实上网验证（V0.5-1 便捷入口）。
+
+    ``verify(Ethernet) → Ethernet socket``，``verify(WiFi) → WiFi socket``；
+    绝不允许「验证 Wi-Fi 时实际走了 Ethernet 默认出口」（方案 §4）。
+
+    仅返回结果、**不产生任何副作用**（不切路由、不认证、不重启 UU）；调用方必须
+    先看 :attr:`PathVerificationResult.allows_recovery` 再决定是否动作。
+    """
+    return PathVerifier(**kwargs).verify(path)
 
 
 def portal_base(port: int) -> str:

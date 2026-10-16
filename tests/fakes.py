@@ -11,7 +11,8 @@
 包含：:class:`FakeRegistry`、:class:`FakeKeyring`、:class:`FakeResponse`、
 :class:`FakeSession`、:class:`FakeLauncher`、:class:`VirtualClock`、
 :class:`FakeCommandRunner`（V0.3 P0 只读诊断用的假命令执行器）、
-:class:`FakeRemoteOps`（V0.3 P7 远控探测用的假能力集合）。
+:class:`FakeRemoteOps`（V0.3 P7 远控探测用的假能力集合）、
+:class:`FakeScopedTransport` / :class:`FakePathEngine`（V0.5-1 接口受限验证）。
 """
 from __future__ import annotations
 
@@ -887,4 +888,87 @@ class FakeRemoteAppOps:
                                 "path": r"C:\_study\GameViewer\bin\%s"
                                         % self.spawn_name}]
         return success
+
+
+# --------------------------------------------------------------------------- #
+# 接口受限验证假件（V0.5-1 campus_reconnect.PathVerifier 用）
+# --------------------------------------------------------------------------- #
+class FakeScopedTransport:
+    """假「接口受限 transport」（V0.5-1）：**不建 socket**，只记录接口/源地址。
+
+    与 ``campus_transport.InterfaceTransport`` 同构的关键面：
+
+    - ``interface_bound``：模拟 ``IP_UNICAST_IF`` 回读确认是否成功；
+    - :meth:`bind_session`：模拟绑定（``trust_env=False`` + 挂载接口受限适配器）；
+      ``set_trust_env=False`` 用来构造「绑定返回成功但会话仍会走环境代理」的缺陷实现，
+      验证验证器**一个请求都不发**地 fail-closed；
+    - ``dns_ok`` / ``dns_servers``：模拟该接口自己的解析能力（**不回退**系统全局解析器）。
+
+    ``bound_sessions`` / ``mounts`` / ``resolve_calls`` 供断言「探测确实经该 transport」。
+    """
+
+    def __init__(self, if_index: int, source_ip: str, dns_servers: Any = (), *,
+                 interface_bound: bool = True, bind_ok: bool = True,
+                 set_trust_env: bool = True, dns_ok: bool = True) -> None:
+        self.if_index = if_index
+        self.source_ip = source_ip
+        self.dns_servers = [str(value) for value in dns_servers]
+        self.interface_bound = bool(interface_bound)
+        self.bind_ok = bool(bind_ok)
+        self.set_trust_env = bool(set_trust_env)
+        self.dns_ok = bool(dns_ok)
+        self.bound_sessions: List[Any] = []
+        self.mounts: List[Tuple[str, Any]] = []
+        self.resolve_calls: List[str] = []
+
+    def bind_session(self, session: Any) -> bool:
+        self.bound_sessions.append(session)
+        if not self.bind_ok:
+            return False
+        if self.set_trust_env:
+            session.trust_env = False        # 真实语义：接口绑定必须绕开环境代理
+        for prefix in ("http://", "https://"):
+            if hasattr(session, "mount"):
+                session.mount(prefix, self)
+                self.mounts.append((prefix, self))
+        return True
+
+    def resolve(self, name: str) -> List[str]:
+        self.resolve_calls.append(name)
+        return ["127.0.0.1"] if self.dns_ok else []
+
+    def dns_resolve(self, name: str) -> bool:
+        return bool(self.resolve(name))
+
+
+class FakePathEngine:
+    """假探测引擎（V0.5-1）：记录 ``for_interface`` 调用并返回假受限 transport。
+
+    ``calls`` 为 ``(if_index, source_ip, dns_servers)`` 全量记录，是断言「验证用的是
+    哪条接口」的主要证据；``transports`` 保存每次新建的 :class:`FakeScopedTransport`。
+    ``error`` 用来构造「接口约束工厂本身失败」。
+    """
+
+    def __init__(self, *, interface_bound: bool = True, bind_ok: bool = True,
+                 set_trust_env: bool = True, dns_ok: bool = True,
+                 error: Any = None) -> None:
+        self.interface_bound = bool(interface_bound)
+        self.bind_ok = bool(bind_ok)
+        self.set_trust_env = bool(set_trust_env)
+        self.dns_ok = bool(dns_ok)
+        self.error = error
+        self.calls: List[Tuple[Any, Any, Tuple[str, ...]]] = []
+        self.transports: List[FakeScopedTransport] = []
+
+    def for_interface(self, if_index: Any, source_ip: Any,
+                      dns_servers: Any = ()) -> FakeScopedTransport:
+        self.calls.append((if_index, source_ip, tuple(dns_servers)))
+        if self.error is not None:
+            raise self.error
+        transport = FakeScopedTransport(
+            if_index, source_ip, dns_servers,
+            interface_bound=self.interface_bound, bind_ok=self.bind_ok,
+            set_trust_env=self.set_trust_env, dns_ok=self.dns_ok)
+        self.transports.append(transport)
+        return transport
 
