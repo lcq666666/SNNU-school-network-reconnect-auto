@@ -51,7 +51,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Optional
+from typing import List, Optional
 
 import keyring
 import pystray
@@ -89,6 +89,13 @@ PYTHONW = str(Path(sys.executable).with_name("pythonw.exe"))
 CLASH_SERVER_DEFAULT = "127.0.0.1:7897"   # 仅在用户显式确认时作为**建议值**展示
 APP_NAME = "校园网自动重连助手"
 UI_POLL_MS = 120
+#: V0.5-5：主窗口仪表盘刷新周期（毫秒）。UI 只消费状态映射，不发起任何网络 I/O。
+DASHBOARD_REFRESH_MS = 1000
+#: V0.5-5：主窗口尺寸（方案 §5.5：820–920 × 560–650）。
+DASHBOARD_WIDTH = 880
+DASHBOARD_HEIGHT = 620
+DASHBOARD_MIN_WIDTH = 820
+DASHBOARD_MIN_HEIGHT = 560
 
 #: V0.3 P7 看门狗：巡检间隔与心跳容忍窗口（秒）。
 WATCHDOG_INTERVAL = 30.0
@@ -529,6 +536,13 @@ class TrayApp:
         self.icon = None
         self.root = None
         self.settings_win = None
+        #: V0.5-5：主窗口仪表盘（惰性创建；关闭后置回 ``None``）。
+        self.dashboard_win = None
+        #: V0.5-5：最近一次**手动**验证结果（``role`` → ``PathVerificationResult``）。
+        #: 只用于展示逐站明细，不参与任何判定（判定一律走整合层）。
+        self.manual_verification = {}
+        self._dash_widgets = None
+        self._dash_refresh_id = None
 
         # ---- 单网络工作线程与命令队列（F01 / F02）----
         self._commands: "queue.Queue" = queue.Queue()
@@ -648,9 +662,12 @@ class TrayApp:
         try:
             from campus_dual_path import DualPathRecoveryController
 
-            verifier = self._build_path_verifier()
+            # 验证能力**惰性解析**：``_build_path_verifier()`` 每次调用取当前能力，
+            # 于是运行期替换（含离线测试注入假件）立即生效，且构造仍是零 I/O。
             controller = DualPathRecoveryController(
-                verifier=verifier.verify, gate_verifier=verifier.verify_gate,
+                verifier=lambda request: self._build_path_verifier().verify(request),
+                gate_verifier=(
+                    lambda request: self._build_path_verifier().verify_gate(request)),
                 uu_restart_enabled=lambda: bool(
                     self.get_config().get("remote_restart_enabled", False)),
                 # 与托盘其余接线同源：整合层与验证前置门共用**本进程**时钟
@@ -981,6 +998,502 @@ class TrayApp:
 
             ledger = self._uu_restart_ledger = RecoveryRestartLedger()
         return ledger
+
+    # ---------- V0.5-5：UI 状态映射 + 主界面 + 手动操作 ----------
+    def ui_state(self, *, now: Optional[float] = None):
+        """把当前只读状态映射成仪表盘视图模型（**零 I/O**，方案 §5.5）。
+
+        只读 ``last_observation`` / ``failover_status`` / ``dual_path_tick`` /
+        整合层 ``status()``；**不**发起探测、**不**碰 Tk、**不**清退进程 ——
+        因此可以在 Tk 主线程与 pystray 菜单线程里安全调用。
+        """
+        from campus_ui_state import build_ui_state
+
+        moment = time.monotonic() if now is None else float(now)
+        controller = getattr(self, "dual_path", None)
+        status = None
+        if controller is not None:
+            try:
+                status = controller.status(now=moment)
+            except Exception as exc:                 # 状态映射不得让 UI 崩溃
+                self.log.warning("整合层状态读取异常：%s", type(exc).__name__)
+                status = None
+        verification = {}
+        active_path = standby_path = None
+        uu_enabled = False
+        uu_last_ok = None
+        network_epoch = 0
+        events = []
+        max_age = None
+        if status is not None:
+            verification = {"ethernet": status.ethernet, "wifi": status.wifi}
+            active_path = status.active_path
+            standby_path = status.standby_path
+            uu_enabled = bool(status.uu_enabled)
+            uu_last_ok = status.last_uu_ok
+            network_epoch = int(status.network_epoch)
+            event = getattr(status, "event", None)
+            if event is not None:
+                events.append("最近恢复事件：%s" % getattr(event, "value", event))
+            steps = getattr(status, "steps", ()) or ()
+            if steps:
+                events.append("恢复阶段：%s"
+                              % " → ".join(str(getattr(s, "value", s)) for s in steps))
+            gate = getattr(controller, "gate", None)
+            max_age = getattr(gate, "max_age", None)
+        observation = getattr(self, "last_observation", None)
+        snapshot = getattr(observation, "snapshot", None) if observation is not None else None
+        fs = getattr(self, "failover_status", None)
+        failover_state = getattr(fs, "state", None)
+        if active_path is None and fs is not None:
+            active_path = getattr(fs, "primary", None)
+        if standby_path is None and fs is not None:
+            standby_path = getattr(fs, "backup", None)
+        tick = getattr(self, "dual_path_tick", None)
+        verify_roles = tuple(getattr(tick, "verify_roles", ()) or ()) if tick is not None else ()
+        uu_request = getattr(tick, "uu_request", None) if tick is not None else None
+        recovery_event = None
+        if tick is not None:
+            event = getattr(tick, "event", None)
+            if event is not None:
+                recovery_event = str(getattr(event, "value", event))
+        warnings = list(getattr(fs, "warnings", ()) or ()) if fs is not None else []
+        events.extend(str(item) for item in (getattr(fs, "remote_warnings", ()) or ()))
+        worker = self.worker_status()
+        kwargs = {}
+        if max_age is not None:
+            kwargs["max_age"] = float(max_age)
+        return build_ui_state(
+            now=moment, ethernet=getattr(snapshot, "ethernet", None),
+            wifi=getattr(snapshot, "wifi", None), verification=verification,
+            active_path=active_path, standby_path=standby_path,
+            failover_state=failover_state,
+            mode_label=tray_mode_label(self._current_mode()),
+            monitor_label=str(worker.get("label") or ""),
+            monitor_alive=bool(worker.get("alive")),
+            paused=bool(self.config.get("paused")),
+            recovery_event=recovery_event, verify_roles=verify_roles,
+            uu_enabled=uu_enabled, uu_last_ok=uu_last_ok,
+            uu_pending=uu_request is not None, events=events,
+            warnings=warnings, network_epoch=network_epoch,
+            ssid=self.config.get("ssid") or "SNNU",
+            manual=getattr(self, "manual_verification", None) or {}, **kwargs)
+
+    def ui_state_lines(self) -> List[str]:
+        """仪表盘状态的可日志化摘要（诊断用；**不**含凭据/Cookie）。"""
+        try:
+            return self.ui_state().lines()
+        except Exception:
+            return ["UI 状态映射失败：\n%s" % traceback.format_exc()]
+
+    def _link_text(self, item=None):
+        """菜单：主链路 / 备用链路（只读）。"""
+        try:
+            state = self.ui_state()
+        except Exception:
+            return "主/备链路：未知"
+        return "主链路：%s · 备用：%s" % (
+            PATH_LABEL.get(state.active_path, "未知"),
+            PATH_LABEL.get(state.standby_path, "未知"))
+
+    def _internet_text(self, item=None):
+        """菜单：Internet 是否**真正**可用（真值来自接口受限验证）。"""
+        try:
+            state = self.ui_state()
+        except Exception:
+            return "Internet：未知"
+        card = state.card(state.active_path) if state.active_path else None
+        return "Internet：%s" % (card.field("Internet") if card is not None else "未验证")
+
+    def _uu_text(self, item=None):
+        """菜单：UU 远程自动恢复状态。"""
+        try:
+            state = self.ui_state()
+        except Exception:
+            return "UU 远程：未知"
+        return "UU 远程：%s" % state.uu.label
+
+    def _active_role_hint(self) -> str:
+        """当前活动路径（用于手动验证 / 手动清退选目标；fail-closed 回退 ethernet）。"""
+        controller = getattr(self, "dual_path", None)
+        if controller is not None:
+            try:
+                active = controller.status().active_path
+            except Exception:
+                active = None
+            if active in PATH_LABEL:
+                return active
+        primary = getattr(getattr(self, "failover_status", None), "primary", None)
+        if primary in PATH_LABEL:
+            return primary
+        return "ethernet"
+
+    # ---- 主界面（仪表盘） ---- #
+    def on_dashboard(self, icon=None, item=None):
+        """打开主界面：只把动作投递到 Tk 线程（网络线程不直接碰 Tk）。"""
+        if self.root is None:
+            self.log.info("无 Tk 根窗口：忽略“打开主界面”请求")
+            return
+        self._ui_post(self._open_dashboard)
+
+    def _open_dashboard(self):
+        """构建主窗口仪表盘（顶部状态灯 + 双网卡卡片 + 恢复流水线 + 操作按钮）。"""
+        if self.root is None:
+            return
+        win = self.dashboard_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+                    win.lift()
+                    win.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        from campus_ui_state import CARD_ROWS, PIPELINE_LABELS
+
+        win = tk.Toplevel(self.root)
+        self.dashboard_win = win
+        win.title("%s · 双链路监控" % APP_NAME)
+        win.geometry("%dx%d" % (DASHBOARD_WIDTH, DASHBOARD_HEIGHT))
+        win.minsize(DASHBOARD_MIN_WIDTH, DASHBOARD_MIN_HEIGHT)
+        win.protocol("WM_DELETE_WINDOW", self._close_dashboard)
+        outer = ttk.Frame(win, padding=12)
+        outer.grid(sticky="nsew")
+        win.rowconfigure(0, weight=1)
+        win.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(outer)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text=APP_NAME,
+                  font=("Microsoft YaHei", 13, "bold")).grid(row=0, column=0, sticky="w")
+        self._dash_light = tk.Canvas(header, width=18, height=18, highlightthickness=0)
+        self._dash_light.grid(row=0, column=2, sticky="e", padx=(8, 4))
+        self._dash_overall = tk.StringVar(value="未知")
+        ttk.Label(header, textvariable=self._dash_overall,
+                  font=("Microsoft YaHei", 11, "bold")).grid(row=0, column=3, sticky="e")
+        self._dash_headline = tk.StringVar(value="正在读取状态…")
+        ttk.Label(header, textvariable=self._dash_headline, foreground="#8b949e").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(2, 8))
+
+        cards = ttk.Frame(outer)
+        cards.grid(row=1, column=0, sticky="ew")
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+        refs = {}
+        for column, role in enumerate(("ethernet", "wifi")):
+            frame = ttk.LabelFrame(
+                cards, text=("以太网" if role == "ethernet" else "SNNU Wi-Fi"), padding=8)
+            frame.grid(row=0, column=column, sticky="nsew",
+                       padx=(0, 6) if column == 0 else (6, 0))
+            title = ttk.Label(frame, text="—", font=("Microsoft YaHei", 10, "bold"))
+            title.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            rows, link_label = {}, None
+            for index, label in enumerate(CARD_ROWS, start=1):
+                name = ttk.Label(frame, text=("Wi-Fi" if label == "链路" else label),
+                                 foreground="#8b949e")
+                name.grid(row=index, column=0, sticky="e", padx=(0, 6), pady=1)
+                var = tk.StringVar(value="—")
+                ttk.Label(frame, textvariable=var).grid(row=index, column=1, sticky="w", pady=1)
+                rows[label] = var
+                if label == "链路":
+                    link_label = name
+            refs[role] = {"title": title, "rows": rows, "link_label": link_label}
+
+        pipeline = ttk.LabelFrame(outer, text="恢复流水线", padding=8)
+        pipeline.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        step_widgets = {}
+        for index, (key, label) in enumerate(PIPELINE_LABELS):
+            widget = ttk.Label(pipeline, text="%s\n—" % label, justify="center")
+            widget.grid(row=0, column=index * 2, padx=4)
+            step_widgets[key] = widget
+            if index < len(PIPELINE_LABELS) - 1:
+                ttk.Label(pipeline, text="→", foreground="#8b949e").grid(
+                    row=0, column=index * 2 + 1)
+        refs["steps"] = step_widgets
+
+        self._dash_uu = tk.StringVar(value="UU 远程自动恢复：—")
+        ttk.Label(outer, textvariable=self._dash_uu).grid(row=3, column=0, sticky="w",
+                                                          pady=(8, 0))
+        self._dash_monitor = tk.StringVar(value="监测：—")
+        ttk.Label(outer, textvariable=self._dash_monitor, foreground="#8b949e").grid(
+            row=4, column=0, sticky="w")
+        self._dash_events = tk.StringVar(value="")
+        ttk.Label(outer, textvariable=self._dash_events, foreground="#8b949e",
+                  justify="left").grid(row=5, column=0, sticky="w")
+        ttk.Label(outer, text="最近手动验证（逐站）", foreground="#8b949e").grid(
+            row=6, column=0, sticky="w", pady=(6, 0))
+        self._dash_manual = tk.StringVar(value="—")
+        ttk.Label(outer, textvariable=self._dash_manual, foreground="#8b949e",
+                  justify="left").grid(row=7, column=0, sticky="w")
+
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=8, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(buttons, text="立即检测", command=self.on_detect_now).grid(
+            row=0, column=0, padx=(0, 6))
+        ttk.Button(buttons, text="立即验证以太网",
+                   command=lambda: self.on_verify_now("ethernet")).grid(
+                       row=0, column=1, padx=6)
+        ttk.Button(buttons, text="立即验证 SNNU Wi-Fi",
+                   command=lambda: self.on_verify_now("wifi")).grid(
+                       row=0, column=2, padx=6)
+        ttk.Button(buttons, text="手动重连", command=self.on_reconnect).grid(
+            row=0, column=3, padx=6)
+        ttk.Button(buttons, text="重启 UU Remote",
+                   command=self.on_restart_uu_remote).grid(row=0, column=4, padx=6)
+        ttk.Button(buttons, text="设置", command=self.on_settings).grid(
+            row=0, column=5, padx=6)
+        ttk.Button(buttons, text="打开日志", command=self.on_open_log).grid(
+            row=0, column=6, padx=6)
+        ttk.Button(buttons, text="关闭", command=self._close_dashboard).grid(
+            row=0, column=7, padx=6)
+
+        self._dash_widgets = refs
+        self._refresh_dashboard()
+
+    def _close_dashboard(self):
+        win = self.dashboard_win
+        self.dashboard_win = None
+        self._dash_widgets = None
+        refresh = self._dash_refresh_id
+        self._dash_refresh_id = None
+        if refresh is not None and win is not None:
+            try:
+                win.after_cancel(refresh)
+            except Exception:
+                pass
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _refresh_dashboard(self):
+        """按周期把状态映射渲染到主界面（**只读**：不做任何网络操作）。"""
+        win = self.dashboard_win
+        if win is None or self.stop_event.is_set():
+            return
+        try:
+            if not win.winfo_exists():
+                self._close_dashboard()
+                return
+        except tk.TclError:
+            self._close_dashboard()
+            return
+        try:
+            self._render_dashboard(self.ui_state())
+        except Exception:                    # 渲染故障不得让托盘崩溃
+            self.log.warning("主界面渲染异常：\n%s", traceback.format_exc())
+        try:
+            self._dash_refresh_id = win.after(DASHBOARD_REFRESH_MS, self._refresh_dashboard)
+        except tk.TclError:
+            self._dash_refresh_id = None
+
+    def _render_dashboard(self, state) -> None:
+        """把 :class:`campus_ui_state.UiState` 写进已建好的控件（纯赋值）。"""
+        refs = self._dash_widgets
+        if refs is None:
+            return
+        try:
+            self._dash_light.configure(bg=state.overall_color)
+        except tk.TclError:
+            pass
+        self._dash_overall.set("%s · %s" % (state.overall_label, state.overall))
+        self._dash_headline.set(state.headline or "—")
+        for role in ("ethernet", "wifi"):
+            card = state.card(role)
+            card_refs = refs.get(role) or {}
+            if card is None:
+                continue
+            title = card_refs.get("title")
+            if title is not None:
+                try:
+                    title.configure(text="%s（%s）" % (card.title, card.assignment_label),
+                                    foreground=card.color)
+                except tk.TclError:
+                    pass
+            for label, var in (card_refs.get("rows") or {}).items():
+                var.set(card.field(label))
+            link_label = card_refs.get("link_label")
+            if link_label is not None:
+                try:
+                    link_label.configure(text="Wi-Fi" if role == "wifi" else "网卡")
+                except tk.TclError:
+                    pass
+        for step in state.pipeline:
+            widget = (refs.get("steps") or {}).get(step.key)
+            if widget is None:
+                continue
+            try:
+                widget.configure(text=step.display, foreground=step.color)
+            except tk.TclError:
+                pass
+        self._dash_uu.set("UU 远程自动恢复：%s%s"
+                          % (state.uu.label,
+                             ("（%s）" % state.uu.detail) if state.uu.detail else ""))
+        notes = [state.monitor_label or "监测状态未知"]
+        if state.network_epoch:
+            notes.append("epoch=%d" % state.network_epoch)
+        if state.mode_label:
+            notes.append("模式：%s" % state.mode_label)
+        self._dash_monitor.set(" · ".join(notes))
+        lines = list(state.events) + ["告警：%s" % w for w in state.warnings]
+        self._dash_events.set("\n".join(lines))
+        manual = []
+        for role in ("ethernet", "wifi"):
+            card = state.card(role)
+            if card is not None and card.manual:
+                manual.extend(card.manual)
+        self._dash_manual.set("\n".join(manual) if manual else "—")
+
+    # ---- 手动操作（全部在后台线程；UI 线程不发起网络 I/O） ---- #
+    def on_detect_now(self, icon=None, item=None):
+        """立即检测：请求工作线程**立刻**跑一轮探测（不等待下一个周期）。"""
+        if self.config.get("paused"):
+            self.notify("监测已暂停", "监测处于暂停状态；请先恢复监测再检测")
+            return
+        if not self._ensure_worker():
+            self.notify("无法启动", "网络工作线程启动失败")
+            return
+        self._commands.put(("detect", None))
+        self.notify("正在检测", "已请求一次即时网络检测")
+
+    def on_verify_now(self, role: str, icon=None, item=None):
+        """立即验证某条链路：构造接口受限请求并在**后台线程**执行（展示逐站结果）。"""
+        controller = getattr(self, "dual_path", None)
+        if controller is None:
+            self.notify("无法验证", "恢复整合层未接线，无法做接口受限验证")
+            return
+        try:
+            request = controller.verification_request(role)
+        except Exception as exc:
+            self.log.warning("构造接口受限验证请求异常：%s", type(exc).__name__)
+            request = None
+        if request is None:
+            self.notify("无法验证",
+                        "缺少 %s 的接口事实（ifIndex / 源地址 / 该接口 DNS）："
+                        "按 fail-closed 不发起探测" % PATH_LABEL.get(role, role))
+            return
+        self._manual_verify_async(role, request)
+        self.notify("正在验证",
+                    "已请求 %s 的接口受限验证（后台线程，只看真实上网结果）"
+                    % PATH_LABEL.get(role, role))
+
+    def _manual_verify_async(self, role: str, request) -> None:
+        """在独立短命线程里执行一次**手动**接口受限验证，并把证据交回整合层。"""
+        controller = self.dual_path
+
+        def _run():
+            try:
+                verifier = self._build_path_verifier()
+                result = verifier.verify(request)
+            except Exception as exc:              # 验证不得影响监测主流程
+                self.log.warning("手动接口受限验证异常：%s", type(exc).__name__)
+                return
+            self._remember_manual_verification(role, result)
+            if result.allows_recovery:
+                self.log.info("手动验证 %s 通过：%s", role, result.reason)
+            else:
+                self.log.warning("手动验证 %s 未通过：%s", role, result.reason)
+            try:
+                follow = controller.on_verification(result, now=time.monotonic())
+            except Exception as exc:
+                self.log.warning("手动验证结果回灌异常：%s", type(exc).__name__)
+                return
+            self._uu_recovery_after_verification(follow, result)
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-manual-verify").start()
+
+    def _remember_manual_verification(self, role: str, result) -> None:
+        store = getattr(self, "manual_verification", None)
+        if store is None:
+            store = self.manual_verification = {}
+        store[role] = result
+
+    def on_restart_uu_remote(self, icon=None, item=None):
+        """手动「重启 UU Remote」：**先确认 + 先验证 + 清退前再确认**（方案 §5.4）。
+
+        这是唯一允许用户显式触发的清退入口；即便配置默认关闭
+        （``remote_restart_enabled=False``），用户当面确认即视为本次授权，但仍
+        **必须**先通过接口受限验证与轻量再确认（fail-closed），且只动用户态进程。
+        """
+        answer = self._ui_ask(
+            "重启 UU 远程",
+            "将清退并重启 UU 远程（网易 GameViewer）的**用户态**进程。\n"
+            "只会处理当前用户的 GameViewer / GameViewerLauncher，"
+            "不动 GameViewerService，也不会断开远程会话服务。\n\n"
+            "继续前会先做一次接口受限上网验证；验证不过则不清退。\n\n是否继续？")
+        if not answer:
+            self.notify("已取消", "未清退任何 UU 进程")
+            return
+        self._manual_uu_restart_async()
+
+    def _manual_uu_restart_async(self) -> None:
+        busy = getattr(self, "_manual_uu_busy", None)
+        if busy is None:
+            busy = self._manual_uu_busy = threading.Event()
+        if busy.is_set():
+            self.notify("正在处理", "已有一次 UU 重启在进行，请稍候…")
+            return
+        busy.set()
+
+        def _run():
+            try:
+                self._manual_uu_restart_run()
+            except Exception as exc:              # 清退不得影响监测主流程
+                self.log.warning("手动 UU 重启异常：%s", type(exc).__name__)
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-manual-uu").start()
+
+    def _manual_uu_restart_run(self) -> None:
+        from campus_remote_app import restart_after_verified_recovery
+
+        controller = getattr(self, "dual_path", None)
+        role = self._active_role_hint()
+        if controller is None:
+            self.notify("未重启 UU", "恢复整合层未接线，无法做接口受限验证")
+            return
+        request = controller.verification_request(role)
+        if request is None:
+            self.notify("未重启 UU",
+                        "缺少活动路径（%s）的接口事实：按 fail-closed 不动作"
+                        % PATH_LABEL.get(role, role))
+            return
+        try:
+            ops = self._get_remote_app_ops()
+            guard = self._get_restart_guard()
+            verifier = self._build_path_verifier()
+        except Exception as exc:
+            self.log.warning("UU 清退能力不可用：%s", type(exc).__name__)
+            self.notify("未重启 UU", "UU 清退能力不可用")
+            return
+        verification = verifier.verify(request)
+        self._remember_manual_verification(role, verification)
+        if not verification.allows_recovery:
+            self.log.warning("手动重启 UU 前验证未通过：%s", verification.reason)
+            self.notify("未重启 UU",
+                        "活动路径未通过接口受限验证（%s）：不清退" % (
+                            verification.reason or "未验证"))
+            return
+        outcome = restart_after_verified_recovery(
+            ops, active_path=role, network_epoch=int(controller.network_epoch),
+            verification=verification, reason="手动重启 UU 远程",
+            enabled=True, guard=guard,
+            recheck=controller.build_recheck(role))
+        if outcome.restarted:
+            self.log.info("手动 UU 远程已清退重启：%s", outcome.detail)
+            self.notify("UU 远程已重启", outcome.detail)
+        elif outcome.ok:
+            self.log.info("手动 UU 远程无需重启：%s（%s）", outcome.detail, outcome.action)
+            self.notify("UU 远程无需重启", outcome.detail)
+        else:
+            self.log.warning("手动 UU 远程未重启：%s（%s）", outcome.detail, outcome.action)
+            self.notify("UU 远程未重启", outcome.detail)
 
     # ---------- 远程保障（V0.3 P7）----------
     def enable_remote_guard(self, ops=None) -> Optional[RemoteSafetyGuard]:
@@ -1653,6 +2166,10 @@ class TrayApp:
             return time.monotonic() + self._interval()
         if kind == "probe":
             return self._probe_tick(next_probe)
+        if kind == "detect":
+            # V0.5-5：手动“立即检测” —— 立刻跑一轮探测，不等下一个检测周期
+            # （``next_probe=0.0`` 是假值，:meth:`_probe_tick` 的节流判断直接放行）。
+            return self._probe_tick(0.0)
         if kind == "quit":
             self.stop_event.set()
             return 0.0
@@ -2091,8 +2608,19 @@ class TrayApp:
         )
         return pystray.Menu(
             pystray.MenuItem(self._status_text, None, enabled=False),
+            pystray.MenuItem(self._link_text, None, enabled=False),
             pystray.MenuItem(self._failover_text, None, enabled=False),
+            pystray.MenuItem(self._internet_text, None, enabled=False),
+            pystray.MenuItem(self._uu_text, None, enabled=False),
             pystray.MenuItem(self._remote_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("打开主界面", self.on_dashboard),
+            pystray.MenuItem("立即检测", self.on_detect_now),
+            pystray.MenuItem("立即验证以太网",
+                             lambda icon, item: self.on_verify_now("ethernet")),
+            pystray.MenuItem("立即验证 SNNU Wi-Fi",
+                             lambda icon, item: self.on_verify_now("wifi")),
+            pystray.MenuItem("重启 UU Remote（手动）", self.on_restart_uu_remote),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("运行模式", mode_menu),
             pystray.MenuItem("手动锁定目标", lock_menu),
@@ -2152,6 +2680,12 @@ class TrayApp:
 
     # ---------- 设置面板 ----------
     def _open_settings(self):
+        """设置面板：Notebook 五页（基本 / 网络 / 恢复 / UU Remote / 诊断，方案 §5.5）。
+
+        面板**只读写配置**，不发起任何网络操作；网络动作一律经后台线程入口
+        （:meth:`on_detect_now` / :meth:`on_verify_now` / :meth:`on_reconnect` /
+        :meth:`on_restart_uu_remote`）。保存时**只提交用户实际变更的项**（F12/T24）。
+        """
         if self.settings_win is not None:
             try:
                 if self.settings_win.winfo_exists():
@@ -2162,20 +2696,21 @@ class TrayApp:
                 pass
         win = tk.Toplevel(self.root)
         self.settings_win = win
-        win.title("校园网自动重连助手 · 设置面板")
+        win.title("校园网自动重连助手 · 设置")
         win.resizable(False, False)
-        frame = ttk.Frame(win, padding=12)
-        frame.grid(sticky="nsew")
+        outer = ttk.Frame(win, padding=10)
+        outer.grid(sticky="nsew")
+        notebook = ttk.Notebook(outer)
+        notebook.grid(sticky="nsew")
 
-        status = self.worker_status()
-        ttk.Label(frame, text="运行状态", font=("Microsoft YaHei", 10, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(frame, text=self._status_text()).grid(row=1, column=0, columnspan=3, sticky="w")
-        ttk.Label(frame, text="监测：%s" % status["label"]).grid(
-            row=2, column=0, columnspan=3, sticky="w")
-        ttk.Label(frame, text="上次重连成功：%s" % (self.state.get("last_ok") or "—")).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        pad = {"padx": 4, "pady": 3}
 
+        def page(title):
+            frame = ttk.Frame(notebook, padding=12)
+            notebook.add(frame, text=title)
+            return frame
+
+        # ---- 变量：取值与保存逻辑一一对应，默认取当前配置 ----
         v_auto = tk.BooleanVar(value=get_autostart())
         v_fallback = tk.BooleanVar(value=bool(self.config.get("browser_fallback")))
         consent_value = self.config.get("clash_auto_proxy")
@@ -2192,43 +2727,150 @@ class TrayApp:
         v_remote = tk.BooleanVar(value=bool(self.config.get("remote_guard", True)))
         v_defer = tk.BooleanVar(
             value=bool(self.config.get("remote_defer_failback", True)))
-
-        ttk.Checkbutton(frame, text="开机自启（登录 Windows 后自动启动）",
-                        variable=v_auto).grid(row=4, column=0, columnspan=3, sticky="w")
-        ttk.Label(frame, text="重连成功后系统代理").grid(row=5, column=0, sticky="e", padx=4, pady=3)
-        ttk.Combobox(frame, textvariable=v_consent, width=16, state="readonly",
-                     values=CONSENT_LABELS).grid(row=5, column=1, columnspan=2, sticky="w")
-        ttk.Label(frame, text="代理端点 host:port").grid(row=6, column=0, sticky="e",
-                                                     padx=4, pady=3)
-        ttk.Entry(frame, textvariable=v_endpoint, width=18).grid(
-            row=6, column=1, columnspan=2, sticky="w")
-        ttk.Checkbutton(frame, text="重连失败时自动打开 Edge 兜底",
-                        variable=v_fallback).grid(row=7, column=0, columnspan=3, sticky="w")
-
-        pad = {"padx": 4, "pady": 3}
-        ttk.Label(frame, text="Wi-Fi 名称").grid(row=8, column=0, sticky="e", **pad)
+        # V0.4-3 / V0.5-3：确认真正连通后清退重启 UU 远程（默认关闭）。
+        v_restart = tk.BooleanVar(
+            value=bool(self.config.get("remote_restart_enabled", False)))
+        v_restart_cd = tk.IntVar(
+            value=self._int_or(self.config.get("remote_restart_cooldown"), 300))
+        # V0.3 P7.5-1A：三轴观测参数。
+        v_snap_age = tk.IntVar(value=self._int_or(self.config.get("snapshot_max_age"), 8))
+        v_snap_timeout = tk.IntVar(
+            value=self._int_or(self.config.get("snapshot_timeout"), 12))
+        v_snap_interval = tk.IntVar(
+            value=self._int_or(self.config.get("snapshot_interval"), 3))
         v_ssid = tk.StringVar(value=self.config.get("ssid") or "SNNU")
-        ttk.Entry(frame, textvariable=v_ssid, width=18).grid(row=8, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="运营商").grid(row=9, column=0, sticky="e", **pad)
         yys_value = self.config.get("yys", "mobile")
         if yys_value not in YYS_VALUE_TO_LABEL:
             yys_value = "mobile"
         v_yys = tk.StringVar(value=YYS_VALUE_TO_LABEL[yys_value])
-        ttk.Combobox(frame, textvariable=v_yys, width=15, state="readonly",
-                     values=YYS_LABELS).grid(
-                         row=9, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="检测间隔（秒）").grid(row=10, column=0, sticky="e", **pad)
         v_interval = tk.IntVar(value=self._int_or(self.config.get("interval"), 15))
-        ttk.Spinbox(frame, from_=5, to=120, textvariable=v_interval, width=16).grid(
-            row=10, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="连续失败阈值").grid(row=11, column=0, sticky="e", **pad)
         v_thr = tk.IntVar(value=self._int_or(self.config.get("threshold"), 3))
-        ttk.Spinbox(frame, from_=1, to=10, textvariable=v_thr, width=16).grid(
-            row=11, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="重连冷却（秒）").grid(row=12, column=0, sticky="e", **pad)
         v_cd = tk.IntVar(value=self._int_or(self.config.get("cooldown"), 180))
-        ttk.Spinbox(frame, from_=60, to=3600, textvariable=v_cd, width=16).grid(
-            row=12, column=1, sticky="w", **pad)
+
+        # ---- 页 1：基本 ----
+        basic = page("基本")
+        ttk.Checkbutton(basic, text="开机自启（登录 Windows 后自动启动）",
+                        variable=v_auto).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(basic, text="重连成功后系统代理").grid(row=1, column=0, sticky="e", **pad)
+        ttk.Combobox(basic, textvariable=v_consent, width=16, state="readonly",
+                     values=CONSENT_LABELS).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Label(basic, text="代理端点 host:port").grid(row=2, column=0, sticky="e", **pad)
+        ttk.Entry(basic, textvariable=v_endpoint, width=20).grid(
+            row=2, column=1, sticky="w", **pad)
+        ttk.Checkbutton(basic, text="重连失败时自动打开 Edge 兜底",
+                        variable=v_fallback).grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Separator(basic, orient="horizontal").grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(basic, text="Wi-Fi 名称").grid(row=5, column=0, sticky="e", **pad)
+        ttk.Entry(basic, textvariable=v_ssid, width=20).grid(row=5, column=1, sticky="w", **pad)
+        ttk.Label(basic, text="运营商").grid(row=6, column=0, sticky="e", **pad)
+        ttk.Combobox(basic, textvariable=v_yys, width=15, state="readonly",
+                     values=YYS_LABELS).grid(row=6, column=1, sticky="w", **pad)
+        ttk.Label(basic, text="检测间隔（秒）").grid(row=7, column=0, sticky="e", **pad)
+        ttk.Spinbox(basic, from_=5, to=120, textvariable=v_interval, width=18).grid(
+            row=7, column=1, sticky="w", **pad)
+        ttk.Label(basic, text="连续失败阈值").grid(row=8, column=0, sticky="e", **pad)
+        ttk.Spinbox(basic, from_=1, to=10, textvariable=v_thr, width=18).grid(
+            row=8, column=1, sticky="w", **pad)
+        ttk.Label(basic, text="重连冷却（秒）").grid(row=9, column=0, sticky="e", **pad)
+        ttk.Spinbox(basic, from_=60, to=3600, textvariable=v_cd, width=18).grid(
+            row=9, column=1, sticky="w", **pad)
+
+        # ---- 页 2：网络 ----
+        net = page("网络")
+        ttk.Label(net, text="双网络故障切换（V0.3 / V0.5）",
+                  font=("Microsoft YaHei", 10, "bold")).grid(
+                      row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(net, text="运行模式").grid(row=1, column=0, sticky="e", **pad)
+        ttk.Combobox(net, textvariable=v_fmode, width=15, state="readonly",
+                     values=[tray_mode_label(m) for m in MODE_ORDER]).grid(
+                         row=1, column=1, sticky="w", **pad)
+        ttk.Label(net, text="锁定目标").grid(row=2, column=0, sticky="e", **pad)
+        ttk.Combobox(net, textvariable=v_flock, width=15, state="readonly",
+                     values=["不锁定", PATH_LABEL["ethernet"],
+                             PATH_LABEL["wifi"]]).grid(
+                         row=2, column=1, sticky="w", **pad)
+        ttk.Checkbutton(net, text="网络切换期间保持 Clash 原样（默认）",
+                        variable=v_clash_keep).grid(
+                            row=3, column=0, columnspan=2, sticky="w")
+        ttk.Separator(net, orient="horizontal").grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(net, text="三轴观测（P7.5-1A）",
+                  font=("Microsoft YaHei", 10, "bold")).grid(
+                      row=5, column=0, columnspan=2, sticky="w")
+        ttk.Label(net, text="快照有效期（秒）").grid(row=6, column=0, sticky="e", **pad)
+        ttk.Spinbox(net, from_=2, to=60, textvariable=v_snap_age, width=18).grid(
+            row=6, column=1, sticky="w", **pad)
+        ttk.Label(net, text="采集超时（秒）").grid(row=7, column=0, sticky="e", **pad)
+        ttk.Spinbox(net, from_=3, to=60, textvariable=v_snap_timeout, width=18).grid(
+            row=7, column=1, sticky="w", **pad)
+        ttk.Label(net, text="采集最小间隔（秒）").grid(row=8, column=0, sticky="e", **pad)
+        ttk.Spinbox(net, from_=1, to=60, textvariable=v_snap_interval, width=18).grid(
+            row=8, column=1, sticky="w", **pad)
+
+        # ---- 页 3：恢复 ----
+        recover = page("恢复")
+        ttk.Label(recover, text="远程保障与切回策略",
+                  font=("Microsoft YaHei", 10, "bold")).grid(
+                      row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Checkbutton(recover, text="远控探测（远程保障，只读）",
+                        variable=v_remote).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(recover, text="远程会话进行中推迟自动切回",
+                        variable=v_defer).grid(row=2, column=0, sticky="w")
+        ttk.Separator(recover, orient="horizontal").grid(
+            row=3, column=0, sticky="ew", pady=6)
+        failover_status = getattr(self, "failover_status", None)
+        failover_text = ("\n".join(failover_status.lines()) if failover_status
+                         is not None else "故障切换：等待首次观测（模式 %s）"
+                         % tray_mode_label(self._current_mode()))
+        ttk.Label(recover, text=failover_text, justify="left").grid(
+            row=4, column=0, sticky="w")
+
+        # ---- 页 4：UU Remote ----
+        uu = page("UU Remote")
+        ttk.Label(uu, text="网易 GameViewer（UU 远程）自动恢复",
+                  font=("Microsoft YaHei", 10, "bold")).grid(
+                      row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Checkbutton(
+            uu, text="网络恢复且接口受限验证通过后，自动清退重启 UU 远程（默认关闭）",
+            variable=v_restart).grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(uu, text="两次清退最小间隔（秒）").grid(
+            row=2, column=0, sticky="e", **pad)
+        ttk.Spinbox(uu, from_=60, to=3600, textvariable=v_restart_cd, width=18).grid(
+            row=2, column=1, sticky="w", **pad)
+        ttk.Label(uu, foreground="#8b949e", justify="left",
+                  text=("只处理当前用户的 GameViewer / GameViewerLauncher 用户态进程；\n"
+                        "不动 GameViewerService，也不重启 Windows 服务。\n"
+                        "真机首次清退仍会再次当面确认。")).grid(
+                            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(uu, text="重启 UU Remote（手动）",
+                   command=self.on_restart_uu_remote).grid(
+                       row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        # ---- 页 5：诊断 ----
+        diag = page("诊断")
+        status = self.worker_status()
+        ttk.Label(diag, text="运行状态", font=("Microsoft YaHei", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(diag, text=self._status_text()).grid(
+            row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(diag, text="监测：%s" % status["label"]).grid(
+            row=2, column=0, columnspan=2, sticky="w")
+        ttk.Label(diag, text="上次重连成功：%s" % (self.state.get("last_ok") or "—")).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(diag, text="\n".join(self.ui_state_lines()), justify="left",
+                  foreground="#8b949e").grid(
+                      row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(diag, text="立即检测", command=self.on_detect_now).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(diag, text="立即验证以太网",
+                   command=lambda: self.on_verify_now("ethernet")).grid(
+                       row=6, column=0, columnspan=2, sticky="w")
+        ttk.Button(diag, text="立即验证 SNNU Wi-Fi",
+                   command=lambda: self.on_verify_now("wifi")).grid(
+                       row=7, column=0, columnspan=2, sticky="w")
+        ttk.Button(diag, text="打开日志", command=self.on_open_log).grid(
+            row=8, column=0, columnspan=2, sticky="w")
 
         # 面板打开时的原始值：保存时**只提交用户实际变更的项**（F12/T24）。
         initial = {
@@ -2247,46 +2889,26 @@ class TrayApp:
             "remote_guard": bool(self.config.get("remote_guard", True)),
             "remote_defer_failback": bool(
                 self.config.get("remote_defer_failback", True)),
+            "remote_restart_enabled": bool(
+                self.config.get("remote_restart_enabled", False)),
+            "remote_restart_cooldown": self._int_or(
+                self.config.get("remote_restart_cooldown"), 300),
+            "snapshot_max_age": self._int_or(self.config.get("snapshot_max_age"), 8),
+            "snapshot_timeout": self._int_or(self.config.get("snapshot_timeout"), 12),
+            "snapshot_interval": self._int_or(self.config.get("snapshot_interval"), 3),
         }
-
-        # V0.3 P6：三模式 / 手动锁定 / Clash 保持原样 + 故障切换状态（只读展示）。
-        ttk.Separator(frame, orient="horizontal").grid(
-            row=13, column=0, columnspan=3, sticky="ew", pady=(10, 4))
-        ttk.Label(frame, text="双网络故障切换（V0.3）",
-                  font=("Microsoft YaHei", 10, "bold")).grid(
-            row=14, column=0, columnspan=3, sticky="w")
-        ttk.Label(frame, text="运行模式").grid(row=15, column=0, sticky="e", **pad)
-        ttk.Combobox(frame, textvariable=v_fmode, width=15, state="readonly",
-                     values=[tray_mode_label(m) for m in MODE_ORDER]).grid(
-            row=15, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="锁定目标").grid(row=16, column=0, sticky="e", **pad)
-        ttk.Combobox(frame, textvariable=v_flock, width=15, state="readonly",
-                     values=["不锁定", PATH_LABEL["ethernet"],
-                             PATH_LABEL["wifi"]]).grid(
-            row=16, column=1, sticky="w", **pad)
-        ttk.Checkbutton(frame, text="网络切换期间保持 Clash 原样（默认）",
-                        variable=v_clash_keep).grid(
-            row=17, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(frame, text="远控探测（远程保障，只读）",
-                        variable=v_remote).grid(
-            row=18, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(frame, text="远程会话进行中推迟自动切回",
-                        variable=v_defer).grid(
-            row=19, column=0, columnspan=3, sticky="w")
-        failover_status = getattr(self, "failover_status", None)
-        failover_text = ("\n".join(failover_status.lines()) if failover_status
-                         is not None else "故障切换：等待首次观测（模式 %s）"
-                         % tray_mode_label(self._current_mode()))
-        ttk.Label(frame, text=failover_text, justify="left").grid(
-            row=20, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         def on_save():
             try:
                 interval = max(5, int(v_interval.get()))
                 threshold = max(1, int(v_thr.get()))
                 cooldown = max(60, int(v_cd.get()))
+                restart_cd = max(60, int(v_restart_cd.get()))
+                snap_age = max(2, int(v_snap_age.get()))
+                snap_timeout = max(3, int(v_snap_timeout.get()))
+                snap_interval = max(1, int(v_snap_interval.get()))
             except (tk.TclError, ValueError):
-                messagebox.showwarning("输入无效", "间隔/阈值/冷却必须是数字")
+                messagebox.showwarning("输入无效", "间隔/阈值/冷却/观测参数必须是数字")
                 return
             changes = {}
             ssid = v_ssid.get().strip() or "SNNU"
@@ -2338,6 +2960,17 @@ class TrayApp:
                 changes["remote_guard"] = bool(v_remote.get())
             if bool(v_defer.get()) != initial["remote_defer_failback"]:
                 changes["remote_defer_failback"] = bool(v_defer.get())
+            # V0.5-3：UU 远程自动恢复开关与冷却。
+            if bool(v_restart.get()) != initial["remote_restart_enabled"]:
+                changes["remote_restart_enabled"] = bool(v_restart.get())
+            if restart_cd != initial["remote_restart_cooldown"]:
+                changes["remote_restart_cooldown"] = restart_cd
+            if snap_age != initial["snapshot_max_age"]:
+                changes["snapshot_max_age"] = snap_age
+            if snap_timeout != initial["snapshot_timeout"]:
+                changes["snapshot_timeout"] = snap_timeout
+            if snap_interval != initial["snapshot_interval"]:
+                changes["snapshot_interval"] = snap_interval
 
             if changes:
                 new_cfg = self.get_config()
@@ -2347,6 +2980,10 @@ class TrayApp:
                                          "配置写入失败，已保留原文件。请检查目录权限后重试。")
                     return
                 self.update_config(changes)
+                if any(key in changes for key in
+                       ("snapshot_max_age", "snapshot_timeout", "snapshot_interval")):
+                    # 观测源按旧参数构造，参数变更后丢弃重建（避免"改了不生效"）。
+                    self._snapshot_source = None
                 self._sync_failover_from_config()
                 if "clash_auto_proxy" in changes:
                     with self._config_lock:
@@ -2373,13 +3010,14 @@ class TrayApp:
             win.destroy()
             self._open_settings()
 
-        ttk.Button(frame, text="保存", command=on_save).grid(row=19, column=0, pady=(12, 0))
-        ttk.Button(frame, text="立即重连", command=on_reconnect_click).grid(
-            row=19, column=1, sticky="w", padx=4)
-        ttk.Button(frame, text="暂停/恢复", command=on_pause_click).grid(
-            row=19, column=2, sticky="w")
+        footer = ttk.Frame(outer, padding=(0, 8, 0, 0))
+        footer.grid(sticky="ew")
+        ttk.Button(footer, text="保存", command=on_save).grid(row=0, column=0)
+        ttk.Button(footer, text="立即重连", command=on_reconnect_click).grid(
+            row=0, column=1, padx=6)
+        ttk.Button(footer, text="暂停/恢复", command=on_pause_click).grid(row=0, column=2)
+        ttk.Button(footer, text="关闭", command=win.destroy).grid(row=0, column=3, padx=6)
         win.protocol("WM_DELETE_WINDOW", win.destroy)
-
     @staticmethod
     def _int_or(value, fallback):
         try:
