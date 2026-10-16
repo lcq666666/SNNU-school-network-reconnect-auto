@@ -77,6 +77,7 @@ from campus_tray_observer import (ObservationResult, TraySnapshotSource,
 from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
 from campus_remote import (MonitorWatchdog, RemoteSafetyGuard,
                            apply_watchdog_decision, build_windows_remote_ops)
+from campus_timeline import NetworkTimeline
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
@@ -603,6 +604,14 @@ class TrayApp:
         #: 接口受限验证能力（惰性构造；注入点便于离线测试替换）。
         self._path_verifier = None
 
+        # ---- V0.5-6 网络事件时间线（纯逻辑；只记录，不判定）----
+        #: 「**什么时候断的网 / 什么时候恢复 / 花了多久**」的可复盘台账（方案 §5.6）。
+        #: 是否离线仍由真实探测 + 状态机滞回给出（``observe(offline=...)``）；本对象
+        #: 只做记录、去重、计时与复盘，不触发任何网络动作。时钟与托盘其余接线同源。
+        self.timeline = NetworkTimeline(
+            clock=lambda: time.monotonic(), emit=self._emit_timeline_event,
+            log=lambda message: self.log.warning("[时间线] %s", message))
+
         # ---- V0.3 P7 远程保障（默认未接线；由 :meth:`enable_remote_guard` 接入）----
         #: 远控只读探测能力（``None`` = 未接线：不产生任何子进程/文件 I/O）。
         self._remote_ops = None
@@ -869,6 +878,9 @@ class TrayApp:
                           ", ".join(o.kind.value for o in result.executed))
         # V0.5-4：把本轮迁移交给恢复整合层（零 I/O 判定；需要验证时起后台线程）。
         self._dual_path_step(now, snapshot, trusted=trusted, result=result)
+        # V0.5-6：把本轮观测记入网络事件时间线（只记录，不判定；零 I/O）。
+        self._timeline_observe(now, online, trusted=trusted, snapshot=snapshot,
+                               result=result, detail=reason)
         return result
 
     # ---------- V0.5-4：双链路恢复整合（路径验证 + 恢复协调器 + UU 恢复）----------
@@ -963,6 +975,7 @@ class TrayApp:
             try:
                 from campus_remote_app import restart_after_verified_recovery
 
+                self._timeline_uu_started(request)
                 outcome = restart_after_verified_recovery(
                     ops, active_path=request.active_path,
                     network_epoch=request.network_epoch, verification=verification,
@@ -978,12 +991,16 @@ class TrayApp:
                     self.log.warning("[恢复] UU 远程未重启：%s（%s）",
                                      outcome.detail, outcome.action)
                     self.notify("UU 远程未重启", outcome.detail)
+                self._timeline_uu_outcome(outcome)
                 controller.note_uu_outcome(bool(outcome.restarted),
                                            detail=outcome.detail)
             except Exception as exc:       # 清退不得影响监测主流程（防御性边界）
                 self.log.warning("[恢复] UU 远程恢复异常：%s", type(exc).__name__)
                 controller.note_uu_outcome(
                     False, detail="异常：%s" % type(exc).__name__)
+                self._timeline_uu_outcome(restarted=False, ok=False,
+                                          action="exception",
+                                          detail="异常：%s" % type(exc).__name__)
             finally:
                 busy.clear()
 
@@ -998,6 +1015,143 @@ class TrayApp:
 
             ledger = self._uu_restart_ledger = RecoveryRestartLedger()
         return ledger
+
+    # ---------- V0.5-6：网络事件时间线（只记录，不判定；零 I/O）----------
+    def _emit_timeline_event(self, text: str, level: str = "info") -> None:
+        """时间线的**唯一日志出口**（级别随事件；绝不写入凭据/Cookie）。"""
+        line = "[时间线] %s" % text
+        if level == "error":
+            self.log.error(line)
+        elif level == "warning":
+            self.log.warning(line)
+        else:
+            self.log.info(line)
+
+    def _path_roles(self):
+        """当前 ``(主链路, 备用链路)``：整合层优先，其次状态机展示状态；未知为 ``None``。"""
+        active = standby = None
+        controller = getattr(self, "dual_path", None)
+        if controller is not None:
+            try:
+                status = controller.status()
+            except Exception:                    # 状态读取失败不得让调用方崩溃
+                status = None
+            if status is not None:
+                active, standby = status.active_path, status.standby_path
+        fs = getattr(self, "failover_status", None)
+        if active is None:
+            active = getattr(fs, "primary", None)
+        if standby is None:
+            standby = getattr(fs, "backup", None)
+        return active, standby
+
+    def _timeline_observe(self, now, online, *, trusted=None, detail="",
+                          snapshot=None, result=None):
+        """把本轮**只读**观测写进时间线（判定仍在真实探测 + 状态机里）。
+
+        ``online`` 传 ``None`` 表示"本次不更新断网/恢复状态"（只补里程碑）。
+        """
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return None
+        try:
+            observation = getattr(self, "last_observation", None)
+            if snapshot is None:
+                snapshot = getattr(observation, "snapshot", None)
+            if trusted is None:
+                trusted = getattr(observation, "trusted", None)
+                detail = detail or getattr(observation, "reason_text", "") or ""
+            verification = {}
+            status = None
+            if self.dual_path is not None:
+                try:
+                    status = self.dual_path.status(now=now)
+                except Exception as exc:      # 整合层异常不得阻断时间线记录
+                    self.log.warning("时间线读取整合层状态异常：%s", type(exc).__name__)
+            if status is not None:
+                verification = {"ethernet": status.ethernet, "wifi": status.wifi}
+            active_path, standby_path = self._path_roles()
+            fs = getattr(self, "failover_status", None)
+            tick = getattr(self, "dual_path_tick", None)
+            return timeline.observe(
+                now=now,
+                offline=(None if online is None else (not bool(online))),
+                failover_state=getattr(fs, "state", None),
+                ethernet_state=getattr(getattr(snapshot, "ethernet", None),
+                                       "state", None),
+                wifi_state=getattr(getattr(snapshot, "wifi", None), "state", None),
+                active_path=active_path, standby_path=standby_path,
+                verification=verification,
+                op_plan=getattr(result, "plan", ()) or (),
+                op_outcomes=getattr(result, "executed", ()) or (),
+                recovery_event=getattr(tick, "event", None),
+                recovery_steps=getattr(tick, "steps", ()) or (),
+                trusted=trusted, detail=detail,
+                final_state=str(getattr(getattr(fs, "state", None), "value", "") or ""))
+        except Exception as exc:      # 时间线记录不得影响监测主流程（防御性边界）
+            self.log.warning("时间线记录异常：%s", type(exc).__name__)
+            return None
+
+    def _timeline_paused(self, now) -> None:
+        """监测被暂停：时间线一并停记（**不**伪造恢复时刻，方案 §5.6）。"""
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return
+        try:
+            timeline.note_paused(now=now)
+        except Exception as exc:
+            self.log.warning("时间线暂停记录异常：%s", type(exc).__name__)
+
+    def _timeline_reconnect(self, ok, detail, elapsed=None) -> None:
+        """一次重连尝试的结局入时间线（``ok`` 只代表 Portal 认证完成，见方案 §1）。"""
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return
+        try:
+            timeline.note_reconnect(bool(ok), detail=detail or "", elapsed=elapsed)
+        except Exception as exc:
+            self.log.warning("时间线重连记录异常：%s", type(exc).__name__)
+
+    def _timeline_uu_started(self, request=None, *, active_path=None,
+                             network_epoch=None, reason=None) -> None:
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return
+        try:
+            timeline.note_uu_started(request, active_path=active_path,
+                                     network_epoch=network_epoch, reason=reason)
+        except Exception as exc:
+            self.log.warning("时间线 UU 记录异常：%s", type(exc).__name__)
+
+    def _timeline_uu_outcome(self, outcome=None, **kwargs) -> None:
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return
+        try:
+            timeline.note_uu_outcome(outcome, **kwargs)
+        except Exception as exc:
+            self.log.warning("时间线 UU 记录异常：%s", type(exc).__name__)
+
+    def timeline_report_lines(self, limit: int = 1):
+        """最近故障事件的**复盘时间线**（诊断页 / 日志用；不含凭据/Cookie）。"""
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return ["时间线未接线"]
+        try:
+            return list(timeline.report_lines(limit=limit))
+        except Exception:
+            return ["时间线读取失败：\n%s" % traceback.format_exc()]
+
+    def timeline_status_lines(self, limit: int = 3):
+        """仪表盘用短摘要（最近一次断网结论 + 最近事件）；失败时返回空表。"""
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return []
+        try:
+            return list(timeline.status_lines(limit=limit))
+        except Exception:
+            self.log.warning("时间线摘要读取异常")
+            return []
 
     # ---------- V0.5-5：UI 状态映射 + 主界面 + 手动操作 ----------
     def ui_state(self, *, now: Optional[float] = None):
@@ -1019,16 +1173,14 @@ class TrayApp:
                 self.log.warning("整合层状态读取异常：%s", type(exc).__name__)
                 status = None
         verification = {}
-        active_path = standby_path = None
         uu_enabled = False
         uu_last_ok = None
         network_epoch = 0
         events = []
         max_age = None
+        active_path, standby_path = self._path_roles()
         if status is not None:
             verification = {"ethernet": status.ethernet, "wifi": status.wifi}
-            active_path = status.active_path
-            standby_path = status.standby_path
             uu_enabled = bool(status.uu_enabled)
             uu_last_ok = status.last_uu_ok
             network_epoch = int(status.network_epoch)
@@ -1045,10 +1197,6 @@ class TrayApp:
         snapshot = getattr(observation, "snapshot", None) if observation is not None else None
         fs = getattr(self, "failover_status", None)
         failover_state = getattr(fs, "state", None)
-        if active_path is None and fs is not None:
-            active_path = getattr(fs, "primary", None)
-        if standby_path is None and fs is not None:
-            standby_path = getattr(fs, "backup", None)
         tick = getattr(self, "dual_path_tick", None)
         verify_roles = tuple(getattr(tick, "verify_roles", ()) or ()) if tick is not None else ()
         uu_request = getattr(tick, "uu_request", None) if tick is not None else None
@@ -1222,14 +1370,21 @@ class TrayApp:
         self._dash_events = tk.StringVar(value="")
         ttk.Label(outer, textvariable=self._dash_events, foreground="#8b949e",
                   justify="left").grid(row=5, column=0, sticky="w")
-        ttk.Label(outer, text="最近手动验证（逐站）", foreground="#8b949e").grid(
+        # V0.5-6：网络事件时间线（什么时候断的网 / 什么时候恢复 / 花了多久）。
+        ttk.Label(outer, text="网络时间线（断网 / 恢复）", foreground="#8b949e").grid(
             row=6, column=0, sticky="w", pady=(6, 0))
+        self._dash_timeline = tk.StringVar(value="—")
+        ttk.Label(outer, textvariable=self._dash_timeline, foreground="#8b949e",
+                  justify="left", wraplength=DASHBOARD_WIDTH - 60).grid(
+                      row=7, column=0, sticky="w")
+        ttk.Label(outer, text="最近手动验证（逐站）", foreground="#8b949e").grid(
+            row=8, column=0, sticky="w", pady=(6, 0))
         self._dash_manual = tk.StringVar(value="—")
         ttk.Label(outer, textvariable=self._dash_manual, foreground="#8b949e",
-                  justify="left").grid(row=7, column=0, sticky="w")
+                  justify="left").grid(row=9, column=0, sticky="w")
 
         buttons = ttk.Frame(outer)
-        buttons.grid(row=8, column=0, sticky="ew", pady=(12, 0))
+        buttons.grid(row=10, column=0, sticky="ew", pady=(12, 0))
         ttk.Button(buttons, text="立即检测", command=self.on_detect_now).grid(
             row=0, column=0, padx=(0, 6))
         ttk.Button(buttons, text="立即验证以太网",
@@ -1340,6 +1495,9 @@ class TrayApp:
         self._dash_monitor.set(" · ".join(notes))
         lines = list(state.events) + ["告警：%s" % w for w in state.warnings]
         self._dash_events.set("\n".join(lines))
+        timeline = self.timeline_status_lines(limit=3)
+        self._dash_timeline.set("\n".join(timeline) if timeline
+                                else "尚无网络故障事件记录")
         manual = []
         for role in ("ethernet", "wifi"):
             card = state.card(role)
@@ -1463,6 +1621,10 @@ class TrayApp:
             self.notify("未重启 UU",
                         "缺少活动路径（%s）的接口事实：按 fail-closed 不动作"
                         % PATH_LABEL.get(role, role))
+            self._timeline_uu_outcome(
+                restarted=False, ok=False, action="fail-closed",
+                detail="缺少 %s 的接口事实（ifIndex / 源地址 / 该接口 DNS）"
+                       % PATH_LABEL.get(role, role))
             return
         try:
             ops = self._get_remote_app_ops()
@@ -1479,6 +1641,10 @@ class TrayApp:
             self.notify("未重启 UU",
                         "活动路径未通过接口受限验证（%s）：不清退" % (
                             verification.reason or "未验证"))
+            self._timeline_uu_outcome(
+                restarted=False, ok=False, action="verification-failed",
+                detail="活动路径未通过接口受限验证：%s"
+                       % (verification.reason or "未验证"))
             return
         outcome = restart_after_verified_recovery(
             ops, active_path=role, network_epoch=int(controller.network_epoch),
@@ -1494,6 +1660,11 @@ class TrayApp:
         else:
             self.log.warning("手动 UU 远程未重启：%s（%s）", outcome.detail, outcome.action)
             self.notify("UU 远程未重启", outcome.detail)
+        # V0.5-6：手动清退同样入时间线（STARTED 由调用方在验证通过后登记）。
+        self._timeline_uu_started(active_path=role,
+                                  network_epoch=int(controller.network_epoch),
+                                  reason="手动重启 UU 远程")
+        self._timeline_uu_outcome(outcome)
 
     # ---------- 远程保障（V0.3 P7）----------
     def enable_remote_guard(self, ops=None) -> Optional[RemoteSafetyGuard]:
@@ -1989,10 +2160,14 @@ class TrayApp:
                         proxy_note = "\n网络已恢复，但系统代理未开启：%s" % (
                             result.detail or "原因未知")
             self.notify("重连成功", "用时约 %.0f 秒 · %s%s" % (elapsed, detail, proxy_note))
+            # V0.5-6：Portal 认证成功**不等于**能上网（方案 §1）⇒ 只记里程碑，
+            # 故障事件仍由真实探测确认后结束（下一次探测 offline=False）。
+            self._timeline_reconnect(True, detail, elapsed)
         else:
             self.set_state("offline", detail)
             extra = self._edge_note(cfg)
             self.notify("重连失败", "%s%s" % (detail, extra))
+            self._timeline_reconnect(False, detail, elapsed)
 
     def _edge_note(self, cfg) -> str:
         """按结果如实报告 Edge 兜底；仅在需人工处理时触发，且同周期限一次（F19）。"""
@@ -2190,6 +2365,8 @@ class TrayApp:
         if self.config.get("paused"):
             if self.state["mode"] != "paused":
                 self.set_state("paused", "监测已暂停")
+            # V0.5-6：暂停期间不探测 ⇒ 时间线也停记（不伪造恢复时刻）。
+            self._timeline_paused(now)
             return now + self._interval()
         if self.state["mode"] == "paused":
             self.set_state("boot", "监测恢复，正在检查网络")
@@ -2859,18 +3036,22 @@ class TrayApp:
         ttk.Label(diag, text="上次重连成功：%s" % (self.state.get("last_ok") or "—")).grid(
             row=3, column=0, columnspan=2, sticky="w")
         ttk.Label(diag, text="\n".join(self.ui_state_lines()), justify="left",
-                  foreground="#8b949e").grid(
+                  foreground="#8b949e", wraplength=520).grid(
                       row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # V0.5-6：最近一次故障事件的可复盘时间线（断网时刻 / 恢复时刻 / 耗时）。
+        ttk.Label(diag, text="\n".join(self.timeline_report_lines()), justify="left",
+                  foreground="#8b949e", wraplength=520).grid(
+                      row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Button(diag, text="立即检测", command=self.on_detect_now).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Button(diag, text="立即验证以太网",
                    command=lambda: self.on_verify_now("ethernet")).grid(
-                       row=6, column=0, columnspan=2, sticky="w")
+                       row=7, column=0, columnspan=2, sticky="w")
         ttk.Button(diag, text="立即验证 SNNU Wi-Fi",
                    command=lambda: self.on_verify_now("wifi")).grid(
-                       row=7, column=0, columnspan=2, sticky="w")
+                       row=8, column=0, columnspan=2, sticky="w")
         ttk.Button(diag, text="打开日志", command=self.on_open_log).grid(
-            row=8, column=0, columnspan=2, sticky="w")
+            row=9, column=0, columnspan=2, sticky="w")
 
         # 面板打开时的原始值：保存时**只提交用户实际变更的项**（F12/T24）。
         initial = {
