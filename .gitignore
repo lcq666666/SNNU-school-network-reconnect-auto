@@ -6,6 +6,7 @@ tray_config.json
 build/
 dist/
 CampusReconnect.exe
+CampusReconnect_V*.exe
 
 # ---- 隔离开发环境（阶段 0 起）----
 .venv/
