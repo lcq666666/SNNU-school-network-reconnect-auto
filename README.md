@@ -2,6 +2,11 @@
 
 让校园网掉线后自动重新认证，**全程不需要关闭 Clash Verge 的系统代理**。
 
+> **当前版本：`V0.5.0`（2026-10-16）** —— 从「自动重连校园网工具」升级为
+> **校园网双链路自动故障恢复控制器**：Ethernet 主用 / SNNU Wi-Fi 温备用、
+> **接口受限**真实上网验证（`Connected ≠ Internet`）、验证通过后才清退重启 UU Remote。
+> 能力清单见 [§12 V0.5.0 版本能力](#12-v050-版本能力2026-10-16)。
+
 本目录文件：
 
 | 文件                         | 作用                                   |
@@ -319,3 +324,54 @@ CI（`.github/workflows/ci.yml`）在 Windows 上执行「离线测试 + ruff + 
 第三方 action 全部锁定到不可变 commit。构建**不注入用户凭据**，不上传日志 / 配置。
 注意：重建产物的字节哈希不必然相同（时间戳 / UPX 版本等），因此只承诺“按锁定依赖可重建并通过测试”，
 不夸大为 bit-for-bit 复现。
+
+## 12. V0.5.0 版本能力（2026-10-16）
+
+### 12.1 双链路主备
+
+**Ethernet = PRIMARY**、**SNNU Wi-Fi = STANDBY**（温备用）。二者各自独立判定健康，
+主链路故障且备用链路**被证实可用**后才切换，恢复则需连续稳定满足滞回窗口才切回。
+
+### 12.2 Internet 验证（`Connected ≠ Internet`）
+
+"接口已连接 / DHCP 成功 / Gateway 通"**都不等于能上网**。真值 = 指定物理接口经
+`InterfaceTransport`（`IP_UNICAST_IF` + `bind(source_ip)` + 接口内 DNS）**绕过系统代理**
+（`trust_env=False`）的直连 HTTP 探测：
+
+- **Baidu 闸门**：`http://www.baidu.com/` 严格 `<title>` 匹配，必须 PASS；
+- **交叉站点**：`qq.com` / `163.com` / `sohu.com` 三站，**至少 2 站 PASS**；
+- 两者同时满足才判 `VERIFIED`，否则本次验证不通过。
+
+验证**绑定接口**：`verify(Ethernet)` 只走 Ethernet socket，`verify(WiFi)` 只走 Wi-Fi socket，
+不会因为 Windows 默认出口是 Ethernet 就把 Wi-Fi 判成在线。接口约束无法证实、或会话可能经
+环境代理时判 `PROBE_UNRELIABLE`，**fail-closed**：不触发切换、不触发 UU 重启。
+因此 Clash / 浏览器能上网**不能**证明校园网直连正常（Chrome 可、Edge 不可时，
+状态是「网络健康 + 应用层问题」，不该重新认证校园网）。
+
+### 12.3 UU Remote 恢复
+
+UU 重启是恢复流水线的**最后一步**，三个条件同时成立才允许：`ACTIVE PATH` +
+`DIRECT INTERNET VERIFIED` + `Recovery Event`。Wi-Fi 单纯 Connected / DHCP 成功 /
+网关通 / 单站 PASS **一律不触发**。执行前还会再做一次轻量确认（活动路径仍可用 + Baidu 闸门仍 PASS），
+避免"验证刚过、网络又断、却已把 UU 杀掉"的双重故障。
+
+- 只清退**当前用户**已核实用户态进程（`GameViewer.exe` / `GameViewerLauncher.exe`），
+  **不动** `GameViewerService` 等服务，不重启 Windows 网络服务；
+- `UU_WAS_RUNNING = false` ⇒ **不启动**，不会替你把已关闭的 UU 拉起来；
+- 一次网络恢复事件最多一次重启，冷却 `UU_RESTART_COOLDOWN = 300s`；
+- 开关 `remote_restart_enabled` **默认关闭**，需显式开启。
+
+### 12.4 UI
+
+主窗口仪表盘：总体状态灯（Healthy / Degraded / Recovering / Offline / Unknown）+
+**Ethernet / SNNU Wi-Fi 双 Network Card**（主备角色、IP、Gateway、ifIndex、SSID、Portal、
+Internet 是否真已验证、最近验证时间）+ **恢复流水线**（检测 → Wi-Fi Ready → Portal →
+Internet Verify → Route Switch → UU Restart）+ 按钮（立即检测 / **立即验证**（分网卡展示逐站结果）/
+手动重连 / 重启 UU Remote）。设置页改为 Notebook 五页（基本 / 网络 / 恢复 / UU Remote / 诊断）。
+所有网络操作在后台线程，UI 线程不发起网络 I/O。新增「网络时间线」只读区域，
+回答「什么时候断的网、多久恢复」，一次断网→恢复记为一个故障事件。
+
+### 12.5 安全边界（不变）
+
+不注销 Portal、不修改 Clash 配置/订阅/TUN、密码只留 Windows 凭据管理器、
+不设置 `verify=False`、日志不写账号/密码/Cookie/MAC、不覆盖既有版本产物。
