@@ -42,10 +42,13 @@ __all__ = [
     "RemoteAppOps",
     "RestartResult",
     "RestartGuard",
+    "RecoveryRestartLedger",
+    "UuRecoveryResult",
     "discover",
     "launch_command",
     "format_status",
     "restart_user_app",
+    "restart_after_verified_recovery",
     "build_windows_remote_app_ops",
 ]
 
@@ -524,3 +527,218 @@ def _launch_and_confirm(ops: Any, command: str,
         except Exception:                                 # noqa: BLE001 - 探测不可信
             continue
     return "unconfirmed"
+
+
+# --------------------------------------------------------------------------- #
+# V0.5-3 恢复流水线的最后一步：**验证通过后**清退重启 UU
+# --------------------------------------------------------------------------- #
+def _attr(value: Any, name: str, default: Any = None) -> Any:
+    """对象属性 / 字典键双兼容读取（验证证据按鸭子类型消费）。"""
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+@dataclass
+class RecoveryRestartLedger:
+    """UU 恢复的「世代去重」台账（方案 §31/§34 步骤 3）。
+
+    与 :class:`RestartGuard`（时间冷却）**正交**：本台账管「同一网络世代最多重启一次」，
+    冷却管「两次重启间隔」。两者叠加，才既能防 tick 级重复、又能防网络抖动造成的
+    ``kill/start/kill/start``。
+
+    进程内保存（不落盘），与 :class:`RestartGuard` 同一取舍。
+    """
+
+    last_epoch: Optional[int] = None
+    restarts: int = 0
+
+    def seen(self, epoch: Optional[int]) -> bool:
+        """该世代是否已经重启过 UU。``epoch`` 为 ``None`` 时无法去重（返回 False）。"""
+        if epoch is None:
+            return False
+        return self.last_epoch is not None and int(self.last_epoch) == int(epoch)
+
+    def consume(self, epoch: Optional[int]) -> None:
+        """登记本世代的名额已被消耗（**尝试**即消耗，失败同样消耗，方案 §36）。"""
+        self.restarts += 1
+        if epoch is not None:
+            self.last_epoch = int(epoch)
+
+
+@dataclass
+class UuRecoveryResult:
+    """一次「验证通过后的 UU 恢复」的结构化结果（如实报告，绝不谎报成功）。"""
+
+    ok: bool
+    action: str
+    detail: str = ""
+    reason: str = ""
+    network_epoch: int = 0
+    active_path: Optional[str] = None
+    was_running: bool = False
+    restarted: bool = False
+    alive: bool = False
+    killed: List[int] = field(default_factory=list)
+    launched: str = ""
+    recheck_detail: str = ""
+    verification_detail: str = ""
+
+    @property
+    def attempted(self) -> bool:
+        """是否真的动过 UU 进程（清退或启动）。"""
+        return bool(self.killed) or bool(self.launched)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"ok": self.ok, "action": self.action, "detail": self.detail,
+                "reason": self.reason,
+                "network_epoch": self.network_epoch,
+                "active_path": self.active_path,
+                "was_running": self.was_running,
+                "restarted": self.restarted, "alive": self.alive,
+                "attempted": self.attempted, "killed": list(self.killed),
+                "launched": self.launched,
+                "recheck_detail": self.recheck_detail,
+                "verification_detail": self.verification_detail}
+
+    def lines(self) -> List[str]:
+        """人类可读要点（托盘/CLI 展示）。"""
+        out = ["UU 远程恢复：%s（%s）" % (self.action, self.detail)]
+        out.append("网络世代     : %d（活动路径 %s）"
+                   % (self.network_epoch, self.active_path or "未知"))
+        out.append("清退前在运行 : %s" % ("是" if self.was_running else "否"))
+        out.append("清退进程     : %s" % (_join(self.killed) or "（无）"))
+        out.append("重启命令     : %s" % (self.launched or "（未执行）"))
+        out.append("UU 存活      : %s" % ("是" if self.alive else "否/未知"))
+        return out
+
+
+def _normalize_recheck(value: Any) -> Tuple[bool, str]:
+    """把「清退前再确认」的返回值归一为 ``(ok, detail)``。
+
+    接受 ``bool``、``(ok, detail)`` 元组或 ``None``（= 未给出结论 ⇒ 视为未通过）。
+    """
+    if isinstance(value, tuple):
+        if not value:
+            return False, ""
+        detail = str(value[1]) if len(value) > 1 and value[1] is not None else ""
+        return bool(value[0]), detail
+    if value is None:
+        return False, ""
+    return bool(value), ""
+
+
+def restart_after_verified_recovery(
+        ops: Any, *,
+        active_path: Optional[str],
+        network_epoch: int,
+        verification: Any,
+        reason: str = "",
+        enabled: bool = False,
+        guard: Optional[RestartGuard] = None,
+        recheck: Optional[Callable[[], Any]] = None,
+        status: Optional[RemoteAppStatus] = None,
+        ledger: Optional[RecoveryRestartLedger] = None,
+        now: Optional[float] = None,
+        sleep: Optional[Callable[[float], None]] = None) -> UuRecoveryResult:
+    """恢复流水线的**最后一步**：网络确认真连通后，清退并重启 UU 远程后台（V0.5-3）。
+
+    顺序（方案 §34）与门禁：
+
+    1. ``enabled``：默认 **False**（V0.5 安全档）；关闭时**零副作用**直接返回；
+    2. ``verification``：本次恢复事件所依据的验证证据必须 ``allows_recovery``
+       （接口受限验证通过且探测可信）；否则不清退（``not-verified``）；
+    3. ``ledger``：同一 ``network_epoch`` 已重启过 ⇒ ``deduped``（防 tick 级重复）；
+    4. ``guard``：冷却期内 ⇒ ``skipped``（防网络抖动 kill/start 抖动）；
+    5. 记录清退前状态 ``was_running``；**没在跑就不启动**（``noop``，方案 §16）；
+    6. **清退前轻量再确认**（``recheck``）：active path 仍可用 + 闸门仍通过。
+       未提供 / 抛异常 / 未通过 ⇒ **一个进程都不清退**（fail-closed，方案 §13）；
+    7. 复用 :func:`restart_user_app` 清退用户态进程、按自启项重启、并确认进程真的出现。
+
+    失败（``failed`` / ``unconfirmed``）同样消耗本世代名额并进入冷却（方案 §36），
+    只允许**下一次真正新的**网络恢复事件再试。
+
+    ``recheck`` 的返回值接受 ``bool`` 或 ``(ok, detail)``。**必须提供**：本函数不假定
+    "刚刚验证通过" 仍然成立（验证与清退之间网络可能瞬间又断）。
+    """
+    epoch = int(network_epoch)
+    verification_detail = str(_attr(verification, "reason", "")
+                              or _attr(verification, "reliability", "") or "")
+
+    def result(ok: bool, action: str, detail: str, **kwargs: Any) -> UuRecoveryResult:
+        return UuRecoveryResult(ok=ok, action=action, detail=detail, reason=reason,
+                                network_epoch=epoch, active_path=active_path,
+                                verification_detail=verification_detail, **kwargs)
+
+    if not enabled:
+        return result(True, "disabled",
+                      "UU 自动恢复未开启（remote_restart_enabled=False）：零副作用")
+
+    if not bool(_attr(verification, "allows_recovery", False)):
+        return result(True, "not-verified",
+                      "网络尚未通过接口受限验证（%s）：不清退 UU"
+                      % (verification_detail or "未验证"))
+
+    if ledger is not None and ledger.seen(epoch):
+        return result(True, "deduped",
+                      "同一网络世代（epoch=%d）已重启过 UU：不重复清退" % epoch)
+
+    if guard is not None:
+        allowed, why = guard.allow(now)
+        if not allowed:
+            return result(True, "skipped", why)
+
+    current = status if status is not None else discover(ops)
+    if not current.user_processes:
+        if ledger is not None:
+            ledger.consume(epoch)
+        return result(True, "noop",
+                      "UU 远程用户态进程未在运行（不启动新实例）")
+
+    if recheck is None:
+        return result(True, "recheck-unavailable",
+                      "未提供清退前的轻量再确认（活动路径仍可用 + 百度闸门仍通过）："
+                      "按 fail-closed 不清退 UU", was_running=True)
+    try:
+        recheck_value = recheck()
+    except Exception as exc:                              # noqa: BLE001 - 再确认本身不可信
+        return result(True, "recheck-failed",
+                      "清退前再确认异常（%s）：不清退 UU" % type(exc).__name__,
+                      was_running=True)
+    recheck_ok, recheck_detail = _normalize_recheck(recheck_value)
+    if not recheck_ok:
+        return result(True, "recheck-failed",
+                      "清退前再确认未通过（%s）：网络可能刚断，不清退 UU"
+                      % (recheck_detail or "无明细"),
+                      was_running=True, recheck_detail=recheck_detail)
+
+    outcome = restart_user_app(ops, status=current, guard=guard, now=now, sleep=sleep)
+    common = dict(was_running=True, killed=list(outcome.killed),
+                  launched=outcome.launched, recheck_detail=recheck_detail)
+
+    if outcome.action == "restart":
+        if guard is not None:
+            guard.mark(now)
+        if ledger is not None:
+            ledger.consume(epoch)
+        return result(True, "restarted", outcome.detail,
+                      restarted=True, alive=True, **common)
+
+    if outcome.action == "noop":            # 再确认期间进程恰好退出：等同"原本未运行"
+        if ledger is not None:
+            ledger.consume(epoch)
+        return result(True, "noop", outcome.detail, was_running=False, **common)
+
+    if outcome.action == "skipped":         # 冷却在 race 中被消耗：如实报告、零副作用
+        return result(True, "skipped", outcome.detail, **common)
+
+    # failed / unconfirmed：失败同样消耗名额并进入冷却（方案 §36）
+    if guard is not None:
+        guard.mark(now)
+    if ledger is not None:
+        ledger.consume(epoch)
+    if outcome.action == "unconfirmed":
+        return result(False, "unconfirmed", outcome.detail, **common)
+    return result(False, "failed", outcome.detail, **common)
