@@ -57,7 +57,7 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          PROBE_HTML_TITLE, BrowserLaunchResult, PortalResolution,
                          PortalStatus, ProbeResult, ProbeSpec, RepairAdapters,
                          RepairOptions, RepairResult, LoginOutcome,
-                         StatusPageResult, TimerTable,
+                         StatusPageResult, TimerTable, __version__,
                          check_redirect_target, classify_network,
                          extract_error_hint, normalize_account,
                          parse_status_page, probe_matches,
@@ -1930,6 +1930,8 @@ def _port_type(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SNNU 校园网自动重连助手（Windows）")
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__,
+                        help="显示版本号并退出")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("configure", help="把账号密码存入 Windows 凭据管理器")
