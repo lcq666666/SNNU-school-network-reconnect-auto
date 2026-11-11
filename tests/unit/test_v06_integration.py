@@ -4,7 +4,6 @@
 """
 
 import logging
-import time
 import types
 
 import pytest
@@ -14,7 +13,7 @@ import campus_core as core
 import campus_reconnect_tray as tray
 import campus_uu_recovery as uu
 from campus_remote_app import RemoteAppStatus, discover
-from tests.fakes import FakeRemoteAppOps
+from tests.fakes import FakeRemoteAppOps, VirtualClock
 
 LOG = logging.getLogger("campus")
 
@@ -223,7 +222,9 @@ def _tier2_status():
 
 
 def test_uu_tier2_restart_kills_tier2_and_confirms_back(monkeypatch):
-    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    # V0.6.1：Tier2 的 10 秒等待走 tray._REAL_SLEEP（导入时抓取），
+    # 不再是模块级 time 的 sleep，测试里改打这个桩。
+    monkeypatch.setattr(tray, "_REAL_SLEEP", lambda _s: None)
     app = _app()
     ops, status = _tier2_status()
     assert app._uu_tier2_restart(ops, status) is True
@@ -232,7 +233,7 @@ def test_uu_tier2_restart_kills_tier2_and_confirms_back(monkeypatch):
 
 
 def test_uu_tier2_restart_aborts_without_launch_command(monkeypatch):
-    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    monkeypatch.setattr(tray, "_REAL_SLEEP", lambda _s: None)
     app = _app()
     ops = FakeRemoteAppOps(
         processes=[{"pid": 101, "process_name": "GameViewer", "path": ""}])
@@ -246,6 +247,42 @@ def test_should_escalate_timeout_semantics():
     assert uu.should_escalate(False, 59.0, False).escalate is False
     assert uu.should_escalate(False, 60.0, False).escalate is True
     assert uu.should_escalate(False, 61.0, False).escalate is True
+
+
+# ---------- V0.6.1：托盘等待不得推进虚拟时钟（i2_01 回归） ----------
+
+def test_v061_tier2_sleep_does_not_advance_virtual_clock(monkeypatch):
+    """UU Tier2 的 10 秒确认等待不得推进虚拟时钟。
+
+    根因（Windows CI 上 i2_01 漂移）：V0.6 把等待写进托盘并走模块级
+    time，计时器测试装上虚拟时钟后，残留的后台线程恰好在此时调用它，
+    虚拟时间被多推进几秒，探测时刻从 [0, 15, 30, 45] 漂到
+    [0, 15, 30, 50]。托盘的等待一律走导入时抓取的 _REAL_SLEEP。
+    """
+    clock = VirtualClock()
+    clock.install(monkeypatch, tray)  # tray.time 换成虚拟时钟
+    slept = []
+    monkeypatch.setattr(tray, "_REAL_SLEEP", lambda s: slept.append(s))
+    app = _app()
+    ops, status = _tier2_status()
+    assert app._uu_tier2_restart(ops, status) is True
+    assert slept == [10.0]
+    assert clock.now == 0.0, "Tier2 等待推进了虚拟时钟：%s" % clock.now
+    assert clock.sleeps == []
+
+
+def test_v061_tray_has_no_patchable_sleep_calls():
+    """托盘源码里不得再出现可被虚拟时钟替换的等待调用。
+
+    守卫上面的回归：以后任何人在托盘里新加等待，都必须走 _REAL_SLEEP，
+    否则计时器测试的虚拟时钟会被后台线程推进，i2_01 这类时序断言
+    会在 CI 上偶发漂移。
+    """
+    from pathlib import Path
+
+    text = Path(tray.__file__).read_text(encoding="utf-8")
+    assert "time.sleep(" not in text
+    assert "_REAL_SLEEP(" in text
     assert uu.should_escalate(True, 60.0, False).escalate is False
     assert uu.should_escalate(False, 60.0, True).escalate is False
 
