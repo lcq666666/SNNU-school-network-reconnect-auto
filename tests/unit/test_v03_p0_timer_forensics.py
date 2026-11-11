@@ -124,4 +124,8 @@ def _make_app(monkeypatch, **overrides):
     app.icon = None
     app.root = None
     app.session = object()
+    # V0.6.1：关掉后台三轴采集——它在独立线程里调 internet_ok，
+    # 会偷吃本文件记录型假件的条目（与 test_v03_p2 的 i2_01 / u2_07
+    # 同一竞态）。采集返回 None 即快照不可信（fail-closed）。
+    app._snapshot_collector = lambda: None
     return app

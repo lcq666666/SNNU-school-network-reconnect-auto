@@ -76,6 +76,11 @@ def _make_app(monkeypatch, **overrides):
     app.icon = None
     app.root = None
     app.session = object()
+    # V0.6.1：关掉后台三轴采集——它在独立线程里调 internet_ok，
+    # 会偷吃本文件记录型假件的条目（采集线程恰好吃掉一次，探测时刻
+    # 表就多一条 0.0；i2_01 / u2_07 在全量套件里因此偶发失败）。
+    # 采集返回 None 即快照不可信（fail-closed），不影响计时器断言。
+    app._snapshot_collector = lambda: None
     return app
 
 
