@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -335,7 +336,8 @@ def verify_internet(session: requests.Session, *,
                     gate: ProbeSpec = VERIFY_GATE,
                     cross: Tuple[ProbeSpec, ...] = VERIFY_CROSS,
                     min_cross: int = VERIFY_MIN_CROSS,
-                    timeout: Tuple[float, float] = VERIFY_TIMEOUT
+                    timeout: Tuple[float, float] = VERIFY_TIMEOUT,
+                    stop_on_failed_gate: bool = False,
                     ) -> Tuple[bool, str]:
     """V0.4-1 连接后**真实上网校验**：抓真实页面并按 ``<title>`` 结构严格匹配。
 
@@ -353,6 +355,8 @@ def verify_internet(session: requests.Session, *,
     lines: List[str] = []
     gate_result = verify_site(session, gate, timeout)
     lines.append("闸门 %s" % _probe_detail(gate_result))
+    if stop_on_failed_gate and not gate_result.ok:
+        return False, lines[0]
     hits = 0
     for spec in cross:
         result = verify_site(session, spec, timeout)
@@ -505,8 +509,7 @@ def _close_quietly(session: Any) -> None:
 def _captive_portal_hit(final_url: str, body: str) -> bool:
     """Portal 劫持判定（V0.5-1）：最终 URL 或正文命中校园网门户特征。
 
-    与 :func:`campus_network._portal_hit` 的区别：这里已**跟随重定向**，故不能再用
-    ``redirected`` 标志，改为直接看**落到哪里**。
+    此处已跟随重定向，诊断使用最终地址和正文。
     """
     text = "%s %s" % (final_url or "", body or "")
     return any(hint in text for hint in PORTAL_HINTS)
@@ -758,6 +761,16 @@ def _is_portal_url(url: str) -> bool:
     return host in (PORTAL_IP, "net.snnu.edu.cn")
 
 
+def _advertised_port(response: Any) -> Tuple[Optional[int], str]:
+    if 300 <= response.status_code < 400:
+        location = response.headers.get("Location", "")
+        port = _port_from_text(location)
+        if port is not None and _is_portal_url(resolve_url(PORTAL_ROOT, location) or ""):
+            return port, "根页面 Location"
+    port = _port_from_text(decode_body(response) or "")
+    return port, "根页面 JS 跳转" if port is not None else ""
+
+
 def resolve_portal(session: requests.Session, requested: Optional[int] = None,
                    budget: float = PORTAL_BUDGET) -> PortalResolution:
     """解析 Portal 认证端口并返回结构化结果（F16）。
@@ -791,17 +804,10 @@ def resolve_portal(session: requests.Session, requested: Optional[int] = None,
     else:
         root_error = ""
     if resp is not None:
-        if 300 <= resp.status_code < 400:
-            location = resp.headers.get("Location", "")
-            port = _port_from_text(location)
-            if port is not None and _is_portal_url(resolve_url(PORTAL_ROOT, location) or ""):
-                return PortalResolution(port=port, source="根页面 Location",
-                                        evidence="302 Location 指向学校 Portal")
-        body = decode_body(resp) or ""
-        port = _port_from_text(body)
+        port, source = _advertised_port(resp)
         if port is not None:
-            return PortalResolution(port=port, source="根页面 JS 跳转",
-                                    evidence="JS 声明 :%d/snnuportal/login.jsp" % port)
+            return PortalResolution(port=port, source=source,
+                                    evidence="%s 指向 :%d/snnuportal/login.jsp" % (source, port))
 
     # 2) 已知端口试探（受总预算约束）
     for port in KNOWN_PORTS:
@@ -1008,7 +1014,9 @@ def configure() -> None:
 
 
 def read_status_page(session: requests.Session, port: int,
-                     log: Optional[logging.Logger] = None
+                     log: Optional[logging.Logger] = None, *,
+                     timeout: Tuple[float, float] = (3, 6),
+                     explicit_login: bool = False,
                      ) -> Optional[object]:
     """只读获取状态页并解析（不发凭据，F06/F08）。
 
@@ -1024,14 +1032,14 @@ def read_status_page(session: requests.Session, port: int,
     """
     base = portal_base(port)
     try:
-        resp = session.get(base + USERSTATUS_JSP, timeout=(3, 6),
+        resp = session.get(base + USERSTATUS_JSP, timeout=timeout,
                            allow_redirects=False)
     except requests.RequestException:
         return None
     if resp.status_code in (301, 302, 303):
         ok, _target, reason = check_redirect_target(
             resp.headers.get("Location", ""), base,
-            allowed_paths=(USERSTATUS_JSP, LOGIN_JSP))
+            allowed_paths=(LOGIN_JSP,) if explicit_login else (USERSTATUS_JSP, LOGIN_JSP))
         if ok:
             return StatusPageResult(PortalStatus.AUTH_REQUIRED, marker_found=False,
                                     detail="状态页跳转到登录页，判定需要认证")
@@ -1043,7 +1051,39 @@ def read_status_page(session: requests.Session, port: int,
     body = decode_body(resp, strict=True)
     if body is None:
         return None
-    return parse_status_page(body)
+    parsed = parse_status_page(body)
+    if explicit_login and parsed.status is PortalStatus.AUTH_REQUIRED:
+        # 状态页空白、错误页或未知 HTML 不足以授权自动登录。
+        html = body.lower()
+        login_form = ("<form" in html and "/snnuportal/login" in html
+                      and all(re.search(r"<input\b[^>]*\bname\s*=\s*[\"']?" + field + r"\b", html)
+                              for field in ("account", "password")))
+        return parsed if login_form else None
+    return parsed
+
+
+def probe_snnu_portal(scoped: Any, interface: str, ssid: str,
+                      configured_port: Optional[int] = None) -> Optional[PortalStatus]:
+    """在已验证绑定的 SNNU Wi-Fi 上读取 Portal 状态，不访问凭据库。"""
+    if not interface or getattr(scoped, "interface_bound", False) is not True:
+        return None
+    if wifi_state(interface)[0] != ssid:
+        return None
+    timeout = (0.7, 1.3)
+    try:
+        with direct_session() as session:
+            if not scoped.bind_session(session) or session.trust_env:
+                return None
+            port = configured_port
+            if port is None:
+                with session.get(PORTAL_ROOT, timeout=timeout, allow_redirects=False) as response:
+                    port, _source = _advertised_port(response)
+            if port is None:
+                return None
+            result = read_status_page(session, port, timeout=timeout, explicit_login=True)
+            return result.status if result is not None else None
+    except (OSError, ValueError, requests.RequestException):
+        return None
 
 
 def _interpret_auth_response(session: requests.Session, base: str, resp,
@@ -1318,7 +1358,7 @@ def failover(session: requests.Session, args: argparse.Namespace,
 
 
 def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
-              interface: Optional[str]) -> SnnuOps:
+              interface: Optional[str], *, require_web: bool = False) -> SnnuOps:
     """P4 CLI 侧的注入式能力集合（指向本模块真实函数，便于测试替换）。
 
     ``repair`` 封装调用 ``campus_core.repair_service``（**不重写认证引擎**，
@@ -1344,6 +1384,12 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
             host, port, timeout, source_ip)
 
     def _repair(bound_session: Any, options: RepairOptions) -> RepairResult:
+        if require_web:
+            # Portal 或过滤网关可能允许 TCP 握手；认证前后都按网页内容确认公网。
+            verify_web = partial(verify_internet, stop_on_failed_gate=True)
+            return repair_service(bound_session, options, time.monotonic,
+                                  replace(_cli_adapters(), probe_online=verify_web),
+                                  get_credentials, log=log)
         try:
             source_ip = _refresh_binding().source_ip
         except Exception as exc:  # 取不到源地址 ⇒ 不做 IP 级证据（见 _bound_tcp_probe）
@@ -1356,8 +1402,12 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         return repair_service(bound_session, options, time.monotonic,
                               adapters, get_credentials, log=log)
 
+    def _binding_report():
+        collect_health = getattr(observer, "observe_health", None)
+        return collect_health() if callable(collect_health) else observer.observe(target_ssid="SNNU")
+
     def _refresh_binding():
-        report = observer.observe(target_ssid="SNNU")
+        report = _binding_report()
         adapter = next((item for item in report.adapters
                         if getattr(item, "name", "") == interface), None)
         if adapter is None:
@@ -1367,11 +1417,11 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
                                 if_index=adapter.if_index, source_ip=source)
     def _bind_interface(bound_session, binding):
         from campus_network import _interface_dns
-        report = observer.observe(target_ssid="SNNU")
+        report = _binding_report()
         transport = WindowsProbeEngine().for_interface(
             binding.if_index, binding.source_ip,
             _interface_dns(report, binding.if_index))
-        return transport.bind_session(bound_session)
+        return bool(transport.interface_bound and transport.bind_session(bound_session))
     return SnnuOps(
         wifi_state=lambda: wifi_state(interface),
         wifi_reconnect=lambda ssid: wifi_reconnect(ssid, log,
@@ -1504,7 +1554,7 @@ def _build_composite_executor(observer: Any, report: Any, wifi: Any,
         # SNNU 认证会把 HTTP 会话限定在无线接口。单独创建会话以免影响系统轴检测。
         with direct_session() as session:
             link = SnnuBackupLink(
-                ops=_snnu_ops(session, observer, log, interface), session=session,
+                ops=_snnu_ops(session, observer, log, interface, require_web=True), session=session,
                 target_ssid=args.ssid, interface=interface or "", if_index=wifi_if,
                 source_ip=source_ip, allow_auth=True, reconnect_wifi=False, port=args.port,
                 operator=args.yys, account_format=args.account_format,

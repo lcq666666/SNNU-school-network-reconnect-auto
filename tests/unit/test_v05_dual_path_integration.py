@@ -271,6 +271,23 @@ def test_healthy_active_wifi_verification_is_refreshed_before_expiry():
     assert rig.step(D, H, WIFI_IF, dt=15).tick.verify_roles == ("wifi",)
 
 
+def test_two_portal_evictions_on_same_wifi_address_allow_one_uu_restart_each():
+    rig = Rig()
+    first = rig.step(D, H, WIFI_IF, dt=0)
+    assert not rig.uu_results, "启动后校验不能重启 UU"
+    rig.step(D, C, WIFI_IF, dt=5)
+    assert rig.gate.evidence("wifi") is None
+    rig.step(D, HealthState.INTERNET_UNREACHABLE, WIFI_IF, dt=5)
+    recovered = rig.step(D, H, WIFI_IF, dt=5)
+    assert recovered.tick.network_epoch > first.tick.network_epoch
+    assert [item.restarted for item in rig.uu_results] == [True]
+    rig.step(D, H, WIFI_IF, dt=40)
+    assert len(rig.uu_results) == 1
+    rig.step(D, C, WIFI_IF, dt=310)
+    rig.step(D, H, WIFI_IF, dt=5)
+    assert [item.restarted for item in rig.uu_results] == [True, True]
+
+
 def drive_to_backup(rig: Rig, *, wifi: HealthState = H,
                     dt: float = STEP) -> Step:
     """把台架驱动到 Wi-Fi 接管完成（含切换前验证与门禁放行）。

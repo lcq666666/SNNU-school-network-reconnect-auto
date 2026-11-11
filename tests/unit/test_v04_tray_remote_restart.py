@@ -5,8 +5,7 @@
 本机；希望确认网络真连上后把 UU 远程后台清退重启。
 
 接线判据（方案 §3.3）：
-- 触发点 = **连接后真实上网校验通过**（V0.4-1 的 ``verify_internet`` 返回 ok）；
-  「校验通过」本身就是"真的连上"的定义，故不另设判据；
+- 触发点 = 已记录断网后的当前出口通过接口受限公网校验；
 - **默认关闭**（``remote_restart_enabled=False``）：不主动调用即零副作用；
 - 冷却 ≥ ``remote_restart_cooldown``（默认 300s），跨在线段仍然生效；
 - 失败**如实提示**，不改动状态机、不触发重连/路由动作。
@@ -17,8 +16,11 @@ from __future__ import annotations
 
 import logging
 import time
+from types import SimpleNamespace
 
 import campus_reconnect_tray as tray
+from campus_reconnect import PathVerificationResult
+from campus_recovery import UuRestartRequest
 from campus_remote_app import RestartGuard
 from tests.fakes import FakeRemoteAppOps
 
@@ -94,10 +96,23 @@ def _fake_ops(**kwargs):
 
 def _wait_restart_done(app):
     def done():
-        busy = getattr(app, "_restart_busy", None)
+        busy = getattr(app, "_uu_recovery_busy", None)
         return busy is None or not busy.is_set()
 
     return wait_until(done)
+
+
+def _start_verified_recovery(app, epoch=1):
+    app.dual_path = SimpleNamespace(
+        status=lambda: SimpleNamespace(network_epoch=epoch, active_path="wifi"),
+        build_recheck=lambda role: lambda: True,
+        note_uu_outcome=lambda *args, **kwargs: None,
+    )
+    app._v06_had_outage = True
+    app._v06_uu_was_running = True
+    request = UuRestartRequest(epoch, "wifi", "confirmed recovery", 1)
+    follow = SimpleNamespace(uu_request=request, schedules_uu_restart=True)
+    app._uu_recovery_after_verification(follow, PathVerificationResult(True, role="wifi"))
 
 
 # --------------------------------------------------------------------------- #
@@ -124,12 +139,15 @@ def test_v04_restart_not_triggered_when_disabled(monkeypatch):
 # --------------------------------------------------------------------------- #
 # 触发点 = 校验通过
 # --------------------------------------------------------------------------- #
-def test_v04_restart_triggered_once_after_verified_online(monkeypatch):
-    """开启后：**校验通过** ⇒ 清退用户态进程并按自启项重启（各一次）。"""
+def test_restart_requires_an_outage_and_a_verified_recovery(monkeypatch):
+    """启动校验只确认在线；真实掉线恢复后才允许一次 UU 重启。"""
     app = _make_app(monkeypatch, remote_restart_enabled=True)
     ops = _attach_fake_restart(app, monkeypatch)
 
     app._probe_tick(0.0)
+    assert wait_until(lambda: not app._verify_busy.is_set())
+    assert ops.killed == []
+    _start_verified_recovery(app)
 
     assert wait_until(lambda: ops.launched), "校验通过后未触发 UU 远程重启"
     assert _wait_restart_done(app)
@@ -162,11 +180,10 @@ def test_v04_restart_cooldown_spans_online_segments(monkeypatch):
     app._remote_restart_guard = RestartGuard(cooldown=300.0,
                                              clock=lambda: clock["t"])
 
-    app._probe_tick(0.0)                      # 在线 → 校验通过 → 清退 #1
+    _start_verified_recovery(app)
     assert wait_until(lambda: ops.launched) and _wait_restart_done(app)
-    app._probe_tick(0.0)                      # 掉线（重置在线段标记）
     clock["t"] += 20.0
-    app._probe_tick(0.0)                      # 再连上 → 校验通过，但冷却中
+    _start_verified_recovery(app, epoch=2)
     time.sleep(0.15)
 
     assert len(ops.launched) == 1, "冷却期内重复清退：%d 次" % len(ops.launched)
@@ -182,8 +199,8 @@ def test_v04_restart_failure_notifies_and_keeps_state(monkeypatch):
     monkeypatch.setattr(app, "notify", lambda *a, **k: notices.append(a))
     ops = _attach_fake_restart(app, monkeypatch, launch_results=False)
 
-    app._probe_tick(0.0)
-
+    app.state["mode"] = "online"
+    _start_verified_recovery(app)
     assert wait_until(lambda: notices), "重启失败未提示用户"
     assert app.state["mode"] == "online", "UU 重启失败不应改变在线状态"
     assert ops.killed == [100, 200]
@@ -196,8 +213,8 @@ def test_v04_restart_exception_is_swallowed(monkeypatch):
     app._remote_app_ops = _fake_ops(probe_error=OSError("wmi down"))
     monkeypatch.setattr(tray, "verify_internet", lambda session: (True, "ok"))
 
-    app._probe_tick(0.0)
-    time.sleep(0.15)
+    app.state["mode"] = "online"
+    _start_verified_recovery(app)
 
     assert app.state["mode"] == "online"
     assert _wait_restart_done(app), "重启线程未正常收尾"

@@ -82,6 +82,7 @@ from campus_tray_observer import (ObservationResult, TraySnapshotSource,
                                   is_auto_executable_snapshot,
                                   is_full_snapshot)
 from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
+from campus_network import HealthState
 from campus_remote import (MonitorWatchdog, RemoteSafetyGuard,
                            apply_watchdog_decision, build_windows_remote_ops)
 from campus_timeline import NetworkTimeline
@@ -951,10 +952,13 @@ class TrayApp:
         from campus_network import WindowsProbeEngine, evaluate
 
         system_probe = self._last_system_probe
+        cfg = self.get_config()
         report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
         # 网关不开放 80/443 很常见。端口探测只用于详细诊断，不参与健康判定。
-        return evaluate(report, WindowsProbeEngine(),
+        return evaluate(report, WindowsProbeEngine(timeout=2), parallel_probes=True,
                         system_probe=(lambda: system_probe) if system_probe is not None else None,
+                        portal_probe=lambda alias, scoped: engine.probe_snnu_portal(
+                            scoped, alias, cfg.get("ssid") or "SNNU", cfg.get("port")),
                         config=engine._load_adapters_config(), gateway_ports=())
 
     def _observe_snapshot(self, now: Optional[float] = None) -> ObservationResult:
@@ -1028,8 +1032,7 @@ class TrayApp:
         observation = getattr(self, "last_observation", None)
         trusted = bool(observation is not None and observation.trusted)
         reason = observation.reason_text if observation is not None else ""
-        # P7.5-1A：AUTO 快照契约收紧 —— 仅结构可信不够，必须两轴都有有效
-        # if_index，否则无法把副作用约束到正确网卡。
+        # AUTO 需要识别目标网卡。已确认只有 Wi-Fi 的电脑仅执行无线恢复。
         if trusted and bridge.mode is FailoverMode.AUTO:
             ok, auto_reason = is_auto_executable_snapshot(snapshot)
             if not ok:
@@ -1041,6 +1044,13 @@ class TrayApp:
         if not trusted:
             self.log.info("三轴快照不可信（%s）：本轮不执行任何网络副作用",
                           reason)
+        elif (self.config.get("remote_restart_enabled", False)
+              and not getattr(self, "_v06_had_outage", False)
+              and getattr(getattr(snapshot, "ethernet", None), "state", None) is not HealthState.HEALTHY
+              and getattr(getattr(snapshot, "wifi", None), "state", None) in (
+                  HealthState.CAPTIVE_PORTAL, HealthState.INTERNET_UNREACHABLE, HealthState.DNS_FAILURE)):
+            # 系统 TCP 探测仍可能显示在线。用绑定 Wi-Fi 的证据登记掉线。
+            self._note_outage_for_uu()
         result = bridge.tick(now, snapshot)
         self.failover_status = bridge.status()
         if result is not None and result.executed:
@@ -1117,27 +1127,23 @@ class TrayApp:
         request = getattr(follow, "uu_request", None)
         if request is None:
             return
+        had_outage = bool(getattr(self, "_v06_had_outage", False))
+        was_running = bool(getattr(self, "_v06_uu_was_running", False))
+        self._v06_had_outage = False
+        self._v06_uu_was_running = False
         if not getattr(follow, "schedules_uu_restart", False):
             self.log.info("[恢复] 已满足恢复条件，但 UU 自动恢复未开启"
                           "（remote_restart_enabled=False）：不清退")
             return
         # V0.6：恢复事件触发条件（断网再恢复 + 恢复前 UU 在运行 + 验证通过）。
-        _was = getattr(self, "_v06_uu_was_running", None)
-        if _was is None:
-            try:
-                from campus_remote_app import discover as _discover
-
-                _was = bool(_discover(self._get_remote_app_ops()).user_processes)
-            except Exception:
-                _was = False
         try:
             _cooldown_ok, _ = self._get_restart_guard().allow()
         except Exception:
-            _cooldown_ok = True
+            _cooldown_ok = False
         _decision = uu_decide(
-            had_outage=bool(getattr(self, "_v06_had_outage", True)),
-            was_running_before_outage=bool(_was),
-            verified_recovery=True,
+            had_outage=had_outage,
+            was_running_before_outage=was_running,
+            verified_recovery=bool(getattr(verification, "allows_recovery", False)),
             remote_restart_enabled=True,
             cooldown_ok=bool(_cooldown_ok),
             epoch_already_restarted=self._uu_recovery_ledger().seen(
@@ -1145,7 +1151,6 @@ class TrayApp:
         if not _decision.should_restart:
             self.log.info("[UU V0.6] 不重启：%s", _decision.reason)
             return
-        self._v06_had_outage = False  # 本次断网事件已消费
         self._uu_recovery_async(request, verification)
 
     def _uu_recovery_async(self, request, verification):
@@ -1166,7 +1171,15 @@ class TrayApp:
             self.log.warning("[恢复] UU 清退能力不可用：%s", type(exc).__name__)
             return
         controller = self.dual_path
-        recheck = controller.build_recheck(request.active_path)
+        verify_gate = controller.build_recheck(request.active_path)
+
+        def recheck():
+            current = controller.status()
+            if (not self.config.get("remote_restart_enabled", False)
+                    or current.network_epoch != request.network_epoch
+                    or current.active_path != request.active_path):
+                return False, "UU 恢复开关或活动网络已变化"
+            return verify_gate()
 
         def _run():
             try:
@@ -2426,56 +2439,6 @@ class TrayApp:
                                                DEFAULT_RESTART_COOLDOWN))
         return guard
 
-    def _maybe_restart_remote_app(self):
-        """确认**真的**连上后清退重启 UU 远程后台（V0.4-3）。
-
-        触发点 = 连接后真实上网校验通过（V0.4-1）：「校验通过」本身就是"真的连上"
-        的定义。**默认关闭**：不开开关时本方法直接返回，不构建能力、不探测、零副作用。
-        """
-        if not bool(self.config.get("remote_restart_enabled", False)):
-            return
-        try:
-            ops = self._get_remote_app_ops()
-            guard = self._get_restart_guard()
-        except Exception as exc:       # 能力构建失败不得影响校验线程
-            self.log.warning("UU 远程清退能力不可用: %s", type(exc).__name__)
-            return
-        self._restart_remote_app_async(ops, guard)
-
-    def _restart_remote_app_async(self, ops, guard):
-        """在独立短命线程里执行清退/重启（绝不阻塞监测与校验线程）。"""
-        busy = getattr(self, "_restart_busy", None)
-        if busy is None:
-            busy = self._restart_busy = threading.Event()
-        if busy.is_set():
-            return
-        busy.set()
-
-        def _run():
-            try:
-                from campus_remote_app import restart_user_app
-
-                result = restart_user_app(ops, guard=guard)
-                # V0.6：Tier1 失败时按 V0.4 行为如实提示、不改状态、不额外清退
-                # （重启命令本身失败时再杀 Server/Healthd 只会让 UU 更死；
-                # 升级只走 60 秒超时确认，见 _schedule_uu_tier2_check）。
-                if result.action == "restart":
-                    self.log.info("UU 远程后台已清退重启：%s（%s）",
-                                  result.detail, result.launched)
-                elif result.ok:
-                    self.log.info("UU 远程后台无需重启：%s", result.detail)
-                else:
-                    self.log.warning("UU 远程后台未重启：%s（%s）",
-                                     result.detail, result.action)
-                    self.notify("UU 远程后台未重启", result.detail)
-            except Exception as exc:   # 清退不得影响监测主流程（防御性边界）
-                self.log.warning("UU 远程清退异常: %s", type(exc).__name__)
-            finally:
-                busy.clear()
-
-        threading.Thread(target=_run, daemon=True,
-                         name="campus-uu-restart").start()
-
     def _remote_text(self, item=None):
         """菜单中的远程保障摘要（只读）。"""
         status = getattr(self, "remote", None)
@@ -3051,7 +3014,7 @@ class TrayApp:
                 self.set_state("offline", "公网探测失败（%d/%d）"
                                % (self.state["failures"], threshold))
             return self._next_probe_time(now)
-        if not getattr(self, "_v06_had_outage", False):
+        if self.config.get("remote_restart_enabled", False) and not getattr(self, "_v06_had_outage", False):
             self._note_outage_for_uu()
         # ---- P7.5-1（F75-02）：后台**永不**自动认证 ----
         # 旧实现在此调用 V0.2 的 ``_run_repair()``（Portal POST + Wi-Fi 重连），
@@ -3094,8 +3057,6 @@ class TrayApp:
                 ok, detail = verify_internet(direct_session())
                 if ok:
                     self.log.info("连接后上网校验通过：%s", detail)
-                    # V0.4-3：确认真连通后清退重启 UU 远程后台（默认关闭）
-                    self._maybe_restart_remote_app()
                 else:
                     self.log.warning("连接后上网校验未通过，疑似「假死」：%s", detail)
                     self.notify("网络校验未通过",
@@ -3150,13 +3111,15 @@ class TrayApp:
         was_running = False
         try:
             ops = self._get_remote_app_ops()
-            from campus_remote_app import discover
+            from campus_remote_app import AppProcess
 
-            status = discover(ops)
-            was_running = bool(status.user_processes)
+            processes = [proc for row in ops.list_processes() or ()
+                         if (proc := AppProcess.from_mapping(row)) is not None
+                         and proc.in_restart_scope]
+            was_running = bool(processes)
             try:
                 rows = uu_diagnose(
-                    [{"pid": p.pid, "name": p.name} for p in status.user_processes],
+                    [{"pid": p.pid, "name": p.name} for p in processes],
                     [])
                 for row in rows:
                     self.log.info("[UU 诊断] %s", row)

@@ -179,7 +179,7 @@ def test_uu_gate_blocks_without_outage(monkeypatch):
     called = []
     monkeypatch.setattr(app, "_uu_recovery_async",
                         lambda *a: called.append(a))
-    app._uu_recovery_after_verification(_Follow(), None)
+    app._uu_recovery_after_verification(_Follow(), types.SimpleNamespace(allows_recovery=True))
     assert called == []
 
 
@@ -190,7 +190,7 @@ def test_uu_gate_blocks_when_not_running_before(monkeypatch):
     called = []
     monkeypatch.setattr(app, "_uu_recovery_async",
                         lambda *a: called.append(a))
-    app._uu_recovery_after_verification(_Follow(), None)
+    app._uu_recovery_after_verification(_Follow(), types.SimpleNamespace(allows_recovery=True))
     assert called == []
 
 
@@ -201,7 +201,7 @@ def test_uu_gate_allows_when_all_conditions_hold(monkeypatch):
     called = []
     monkeypatch.setattr(app, "_uu_recovery_async",
                         lambda *a: called.append(a))
-    app._uu_recovery_after_verification(_Follow(epoch=7), None)
+    app._uu_recovery_after_verification(_Follow(epoch=7), types.SimpleNamespace(allows_recovery=True))
     assert len(called) == 1
     assert app._v06_had_outage is False  # 事件已消费
 

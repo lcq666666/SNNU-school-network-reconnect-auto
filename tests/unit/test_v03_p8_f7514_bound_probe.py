@@ -247,6 +247,31 @@ def test_f7514_snnu_repair_adapter_uses_interface_bound_probe(monkeypatch):
     assert all(source == SNNU_SOURCE_IP for _h, _p, source in bound), bound
 
 
+def test_automatic_snnu_repair_reaches_portal_when_only_tcp_would_succeed(monkeypatch):
+    session = FakeSession()
+    ops = engine._snnu_ops(session, _fake_snnu_observer(), logging.getLogger("campus"),
+                           "WLAN", require_web=True)
+    tcp_calls = []
+    portal_calls = []
+
+    def tcp_probe(*args):
+        tcp_calls.append(args)
+        return True
+
+    monkeypatch.setattr(engine, "IP_TCP_PROBE", tcp_probe)
+    monkeypatch.setattr(engine, "IP_TCP_PROBE_BOUND", tcp_probe)
+    monkeypatch.setattr(engine, "verify_internet", lambda *_args, **_kwargs: (False, "Portal"))
+    monkeypatch.setattr(engine, "wifi_state", lambda interface=None: ("SNNU", "connected"))
+    monkeypatch.setattr(engine, "resolve_port", lambda sess, requested=None: (8601, "测试"))
+    monkeypatch.setattr(engine, "portal_reachable", lambda sess, port: portal_calls.append(port) or False)
+
+    result = ops.repair(session, RepairOptions(ssid="SNNU", operator="mobile"))
+
+    assert not result.network_ok
+    assert portal_calls == [8601]
+    assert tcp_calls == []
+
+
 def test_f7514_snnu_repair_fails_closed_without_source_ip(monkeypatch):
     """源地址不可得 ⇒ **不产生** IP 级证据（fail-closed），绝不用默认路由兜底。"""
     session = FakeSession()

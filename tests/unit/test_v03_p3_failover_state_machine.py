@@ -77,12 +77,16 @@ def drive_to_backup(manager, *, t0=0.0):
     return t
 
 
-def test_active_wifi_reauth_and_reconnect_without_writing_routes():
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_active_wifi_reauth_and_reconnect_without_writing_routes(wifi_only):
     manager = auto_manager()
-    online = snapshot(D, H, WIFI_IF)
+    eth = None if wifi_only else D
+    online = snapshot(eth, H, WIFI_IF)
+    online.wifi_only = wifi_only
     assert manager.tick(0, online).state is FailoverState.WIFI_BACKUP_ACTIVE
 
-    expired = snapshot(D, C, WIFI_IF, online=False)
+    expired = snapshot(eth, C, WIFI_IF, online=False)
+    expired.wifi_only = wifi_only
     assert manager.tick(5, expired).state is FailoverState.WIFI_PREPARING
     untrusted = manager.tick(120, snapshot(None, None), trusted=False)
     assert untrusted.state is FailoverState.WIFI_PREPARING
@@ -93,10 +97,32 @@ def test_active_wifi_reauth_and_reconnect_without_writing_routes():
     assert restored.state is FailoverState.WIFI_BACKUP_ACTIVE
     assert not restored.plan
 
-    disconnected = snapshot(D, D, None, online=False)
+    disconnected = snapshot(eth, D, None, online=False)
+    disconnected.wifi_only = wifi_only
     assert manager.tick(140, disconnected).state is FailoverState.BOTH_OFFLINE
     retry = manager.tick(145, disconnected)
     assert [op.kind for op in retry.executed] == [OpKind.WIFI_RECONNECT]
+    if wifi_only:
+        delayed_route = snapshot(None, H, None)
+        delayed_route.wifi_only = True
+        assert not manager.tick(150, delayed_route).plan
+
+
+def test_repeated_successful_logins_cannot_create_a_fast_eviction_loop():
+    executor = FakeOpExecutor()
+    manager = auto_manager(executor)
+    online = snapshot(D, H, WIFI_IF)
+    captive = snapshot(D, C, WIFI_IF, online=False)
+    manager.tick(0, online)
+    for t in (10, 200):
+        manager.tick(t, captive)
+        manager.tick(t + 5, captive)
+        manager.tick(t + 10, online)
+    manager.tick(400, captive)
+    blocked = manager.tick(405, captive)
+    assert not blocked.plan and any("并发限制" in note for note in blocked.notes)
+    assert executor.calls == [OpKind.PORTAL_POST, OpKind.PORTAL_POST]
+    assert [op.kind for op in manager.tick(615, captive).executed] == [OpKind.PORTAL_POST]
 
 
 # --------------------------------------------------------------------------- #

@@ -21,12 +21,15 @@
 from __future__ import annotations
 
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urljoin, urlsplit
 
-from campus_core import (PROBE_EXACT, PROBE_HTML_TITLE, ProbeSpec,
+from campus_core import (PROBE_EXACT, PROBE_HTML_TITLE, PortalStatus, ProbeSpec,
                          probe_matches)
 from tools import netdiag
 
@@ -210,6 +213,7 @@ class NetworkHealthSnapshot:
     wifi: Optional[InterfaceHealth] = None
     system: Optional[SystemHealth] = None
     recommendation: Optional[Recommendation] = None
+    wifi_only: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -218,6 +222,7 @@ class NetworkHealthSnapshot:
             "host": self.host,
             "ethernet": self.ethernet.to_dict() if self.ethernet else None,
             "wifi": self.wifi.to_dict() if self.wifi else None,
+            "wifi_only": self.wifi_only,
             "system": self.system.to_dict() if self.system else None,
             "recommendation": (self.recommendation.to_dict()
                                if self.recommendation else None),
@@ -237,6 +242,9 @@ class NetworkObserver:
                 ) -> "netdiag.DiagReport":
         """一次完整只读观察（P0 契约 v03-p0-diag-1 的报告）。"""
         return netdiag.collect(self._runner, target_ssid=target_ssid)
+
+    def observe_health(self) -> "netdiag.DiagReport":
+        return netdiag.collect_health(self._runner)
 
     def route_lookup(self, target: str) -> Optional[EgressInfo]:
         """按目标地址查询系统最佳路由（Find-NetRoute，不发包）。
@@ -393,11 +401,16 @@ def _interface_dns(report: Any, if_index: Optional[int]) -> List[str]:
     return servers
 
 
-def _portal_hit(redirected: bool, final_url: str, body: str) -> bool:
-    if not redirected:
+def is_snnu_login_url(url: str) -> bool:
+    """只认学校 Portal 的实际主机和登录页，拒绝主机名或查询参数里的相似字符串。"""
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme in ("http", "https")
+                and parsed.hostname in ("202.117.144.205", "net.snnu.edu.cn")
+                and parsed.username is None
+                and parsed.path.rstrip("/").lower() in ("", "/snnuportal", "/snnuportal/login.jsp"))
+    except ValueError:
         return False
-    text = "%s %s" % (final_url or "", body or "")
-    return any(hint in text for hint in PORTAL_HINTS)
 
 
 class InterfaceHealthChecker:
@@ -413,6 +426,8 @@ class InterfaceHealthChecker:
                  dns_targets: Sequence[str] = DEFAULT_DNS_TARGETS,
                  gateway_ports: Sequence[int] = DEFAULT_GATEWAY_PORTS,
                  remote_targets: Sequence[Tuple[str, int]] = (),
+                 portal_probe: Optional[Callable[[str, Any], Optional[PortalStatus]]] = None,
+                 parallel_probes: bool = False,
                  timeout: float = _DEFAULT_TIMEOUT) -> None:
         self.engine = engine
         self.tcp_targets = tuple(tcp_targets)
@@ -420,6 +435,8 @@ class InterfaceHealthChecker:
         self.dns_targets = tuple(dns_targets)
         self.gateway_ports = tuple(gateway_ports)
         self.remote_targets = tuple(remote_targets)
+        self.portal_probe = portal_probe
+        self.parallel_probes = parallel_probes
         self.timeout = timeout
 
     def check(self, axis: HealthAxis, adapter: Any, report: Any,
@@ -474,20 +491,37 @@ class InterfaceHealthChecker:
                    "端口不响应不等同网关不可达" if not ok else "")
             if ok:
                 break
+        tcp_jobs = [partial(scoped.tcp_connect, host, port, timeout=self.timeout)
+                    for host, port in self.tcp_targets]
+        http_jobs = [partial(scoped.http_probe, spec.url, timeout=self.timeout)
+                     for spec in self.http_targets]
+        dns_jobs = [partial(scoped.dns_resolve, target) for target in self.dns_targets]
+        jobs = tcp_jobs + http_jobs + dns_jobs
+        if self.parallel_probes and jobs:
+            with ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as pool:
+                replies = iter(list(pool.map(lambda job: job(), jobs)))
+        else:
+            replies = (job() for job in jobs)
         tcp_ok = 0
         for host, port in self.tcp_targets:
-            ok = bool(scoped.tcp_connect(host, port, timeout=self.timeout))
+            ok = bool(next(replies))
             tcp_ok += int(ok)
             record("tcp", "%s:%d" % (host, port), ok)
         http_ok = portal_hits = 0
         for spec in self.http_targets:
-            probe = scoped.http_probe(spec.url, timeout=self.timeout)
+            probe = next(replies)
             status_code = _attr(probe, "status_code", 0) or 0
             redirected = bool(_attr(probe, "redirected", False))
             body = str(_attr(probe, "body", "") or "")
             final_url = str(_attr(probe, "final_url", "") or "")
             ok = probe_matches(spec, status_code, body, redirected=redirected)
-            portal = _portal_hit(redirected, final_url, body)
+            location = str(_attr(probe, "redirect_url", "") or "")
+            if location:
+                try:
+                    final_url = urljoin(spec.url, location)
+                except ValueError:
+                    final_url = ""
+            portal = redirected and is_snnu_login_url(final_url)
             http_ok += int(ok)
             portal_hits += int(portal)
             record("http", spec.url, ok,
@@ -495,14 +529,22 @@ class InterfaceHealthChecker:
                    "captive" if portal else "")
         dns_ok = 0
         for target in self.dns_targets:
-            ok = bool(scoped.dns_resolve(target))
+            ok = bool(next(replies))
             dns_ok += int(ok)
             record("dns", target, ok, "" if ok else "本接口 DNS 解析失败", "dns")
         for host, port in self.remote_targets:
             record("remote", "%s:%d" % (host, port),
                    bool(scoped.tcp_connect(host, port, timeout=self.timeout)))
 
-        if portal_hits and not http_ok:
+        if (not portal_hits and http_ok < 2 and axis is HealthAxis.WIFI_HEALTH
+                and self.portal_probe):
+            portal_status = self.portal_probe(name, scoped)
+            if portal_status is PortalStatus.AUTH_REQUIRED:
+                portal_hits = 1
+                record("portal", "SNNU", False, "状态页确认需要登录", "captive")
+            elif portal_status is PortalStatus.ONLINE:
+                record("portal", "SNNU", False, "Portal 已登录，但公网探测失败")
+        if portal_hits:
             state = HealthState.CAPTIVE_PORTAL
         elif dns_ok == 0:
             state = HealthState.DNS_FAILURE if tcp_ok or http_ok else HealthState.INTERNET_UNREACHABLE
@@ -576,6 +618,8 @@ def evaluate(report: Any, engine: Any = None, *,
              route_lookup: Optional[Callable[[str], Any]] = None,
              remote_targets: Sequence[Tuple[str, int]] = (),
              gateway_ports: Sequence[int] = DEFAULT_GATEWAY_PORTS,
+             portal_probe: Optional[Callable[[str, Any], Optional[PortalStatus]]] = None,
+             parallel_probes: bool = False,
              ) -> NetworkHealthSnapshot:
     """三轴健康评估入口（一次性快照，只读）。
 
@@ -598,7 +642,8 @@ def evaluate(report: Any, engine: Any = None, *,
         lookup = engine.route_lookup
 
     checker = InterfaceHealthChecker(engine, remote_targets=remote_targets,
-                                     gateway_ports=gateway_ports)
+                                     gateway_ports=gateway_ports, portal_probe=portal_probe,
+                                     parallel_probes=parallel_probes)
 
     ethernet = None
     if roles.get("ethernet") is not None:
@@ -628,12 +673,16 @@ def evaluate(report: Any, engine: Any = None, *,
         system.evidence.append("IPv4 出口识别失败：%s" % egress_v4["error"])
 
     recommendation = recommend_path(ethernet, wifi)
+    wifi_only = (wifi is not None and "adapters" in getattr(report, "commands_executed", ())
+                 and not any(item.get("command") == "adapters"
+                             for item in getattr(report, "errors", ()))
+                 and not any(a.category == "physical-ethernet" for a in report.adapters))
     return NetworkHealthSnapshot(
         generated_at=datetime.now(timezone.utc).astimezone().isoformat(
             timespec="seconds"),
         host=getattr(report, "host", "") or "",
         ethernet=ethernet, wifi=wifi, system=system,
-        recommendation=recommendation)
+        recommendation=recommendation, wifi_only=wifi_only)
 
 
 def format_snapshot(snapshot: NetworkHealthSnapshot) -> str:

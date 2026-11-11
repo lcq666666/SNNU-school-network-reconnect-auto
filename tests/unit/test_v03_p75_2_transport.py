@@ -166,6 +166,7 @@ def test_http_probe_closes_and_limits(monkeypatch):
     class Response:
         status_code = 302
         url = "http://portal.example/"
+        headers = {"Location": "http://202.117.144.205:8601/snnuportal/login.jsp"}
         encoding = "utf-8"
         raw = SimpleNamespace(read=lambda n, **kw: b"x" * n)
 
@@ -189,6 +190,7 @@ def test_http_probe_closes_and_limits(monkeypatch):
     monkeypatch.setattr(requests, "Session", Session)
     result = transport().http_probe("http://portal.example/")
     assert result.status_code == 302 and result.redirected
+    assert result.redirect_url == Response.headers["Location"]
     assert len(result.body) == 512
     assert not state["allow_redirects"] and not state["trust_env"]
     assert state["response_closed"] and state["session_closed"]

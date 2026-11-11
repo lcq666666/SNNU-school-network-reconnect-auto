@@ -271,7 +271,7 @@ def test_r75_04_portal_auth_must_rebind_after_dhcp_change(monkeypatch):
     ops.refresh_binding = lambda: snnu_mod.InterfaceBinding(
         "WLAN", WIFI_IF, "10.8.0.9")
     ops.bind_interface = lambda session, binding: bound.append(binding.source_ip) or True
-    monkeypatch.setattr(engine, "_snnu_ops", lambda *args: ops)
+    monkeypatch.setattr(engine, "_snnu_ops", lambda *args, **kwargs: ops)
     executor = engine._build_composite_executor(
         observer, observer.report, wifi, args, LOG,
         object())

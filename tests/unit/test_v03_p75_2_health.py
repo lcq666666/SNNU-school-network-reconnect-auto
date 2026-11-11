@@ -3,17 +3,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from campus_network import HealthAxis, HealthState, InterfaceHealthChecker
+from campus_core import PortalStatus
+from campus_network import HealthAxis, HealthState, InterfaceHealthChecker, evaluate
+from campus_tray_observer import is_auto_executable_snapshot
 from tests.fakes import FakeProbeEngine
 from tests.unit.test_v03_p1_health import (
     ETH_IP, WIFI_IP, ETH_ROUTE, WIFI_ROUTE, _report, _healthy_engine,
 )
 
 
-def _check(engine):
+def _check(engine, **kwargs):
     report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
     wifi = next(a for a in report.adapters if a.if_index == 5)
-    return InterfaceHealthChecker(engine).check(
+    return InterfaceHealthChecker(engine, **kwargs).check(
         HealthAxis.WIFI_HEALTH, wifi, report, engine.route_lookup)
 
 
@@ -24,6 +26,17 @@ def test_nondefault_wifi_is_independently_healthy():
     health = _check(engine)
     assert health.state is HealthState.HEALTHY
     assert health.egress_confirmed is True
+
+
+def test_wifi_only_authorization_requires_successful_adapter_inventory():
+    engine = _healthy_engine(FakeProbeEngine())
+    report = _report(ips=[WIFI_IP], routes=[WIFI_ROUTE])
+    report.adapters = [a for a in report.adapters if a.category != "physical-ethernet"]
+    assert not is_auto_executable_snapshot(evaluate(report, engine))[0]
+    report.commands_executed.append("adapters")
+    assert is_auto_executable_snapshot(evaluate(report, engine))[0]
+    report.errors.append({"command": "adapters", "error": "partial inventory"})
+    assert not is_auto_executable_snapshot(evaluate(report, engine))[0]
 
 
 @pytest.mark.parametrize("proof", [False, None])
@@ -51,6 +64,31 @@ def test_portal_evidence_precedes_public_tcp_failure():
         engine.http[url] = {"status_code": 302, "redirected": True,
                             "final_url": "http://202.117.144.205:8601/snnuportal/login.jsp"}
     assert _check(engine).state is HealthState.CAPTIVE_PORTAL
+
+
+def test_header_only_campus_redirect_is_detected_even_with_one_public_hit():
+    engine = _healthy_engine(FakeProbeEngine())
+    url = next(iter(engine.http))
+    engine.http[url] = {"status_code": 302, "redirected": True, "final_url": url,
+                        "redirect_url": "http://202.117.144.205:8601/snnuportal/login.jsp"}
+    assert _check(engine).state is HealthState.CAPTIVE_PORTAL
+    engine.http[url]["redirect_url"] = "http://202.117.144.205.example/snnuportal/login.jsp"
+    assert _check(engine).state is HealthState.HEALTHY
+
+
+@pytest.mark.parametrize(("status", "expected"), [
+    (PortalStatus.AUTH_REQUIRED, HealthState.CAPTIVE_PORTAL),
+    (PortalStatus.ONLINE, HealthState.INTERNET_UNREACHABLE),
+    (None, HealthState.INTERNET_UNREACHABLE),
+])
+def test_associated_wifi_with_no_public_web_uses_read_only_portal_evidence(status, expected):
+    engine = _healthy_engine(FakeProbeEngine())
+    engine.http = {"default": {"status_code": 0, "error": "timeout"}}
+    calls = []
+    health = _check(engine, parallel_probes=True,
+                    portal_probe=lambda alias, _scoped: calls.append(alias) or status)
+    assert calls == ["WLAN"]
+    assert health.state is expected
 
 
 def test_dns_is_scoped_to_the_wifi_source():

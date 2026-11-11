@@ -51,6 +51,8 @@ __all__ = [
 ]
 
 CONTRACT_VERSION = "v03-p3-failover-1"
+PORTAL_RETRY_WINDOW = 600.0
+PORTAL_RETRIES_PER_WINDOW = 2
 
 #: 手动锁定（``FailoverMode.LOCKED``）可选的优先路径（方案 §11「手动锁定」）。
 LOCK_TARGETS = ("ethernet", "wifi")
@@ -425,6 +427,7 @@ class NetworkFailoverManager:
         self.recovery_since: Optional[float] = None
         self.recovery_successes = 0
         self.auth_attempts = 0
+        self._recent_portal_attempts: List[float] = []
         self.last_switch_at: Optional[float] = None
         self.manual_reason = ""
         self.history: List[Tuple[float, FailoverState]] = []
@@ -594,11 +597,13 @@ class NetworkFailoverManager:
 
         eth_ok = eth_state is HealthState.HEALTHY
         wifi_ok = wifi_state is HealthState.HEALTHY
-        eth_fail = (eth_state in RELIABLE_FAILURE_STATES
+        wifi_only = (getattr(snapshot, "ethernet", None) is None
+                     and getattr(snapshot, "wifi_only", False) is True)
+        eth_fail = (wifi_only or eth_state in RELIABLE_FAILURE_STATES
                     or eth_state in CAPTIVE_STATES)
         wifi_fail = wifi_state in RELIABLE_FAILURE_STATES
         wifi_captive = wifi_state in CAPTIVE_STATES
-        eth_unknown = eth_state is None or eth_state in UNRELIABLE_STATES
+        eth_unknown = not wifi_only and (eth_state is None or eth_state in UNRELIABLE_STATES)
         wifi_unknown = wifi_state is None or wifi_state in UNRELIABLE_STATES
 
         # ---- 粘性状态：只记录，不产生任何动作 ---- #
@@ -640,6 +645,14 @@ class NetworkFailoverManager:
                 and _egress_if_index(snapshot) == wifi_if):
             notes.append("已确认 Windows 当前使用可用的 Wi-Fi 出口：继续监测")
             return FailoverState.WIFI_BACKUP_ACTIVE
+
+        if wifi_only:
+            if wifi_ok:
+                notes.append("Wi-Fi 健康，等待 Windows 确认默认出口")
+                return state
+            if state in (FailoverState.ETHERNET_PRIMARY, FailoverState.ETHERNET_SUSPECT,
+                         FailoverState.WIFI_SWITCHING, FailoverState.ETHERNET_FAILBACK):
+                return FailoverState.WIFI_PREPARING if wifi_captive else FailoverState.BOTH_OFFLINE
 
         # ---- ETHERNET_PRIMARY：有线主用 ---- #
         if state is FailoverState.ETHERNET_PRIMARY:
@@ -721,6 +734,8 @@ class NetworkFailoverManager:
                 if self.auth_attempts >= policy.auth_max_attempts:
                     return self._manual("SNNU 认证重复失败（%d 次），停止自动认证"
                                         % self.auth_attempts, notes)
+                if not self._portal_retry_allowed(now, notes):
+                    return state
                 outcome = self._submit(plan, OpKind.PORTAL_POST,
                                        "SNNU 需要认证：经 SNNU 接口提交 Portal 认证")
                 if outcome.attempted:
@@ -764,6 +779,8 @@ class NetworkFailoverManager:
                         "SNNU 认证重复失败（%d 次），停止自动认证"
                         % self.auth_attempts, notes)
                 if self.timers.auth_allowed(now):
+                    if not self._portal_retry_allowed(now, notes):
+                        return state
                     outcome = self._submit(plan, OpKind.PORTAL_POST,
                                            "SNNU 仍未认证成功：按冷却窗口重试认证")
                     if outcome.attempted:
@@ -942,8 +959,19 @@ class NetworkFailoverManager:
         self.last_switch_at = now
         self.timers.note_switch(now, self.policy.switch_min_interval)
 
+    def _portal_retry_allowed(self, now: float, notes: List[str]) -> bool:
+        self._recent_portal_attempts = [stamp for stamp in self._recent_portal_attempts
+                                        if now - stamp < PORTAL_RETRY_WINDOW]
+        if len(self._recent_portal_attempts) < PORTAL_RETRIES_PER_WINDOW:
+            return True
+        remaining = PORTAL_RETRY_WINDOW - (now - self._recent_portal_attempts[0])
+        notes.append("告警：SNNU 短时间内反复需要认证，可能存在账号并发限制："
+                     "%.0f 秒后再尝试，期间继续监测" % remaining)
+        return False
+
     def _note_auth(self, now: float) -> None:
         """登记认证冷却：**只限制认证**，不影响网络检测（AGENTS §3.4）。"""
+        self._recent_portal_attempts.append(now)
         self.timers.note_auth(now, self.policy.auth_cooldown)
 
 

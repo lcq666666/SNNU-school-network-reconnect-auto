@@ -281,10 +281,12 @@ class InterfaceTransport:
             body = raw[:512].decode(response.encoding or "utf-8", errors="replace")
             return SimpleNamespace(status_code=response.status_code,
                                    redirected=bool(300 <= response.status_code < 400),
+                                   redirect_url=response.headers.get("Location", "")
+                                   if 300 <= response.status_code < 400 else "",
                                    final_url=response.url or "", body=body, error="")
         except requests.RequestException as exc:
             return SimpleNamespace(status_code=0, redirected=False,
-                                   final_url="", body="", error=type(exc).__name__)
+                                   redirect_url="", final_url="", body="", error=type(exc).__name__)
         finally:
             if response is not None:
                 response.close()

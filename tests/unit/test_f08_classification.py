@@ -218,3 +218,14 @@ def test_p8_k4_internet_ok_survives_other_endpoints_flaking():
     ok, via = engine.internet_ok(session)
     assert ok is True, "仅最后一个探测点可用就被判离线（K-4 假掉线）"
     assert via == last.url
+
+
+def test_portal_watch_only_accepts_explicit_login_evidence():
+    from tests.fakes import FakeResponse, FakeSession
+
+    session = FakeSession()
+    url = engine.portal_base(8601) + engine.USERSTATUS_JSP
+    session.route(url, FakeResponse(200, "<html>Temporary server problem</html>"))
+    assert engine.read_status_page(session, 8601, explicit_login=True) is None
+    session.route(url, FakeResponse(302, headers={"Location": engine.LOGIN_JSP}))
+    assert engine.read_status_page(session, 8601, explicit_login=True).status is PortalStatus.AUTH_REQUIRED

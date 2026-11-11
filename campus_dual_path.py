@@ -75,6 +75,7 @@ CONNECTED_STATES = frozenset({
     HealthState.INTERNET_UNREACHABLE,
     HealthState.DNS_FAILURE,
 })
+WIFI_ONLINE_FAILURE_STATES = CONNECTED_STATES - {HealthState.HEALTHY}
 
 #: 状态机「切回已完成」以外的、进入 ``ETHERNET_PRIMARY`` 的恢复来源（方案 §30）。
 _RECOVERED_INTO_PRIMARY = frozenset({
@@ -210,6 +211,9 @@ class VerifiedActionGate(NetworkOpScheduler):
     def evidence(self, role: str) -> Optional[Tuple[float, Any]]:
         """该路径最近一次验证记录（**不论是否过期**；UI / 日志用）。"""
         return self._verified.get(role)
+
+    def forget(self, role: str) -> None:
+        self._verified.pop(role, None)
 
     def verified_for(self, role: str, now: Optional[float] = None) -> Optional[Any]:
         """返回该路径**新鲜的**验证结果（无记录 / 已过期 ⇒ ``None``）。"""
@@ -654,11 +658,19 @@ class DualPathRecoveryController:
             _if_index(snapshot, PATH_WIFI),
             str(getattr(getattr(snapshot, "wifi", None), "source_ip", "") or ""),
             _egress_if_index(snapshot), active)
-        if signature != self._signature:
+        before = self._axis_states.get(PATH_WIFI)
+        current = _axis_state(snapshot, PATH_WIFI)
+        wifi_online_changed = (active == PATH_WIFI and (
+            (before is HealthState.HEALTHY and current in WIFI_ONLINE_FAILURE_STATES)
+            or (current is HealthState.HEALTHY and before in WIFI_ONLINE_FAILURE_STATES)))
+        if wifi_online_changed:
+            self.gate.forget(PATH_WIFI)
+            self._attempted.pop(PATH_WIFI, None)
+        if signature != self._signature or wifi_online_changed:
             self._signature = signature
             self.network_epoch += 1
             if self.network_epoch > 1:
-                notes.append("网络世代 +1（epoch=%d）：接口 / 源地址 / 活动出口发生变化"
+                notes.append("网络世代 +1（epoch=%d）：接口、出口或校园网会话发生变化"
                              % self.network_epoch)
         self.active_path = active
         self.standby_path = standby
@@ -723,6 +735,10 @@ class DualPathRecoveryController:
             if current not in CONNECTED_STATES:
                 continue
             before = self._axis_states.get(role)
+            if (role == self.active_path == PATH_WIFI and current is HealthState.HEALTHY
+                    and before in WIFI_ONLINE_FAILURE_STATES):
+                events.append((RecoveryEvent.ACTIVE_PATH_RECOVERED, role))
+                continue
             if before in CONNECTED_STATES:
                 continue
             if role == self.active_path and before is not None:

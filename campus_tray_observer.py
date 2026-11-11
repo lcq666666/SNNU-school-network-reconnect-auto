@@ -192,7 +192,7 @@ def is_auto_executable_snapshot(snapshot: Optional[NetworkHealthSnapshot]
 
     返回 ``(ok, reason)``：
 
-    - ``ok=True``：三轴齐全 + 两轴都有有效 ifIndex + system 轴存在；
+    - ``ok=True``：已识别的接口均有有效 ifIndex。确认只有 Wi-Fi 时允许无线恢复；
     - ``ok=False``：``reason`` 说明缺少哪一项（日志/告警用）。
     """
     if not is_full_snapshot(snapshot):
@@ -200,16 +200,16 @@ def is_auto_executable_snapshot(snapshot: Optional[NetworkHealthSnapshot]
     eth = getattr(snapshot, "ethernet", None)
     wifi = getattr(snapshot, "wifi", None)
     system = getattr(snapshot, "system", None)
-    if eth is None or wifi is None:
-        return False, "AUTO 执行需要 Ethernet 与 Wi-Fi 两轴同时存在"
     if system is None:
         return False, "缺少 SYSTEM 轴"
-    eth_idx = getattr(eth, "if_index", None)
     wifi_idx = getattr(wifi, "if_index", None)
-    if type(eth_idx) is not int or not 0 < eth_idx <= 0xFFFFFFFF:
-        return False, "Ethernet 轴缺少有效的 if_index（无法定位目标接口）"
     if type(wifi_idx) is not int or not 0 < wifi_idx <= 0xFFFFFFFF:
         return False, "Wi-Fi 轴缺少有效的 if_index（无法定位目标接口）"
+    if eth is None and getattr(snapshot, "wifi_only", False) is True:
+        return True, ""
+    eth_idx = getattr(eth, "if_index", None)
+    if type(eth_idx) is not int or not 0 < eth_idx <= 0xFFFFFFFF:
+        return False, "Ethernet 轴缺少有效的 if_index（无法定位目标接口）"
     if eth_idx == wifi_idx:
         return False, "Ethernet 与 Wi-Fi 不得指向同一接口"
     return True, ""
