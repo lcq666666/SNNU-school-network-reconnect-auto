@@ -10,6 +10,7 @@ import pytest
 
 import campus_reconnect_tray as tray
 import campus_update as upd
+from campus_core import __version__ as CURRENT_VERSION
 from campus_update import UpdateInfo
 
 LOG = logging.getLogger("campus")
@@ -49,19 +50,46 @@ class _Session:
         return self.resp
 
 
-def _release(tag="v0.6.1"):
+def _current_tag():
+    """当前版本对应的标签（例如 v0.6.1），直接取自产品版本号。"""
+    return "v" + CURRENT_VERSION
+
+
+def _newer_tag():
+    """比当前版本高一个补丁号的假最新版本标签（当前 0.6.1 → v0.6.2）。
+
+    测试不得把版本号写死：版本号升级后假最新版本仍比当前新，
+    同类失败不再重现。
+    """
+    parts = upd.parse_version(CURRENT_VERSION)
+    return "v%d.%d.%d" % (parts[0], parts[1], parts[2] + 1)
+
+
+def _release(tag=None):
+    """假 GitHub 最新 Release；默认标签比当前版本高一补丁号。"""
+    if tag is None:
+        tag = _newer_tag()
     return _Resp(200, {
         "tag_name": tag,
-        "name": "v0.6.1 融合仪表盘",
+        "name": tag + " 融合仪表盘",
         "html_url": "https://github.com/lcq666666/"
-                    "SNNU-school-network-reconnect-auto/releases/tag/v0.6.1",
+                    "SNNU-school-network-reconnect-auto/releases/tag/" + tag,
         "published_at": "2026-11-11T06:00:00Z",
     })
 
 
-def _info(tag="v0.6.1"):
+def _info(tag=None):
+    """假 UpdateInfo；默认标签比当前版本高一补丁号。"""
+    if tag is None:
+        tag = _newer_tag()
     return UpdateInfo(tag=tag, name=tag,
                       html_url="https://example.invalid/releases/tag/" + tag)
+
+
+def test_newer_tag_follows_current_version():
+    """回归：假最新版本必须始终比当前版本新，否则本文件一多半测试失效。"""
+    assert upd.is_newer(_newer_tag(), CURRENT_VERSION) is True
+    assert upd.is_newer(_current_tag(), CURRENT_VERSION) is False
 
 
 # ---------- 1. 版本解析与比较（纯函数） ----------
@@ -104,12 +132,13 @@ def test_should_notify_only_once_per_tag():
 # ---------- 2. check_latest：成功 / 404 / 超时 / 缺 tag ----------
 
 def test_check_latest_success():
-    session = _Session(_release("v0.6.1"))
+    tag = _newer_tag()
+    session = _Session(_release(tag))
     info, reason = upd.check_latest(session)
     assert reason == ""
-    assert info.tag == "v0.6.1"
-    assert info.name == "v0.6.1 融合仪表盘"
-    assert info.html_url.endswith("/releases/tag/v0.6.1")
+    assert info.tag == tag
+    assert info.name == tag + " 融合仪表盘"
+    assert info.html_url.endswith("/releases/tag/" + tag)
     assert info.published_at == "2026-11-11T06:00:00Z"
     url, kwargs = session.calls[0]
     assert "api.github.com" in url
@@ -189,23 +218,24 @@ def _patched_app(monkeypatch, **cfg):
 
 
 def test_on_update_checked_notifies_once_per_tag(monkeypatch):
+    newer = _newer_tag()
     app, saved, notified = _patched_app(monkeypatch)
-    app._on_update_checked(_info("v0.6.1"), "")
+    app._on_update_checked(_info(newer), "")
     assert len(notified) == 1
-    assert "v0.6.1" in notified[0][0]
-    assert app.config["update_notified_tag"] == "v0.6.1"
-    assert saved and saved[-1]["update_notified_tag"] == "v0.6.1"
+    assert newer in notified[0][0]
+    assert app.config["update_notified_tag"] == newer
+    assert saved and saved[-1]["update_notified_tag"] == newer
     # 同一版本第二次检查：只记 _update_info，不再弹气泡。
-    app._on_update_checked(_info("v0.6.1"), "")
+    app._on_update_checked(_info(newer), "")
     assert len(notified) == 1
 
 
 def test_on_update_checked_same_version_is_silent(monkeypatch):
     app, saved, notified = _patched_app(monkeypatch)
-    app._on_update_checked(_info("v0.6.0"), "")
+    app._on_update_checked(_info(_current_tag()), "")
     assert notified == []
     assert app.config["update_notified_tag"] is None
-    assert app._update_info.tag == "v0.6.0"
+    assert app._update_info.tag == _current_tag()
 
 
 def test_on_update_checked_failure_is_silent(monkeypatch):
@@ -218,11 +248,11 @@ def test_on_update_checked_failure_is_silent(monkeypatch):
 
 def test_update_status_text_variants():
     app = _app()
-    assert "v0.6.0" in app._update_status_text()
+    assert _current_tag() in app._update_status_text()
     assert "尚未检查到" in app._update_status_text()
-    app._update_info = _info("v0.6.1")
+    app._update_info = _info()
     assert "有更新可用" in app._update_status_text()
-    app._update_info = _info("v0.6.0")
+    app._update_info = _info(_current_tag())
     assert "已是最新" in app._update_status_text()
 
 
@@ -253,13 +283,13 @@ def test_maybe_check_update_disabled_skips_request(monkeypatch):
 
 def test_check_update_async_end_to_end_with_fake_session(monkeypatch):
     app, saved, notified = _patched_app(monkeypatch)
-    app._update_session_factory = lambda: _Session(_release("v0.6.1"))
+    app._update_session_factory = lambda: _Session(_release())
     app._check_update_async()
     assert app._update_thread is not None
     app._update_thread.join(timeout=5)
     assert not app._update_thread.is_alive(), "检查线程应在 5 秒内完成"
     assert app._update_info is not None
-    assert app._update_info.tag == "v0.6.1"
+    assert app._update_info.tag == _newer_tag()
     assert len(notified) == 1
 
 
@@ -281,16 +311,16 @@ def test_banner_shows_for_newer_and_dismiss_hides(monkeypatch):
     app, root, refs = _open_app()
     try:
         assert not refs["update_banner"].winfo_ismapped()
-        app._update_info = _info("v0.6.1")
+        app._update_info = _info()
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert refs["update_banner"].winfo_ismapped()
-        assert "v0.6.1" in refs["update_banner_label"].cget("text")
+        assert _newer_tag() in refs["update_banner_label"].cget("text")
         # 点“以后再说”：横幅收起，且下次渲染也不再出现。
         app._on_update_dismiss()
         root.update_idletasks()
         assert not refs["update_banner"].winfo_ismapped()
-        assert app.config["update_dismissed_tag"] == "v0.6.1"
+        assert app.config["update_dismissed_tag"] == _newer_tag()
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert not refs["update_banner"].winfo_ismapped()
@@ -307,13 +337,13 @@ def test_banner_download_opens_releases_page(monkeypatch):
     app, root, refs = _open_app()
     try:
         app._update_opener = lambda url: opened.append(url)
-        app._update_info = _info("v0.6.1")
+        app._update_info = _info()
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert refs["update_banner"].winfo_ismapped()
         app._on_update_download()
-        assert opened == ["https://example.invalid/releases/tag/v0.6.1"]
-        assert app.config["update_dismissed_tag"] == "v0.6.1"
+        assert opened == ["https://example.invalid/releases/tag/" + _newer_tag()]
+        assert app.config["update_dismissed_tag"] == _newer_tag()
         assert not refs["update_banner"].winfo_ismapped()
     finally:
         app._close_dashboard()
@@ -335,7 +365,7 @@ def test_settings_shows_update_section(monkeypatch):
     app.root = root
     app.config = dict(tray.DEFAULT_CONFIG)
     try:
-        app._update_info = _info("v0.6.1")
+        app._update_info = _info()
         app._open_settings()
         root.update_idletasks()
         texts = []
@@ -353,7 +383,7 @@ def test_settings_shows_update_section(monkeypatch):
         walk(app.settings_win)
         joined = "\n".join(texts)
         assert "软件更新" in joined
-        assert "当前版本：v0.6.0" in joined
+        assert "当前版本：" + _current_tag() in joined
         assert "有更新可用" in joined
         assert "立即检查更新" in joined
     finally:
