@@ -197,11 +197,10 @@ def test_u75_1a_07_untrusted_then_trusted_does_not_consume_cooldown(wifi_state, 
     # 第 1 轮：快照不可信 → 拒绝执行
     bad_snap = _snapshot(HealthState.LINK_DOWN, wifi_state)
     bridge.set_snapshot_trust(False, "NO_DATA")
-    refusing = bridge.manager.scheduler.executor
     for now in range(0, 61, 5):
         r1 = bridge.tick(float(now), bad_snap)
         assert r1.executed == []
-    assert kind in refusing.refused, "必须到达对应动作的拒绝执行器"
+        assert r1.plan == [], "不可信输入不应推进故障状态或安排动作"
     assert bridge.manager.last_switch_at is None
     assert bridge.manager._last_wifi_reconnect_at is None
     # 第 2 轮：快照变为可信（完整三轴）

@@ -771,6 +771,7 @@ class TrayApp:
         # ---- V0.3 P7 远程保障（默认未接线；由 :meth:`enable_remote_guard` 接入）----
         #: 远控只读探测能力（``None`` = 未接线：不产生任何子进程/文件 I/O）。
         self._remote_ops = None
+        self._remote_probe_busy = threading.Event()
         #: 远程保障守卫（接线后非 ``None``）。
         self.remote = None
         #: 后台监控看门狗（纯逻辑；巡检线程由 :meth:`start_supervisor` 启动）。
@@ -852,6 +853,7 @@ class TrayApp:
                     lambda request: self._build_path_verifier().verify_gate(request)),
                 uu_restart_enabled=lambda: bool(
                     self.get_config().get("remote_restart_enabled", False)),
+                refresh_active_verification=True,
                 # 与托盘其余接线同源：整合层与验证前置门共用**本进程**时钟
                 # （测试用 VirtualClock 替换 ``tray.time`` 时保持一致）。
                 clock=lambda: time.monotonic(),
@@ -886,12 +888,10 @@ class TrayApp:
         from campus_network import NetworkObserver, resolve_roles
 
         cfg = self.get_config()
-        if self.session is None:
-            self.session = direct_session()
         runner = netdiag.PowerShellRunner()
         observer = NetworkObserver(runner)
         ssid = cfg.get("ssid") or "SNNU"
-        report = observer.observe(target_ssid=ssid)
+        report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
         roles = resolve_roles(report, engine._load_adapters_config())
         eth, wifi = roles.get("ethernet"), roles.get("wifi")
         args = SimpleNamespace(
@@ -902,8 +902,7 @@ class TrayApp:
         guard = engine._build_route_guard(observer, runner, eth, wifi, args,
                                           self.log, timers=self._timers)
         self.log.warning("智能自动已授权：接入真实组合执行器（受控路由/Metric 变更）")
-        return engine._build_composite_executor(self.session, observer, report,
-                                                wifi, args, self.log, guard)
+        return engine._build_composite_executor(observer, report, wifi, args, self.log, guard)
 
     def _failover_owns_actions(self) -> bool:
         """**自动**副作用是否已由故障切换管理器独占（P7.5-1：全模式恒真）。
@@ -1085,6 +1084,7 @@ class TrayApp:
             busy = self._verify_path_busy = threading.Event()
         if busy.is_set():
             self.log.info("[恢复] 已有接口受限验证在途：本次跳过（下一轮重试）")
+            self.dual_path.cancel_verifications(requests)
             return
         busy.set()
         controller = self.dual_path
@@ -1101,10 +1101,11 @@ class TrayApp:
                         self.log.warning("[恢复] %s 接口受限验证未通过：%s",
                                          request.role, result.reason)
                     follow = controller.on_verification(
-                        result, now=time.monotonic())
+                        result, now=time.monotonic(), request_epoch=request.network_generation)
                     self._uu_recovery_after_verification(follow, result)
             except Exception as exc:   # 验证不得影响监测主流程（防御性边界）
                 self.log.warning("[恢复] 接口受限验证异常：%s", type(exc).__name__)
+                controller.cancel_verifications(requests)
             finally:
                 busy.clear()
 
@@ -1444,7 +1445,7 @@ class TrayApp:
             standby_path = (next((role for role in observed.values() if role != active_path), None)
                             if active_path is not None else None)
         tick = getattr(self, "dual_path_tick", None)
-        verify_roles = tuple(getattr(tick, "verify_roles", ()) or ()) if tick is not None else ()
+        verify_roles = tuple(getattr(status, "pending_roles", ()) or ())
         uu_request = getattr(tick, "uu_request", None) if tick is not None else None
         recovery_event = None
         if tick is not None:
@@ -2326,15 +2327,24 @@ class TrayApp:
         return self.remote
 
     def _remote_poll(self, now: float) -> None:
-        """刷新远控状态（未接线或配置关闭时直接返回，零 I/O）。"""
-        if self._remote_ops is None or self.remote is None:
+        """独立刷新远控状态，避免端口枚举阻塞网络观察。"""
+        guard = self.remote
+        if self._remote_ops is None or guard is None:
             return
-        if not bool(self.config.get("remote_guard", True)):
+        if (not self.config.get("remote_guard", True) or self._remote_probe_busy.is_set()
+                or not guard.probe_due(now)):
             return
-        try:
-            self.remote.poll(now)
-        except Exception as exc:                     # 远控探测故障不得影响主流程
-            self.log.warning("远控探测异常：%s", type(exc).__name__)
+        self._remote_probe_busy.set()
+
+        def poll():
+            try:
+                guard.poll(now)
+            except Exception as exc:
+                self.log.warning("远控探测异常：%s", type(exc).__name__)
+            finally:
+                self._remote_probe_busy.clear()
+
+        threading.Thread(target=poll, name="campus-remote-probe", daemon=True).start()
 
     def apply_remote_guard(self, enabled: bool) -> bool:
         """开关远控探测（方案 §7.3；关闭后不再探测，也不推迟切回）。"""

@@ -213,7 +213,7 @@ def test_ui23_path_card_marks_expired_verification_as_warn():
     card = ui.build_path_card(role="ethernet", health=_health(
         HealthAxis.ETHERNET_HEALTH, H, ETH_IF, ETH_IP, ETH_DNS, "以太网"),
         assignment="PRIMARY", verification=verified(0.0), now=100.0, max_age=60.0)
-    assert card.verified is True, "记录仍是『通过』，但已过期"
+    assert card.verified is None, "过期记录不能点亮已验证仪表"
     assert card.internet_tone == ui.TONE_WARN
     assert "已过期" in card.field("Internet")
 
@@ -373,7 +373,8 @@ def test_ui43_overall_recovering_during_transitions_and_verifications():
     for state in (FailoverState.WIFI_PREPARING, FailoverState.WIFI_AUTHENTICATING,
                   FailoverState.WIFI_SWITCHING, FailoverState.ETHERNET_FAILBACK):
         assert _overall(failover_state=state) == ui.OVERALL_RECOVERING
-    assert _overall(verify_roles=("wifi",)) == ui.OVERALL_RECOVERING
+    assert _overall(verify_roles=("ethernet",), verification={}) == ui.OVERALL_RECOVERING
+    assert _overall(verify_roles=("ethernet",)) == ui.OVERALL_HEALTHY
     assert _overall(recovery_event="FAILOVER_COMPLETED") == ui.OVERALL_RECOVERING
 
 

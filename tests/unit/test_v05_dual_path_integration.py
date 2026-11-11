@@ -263,6 +263,14 @@ class Rig:
                 if r.kind is kind]
 
 
+def test_healthy_active_wifi_verification_is_refreshed_before_expiry():
+    rig = Rig(uu_enabled=False)
+    rig.controller.refresh_active_verification = True
+    rig.step(D, H, WIFI_IF, dt=0)
+    assert rig.step(D, H, WIFI_IF, dt=30).tick.verify_roles == ()
+    assert rig.step(D, H, WIFI_IF, dt=15).tick.verify_roles == ("wifi",)
+
+
 def drive_to_backup(rig: Rig, *, wifi: HealthState = H,
                     dt: float = STEP) -> Step:
     """把台架驱动到 Wi-Fi 接管完成（含切换前验证与门禁放行）。

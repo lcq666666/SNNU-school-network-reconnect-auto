@@ -273,7 +273,7 @@ def test_r75_04_portal_auth_must_rebind_after_dhcp_change(monkeypatch):
     ops.bind_interface = lambda session, binding: bound.append(binding.source_ip) or True
     monkeypatch.setattr(engine, "_snnu_ops", lambda *args: ops)
     executor = engine._build_composite_executor(
-        SimpleNamespace(), observer, observer.report, wifi, args, LOG,
+        observer, observer.report, wifi, args, LOG,
         object())
 
     # Wi-Fi 重新关联后 DHCP 给出新地址

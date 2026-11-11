@@ -333,15 +333,16 @@ class RemoteSafetyGuard:
         self.defer_count = 0
 
     # ---- 探测 ---- #
+    def probe_due(self, now: float) -> bool:
+        return self.ops is not None and (self._last_probe_at is None
+                                        or now - self._last_probe_at >= self.probe_interval)
+
     def poll(self, now: float) -> RemoteStatus:
         """按 ``probe_interval`` 节流地执行一次**轻量**探测并更新状态。
 
         未到间隔时直接返回上次状态（零 I/O）；无 ``ops`` 时返回 ``UNKNOWN``。
         """
-        if self.ops is None:
-            return self._status
-        if (self._last_probe_at is not None
-                and (now - self._last_probe_at) < self.probe_interval):
+        if not self.probe_due(now):
             return self._status
         self._last_probe_at = now
         self.probe_count += 1
@@ -421,6 +422,8 @@ class RemoteSafetyGuard:
         if not self.defer_failback:
             return True, "未启用「远程会话敏感期推迟切回」"
         status = self._status
+        if self.ops is not None and (status.at is None or now - status.at > self.probe_interval):
+            return False, "等待最新远控探测结果：暂不自动切回"
         if status.sensitive:
             if self._defer_since is None:
                 # 未 observe 到敏感期起点时以本次询问为起点兜底（异常路径）。

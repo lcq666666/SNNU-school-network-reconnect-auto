@@ -235,9 +235,9 @@ def _internet_view(record: Any, now: float,
     reliability = str(_attr(result, "reliability", "") or "")
     captive = bool(_attr(result, "captive_portal", False))
     age = None if at is None else max(0.0, float(now) - at)
+    if age is not None and age > float(max_age):
+        return "验证已过期（%.0fs 前）" % age, TONE_WARN, None
     if allows:
-        if age is not None and age > float(max_age):
-            return "已验证（已过期 %.0fs）" % age, TONE_WARN, True
         return ("已验证（%.0fs 前）" % age) if age is not None else "已验证", TONE_OK, True
     if reliability == PATH_PROBE_UNRELIABLE:
         return "探测不可信（不做破坏性动作）", TONE_UNKNOWN, False
@@ -564,8 +564,8 @@ def build_pipeline(*, failover_state: Any, ethernet: Any, wifi: Any,
         internet = _step("internet", STEP_ACTIVE,
                          "验证中：%s" % "、".join(PATH_LABEL.get(r, r) for r in roles))
     elif active_record is not None:
-        _text, _tone, _verified = _internet_view(active_record, now, max_age)
-        internet = _step("internet", STEP_FAILED, _text)
+        text, _tone, verified = _internet_view(active_record, now, max_age)
+        internet = _step("internet", STEP_PENDING if verified is None else STEP_FAILED, text)
     else:
         internet = _step("internet", STEP_PENDING, "未验证")
 
@@ -619,7 +619,8 @@ def overall_status(*, failover_state: Any, ethernet: Any, wifi: Any,
         return OVERALL_UNKNOWN
     if failover_state is FailoverState.BOTH_OFFLINE:
         return OVERALL_OFFLINE
-    if failover_state in _TRANSITION_STATES or verify_roles or recovery_event:
+    active_verified = verification_fresh_pass(verification.get(active_path), now, max_age)
+    if failover_state in _TRANSITION_STATES or recovery_event or (verify_roles and not active_verified):
         return OVERALL_RECOVERING
     if eth_state in _HARD_DOWN and wifi_state in _HARD_DOWN:
         return OVERALL_OFFLINE
@@ -629,7 +630,7 @@ def overall_status(*, failover_state: Any, ethernet: Any, wifi: Any,
         return OVERALL_DEGRADED
     if active_path is None:
         return OVERALL_DEGRADED
-    if verification_fresh_pass(verification.get(active_path), now, max_age):
+    if active_verified:
         return OVERALL_HEALTHY
     # 链路在、但 Internet 未被证实（假死 / 探测不可信 / 验证过期）⇒ 降级。
     return OVERALL_DEGRADED

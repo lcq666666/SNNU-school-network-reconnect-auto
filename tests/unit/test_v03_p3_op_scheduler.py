@@ -175,7 +175,7 @@ def test_u3_25_manager_never_submits_two_kinds_in_one_round():
     manager = NetworkFailoverManager(mode=FailoverMode.AUTO, executor=executor)
     frames = ([(H, U, ETH_IF)] + [(D, U, ETH_IF)] * 3
               + [(D, C, WIFI_IF)] * 2 + [(D, D, WIFI_IF)] * 2
-              + [(D, H, WIFI_IF)] * 3)
+              + [(D, H, ETH_IF)] * 2 + [(D, H, WIFI_IF)])
     t = 0.0
     for frame in frames:
         result = manager.tick(t, snapshot(*frame))

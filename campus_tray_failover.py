@@ -492,7 +492,7 @@ class TrayFailoverBridge:
     def tick(self, now: float, snapshot: NetworkHealthSnapshot) -> TickResult:
         """推进一轮：喂入只读快照，回传 :class:`TickResult`。"""
         self._last_snapshot = snapshot
-        result = self.manager.tick(now, snapshot)
+        result = self.manager.tick(now, snapshot, trusted=self.snapshot_trust is not False)
         self.last_result = result
         self._record_switch(now, result)
         return result

@@ -474,7 +474,8 @@ class NetworkFailoverManager:
         return self.timers.next_detection_at
 
     # ---- 主循环 ---- #
-    def tick(self, now: float, snapshot: NetworkHealthSnapshot) -> TickResult:
+    def tick(self, now: float, snapshot: NetworkHealthSnapshot, *,
+             trusted: bool = True) -> TickResult:
         """推进一轮检测，返回 :class:`TickResult`（不执行任何未授权动作）。"""
         if self.last_tick_at is None:
             self.state_since = now
@@ -487,7 +488,11 @@ class NetworkFailoverManager:
         previous = self.state
         plan: List[OpRequest] = []
         notes: List[str] = []
-        target = self._decide(now, snapshot, plan, notes)
+        if trusted:
+            target = self._decide(now, snapshot, plan, notes)
+        else:
+            notes.append("等待可信网络快照：保持当前恢复状态")
+            target = self.state
         predicted: Optional[FailoverState] = None
         if target is not self.state:
             if target.is_execution and not self.mode.executes:
@@ -551,6 +556,7 @@ class NetworkFailoverManager:
             self.recovery_since = now
             self.recovery_successes = 1
         elif state is FailoverState.WIFI_BACKUP_ACTIVE:
+            self.auth_attempts = 0
             self.recovery_since = None
             self.recovery_successes = 0
         if previous is not state:
@@ -624,6 +630,16 @@ class NetworkFailoverManager:
                 notes.append("提示：另一条路径 %s 异常（%s），但锁定模式不自动切换"
                              % (PATH_LABEL.get(other, other), other_state.value))
             return state
+
+        # Windows 已经在用可用的无线出口时，直接接续监测，不发起无谓的 Metric 写入。
+        wifi_if = getattr(getattr(snapshot, "wifi", None), "if_index", None)
+        if (state in (FailoverState.ETHERNET_PRIMARY, FailoverState.ETHERNET_SUSPECT,
+                      FailoverState.WIFI_PREPARING, FailoverState.WIFI_AUTHENTICATING,
+                      FailoverState.BOTH_OFFLINE)
+                and eth_fail and wifi_ok and wifi_if is not None
+                and _egress_if_index(snapshot) == wifi_if):
+            notes.append("已确认 Windows 当前使用可用的 Wi-Fi 出口：继续监测")
+            return FailoverState.WIFI_BACKUP_ACTIVE
 
         # ---- ETHERNET_PRIMARY：有线主用 ---- #
         if state is FailoverState.ETHERNET_PRIMARY:
@@ -702,6 +718,9 @@ class NetworkFailoverManager:
                     notes.append("需要 Portal 认证，但认证冷却未过（剩余 %.0fs）"
                                  "：推迟认证" % (self.timers.auth_ready_at - now))
                     return state
+                if self.auth_attempts >= policy.auth_max_attempts:
+                    return self._manual("SNNU 认证重复失败（%d 次），停止自动认证"
+                                        % self.auth_attempts, notes)
                 outcome = self._submit(plan, OpKind.PORTAL_POST,
                                        "SNNU 需要认证：经 SNNU 接口提交 Portal 认证")
                 if outcome.attempted:
@@ -792,6 +811,9 @@ class NetworkFailoverManager:
                              "≥%.0fs）" % (policy.recovery_min_successes,
                                            policy.recovery_stable_seconds))
                 return FailoverState.ETHERNET_RECOVERY_CHECK
+            if wifi_captive and eth_fail:
+                notes.append("当前无线出口需要重新认证：进入 SNNU 恢复流程")
+                return FailoverState.WIFI_PREPARING
             if wifi_fail:
                 notes.append("无线接管链路已不可用，且有线未恢复 → 两条路径均不可用")
                 return FailoverState.BOTH_OFFLINE

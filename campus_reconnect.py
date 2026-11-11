@@ -1488,8 +1488,7 @@ def _wifi_source_ip(report: Any, if_index: Optional[int]) -> Optional[str]:
     return None
 
 
-def _build_composite_executor(session: requests.Session, observer: Any,
-                              report: Any, wifi: Any,
+def _build_composite_executor(observer: Any, report: Any, wifi: Any,
                               args: argparse.Namespace, log: logging.Logger,
                               guard: RouteGuard) -> CompositeExecutor:
     """组合 P4（SNNU）与 P5（路由）执行器为单一副作用门背后的唯一执行器。
@@ -1501,16 +1500,16 @@ def _build_composite_executor(session: requests.Session, observer: Any,
                  or getattr(wifi, "name", None)) if wifi is not None else None
     wifi_if = getattr(wifi, "if_index", None) if wifi is not None else None
     source_ip = _wifi_source_ip(report, wifi_if)
-    ops = _snnu_ops(session, observer, log, interface)
-
     def _portal_action() -> Any:
-        link = SnnuBackupLink(
-            ops=ops, session=session, target_ssid=args.ssid,
-            interface=interface or "", if_index=wifi_if, source_ip=source_ip,
-            allow_auth=True, reconnect_wifi=False, port=args.port,
-            operator=args.yys, account_format=args.account_format,
-            log=lambda message: log.info("%s", message))
-        return link.run()
+        # SNNU 认证会把 HTTP 会话限定在无线接口。单独创建会话以免影响系统轴检测。
+        with direct_session() as session:
+            link = SnnuBackupLink(
+                ops=_snnu_ops(session, observer, log, interface), session=session,
+                target_ssid=args.ssid, interface=interface or "", if_index=wifi_if,
+                source_ip=source_ip, allow_auth=True, reconnect_wifi=False, port=args.port,
+                operator=args.yys, account_format=args.account_format,
+                log=lambda message: log.info("%s", message))
+            return link.run()
 
     def _wifi_action() -> bool:
         return wifi_reconnect(args.ssid, log, interface=interface)
@@ -1709,7 +1708,7 @@ def route(session: requests.Session, args: argparse.Namespace,
         recovered = guard.recover()     # AUTO 启动前先做崩溃恢复
         if recovered is not None:
             print(format_route_change(recovered))
-        executor = _build_composite_executor(session, observer, report, wifi,
+        executor = _build_composite_executor(observer, report, wifi,
                                              args, log, guard)
         # V0.3 P7：远程会话敏感期推迟自动切回（方案 §4.3）。受控 CLI 入口要求
         # **显式**加 --defer-failback 才接入门禁（默认不接入，行为与 P5 一致）；

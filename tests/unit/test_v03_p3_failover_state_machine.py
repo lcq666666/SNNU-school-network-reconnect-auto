@@ -71,10 +71,32 @@ def run_frames(manager, frames, *, t0=0.0, step=STEP):
 def drive_to_backup(manager, *, t0=0.0):
     """把 AUTO 管理器从初始态驱动到 WIFI_BACKUP_ACTIVE，返回下一时刻。"""
     frames = [(H, U, ETH_IF), (D, U, ETH_IF), (D, U, ETH_IF), (D, U, ETH_IF),
-              (D, H, WIFI_IF), (D, H, WIFI_IF), (D, H, WIFI_IF)]
+              (D, H, ETH_IF), (D, H, ETH_IF), (D, H, WIFI_IF)]
     last, states, t = run_frames(manager, frames, t0=t0)
     assert last.state is FailoverState.WIFI_BACKUP_ACTIVE, states
     return t
+
+
+def test_active_wifi_reauth_and_reconnect_without_writing_routes():
+    manager = auto_manager()
+    online = snapshot(D, H, WIFI_IF)
+    assert manager.tick(0, online).state is FailoverState.WIFI_BACKUP_ACTIVE
+
+    expired = snapshot(D, C, WIFI_IF, online=False)
+    assert manager.tick(5, expired).state is FailoverState.WIFI_PREPARING
+    untrusted = manager.tick(120, snapshot(None, None), trusted=False)
+    assert untrusted.state is FailoverState.WIFI_PREPARING
+    assert not untrusted.plan
+    auth = manager.tick(125, expired)
+    assert [op.kind for op in auth.executed] == [OpKind.PORTAL_POST]
+    restored = manager.tick(130, online)
+    assert restored.state is FailoverState.WIFI_BACKUP_ACTIVE
+    assert not restored.plan
+
+    disconnected = snapshot(D, D, None, online=False)
+    assert manager.tick(140, disconnected).state is FailoverState.BOTH_OFFLINE
+    retry = manager.tick(145, disconnected)
+    assert [op.kind for op in retry.executed] == [OpKind.WIFI_RECONNECT]
 
 
 # --------------------------------------------------------------------------- #
@@ -212,7 +234,7 @@ def test_u3_05b_monitor_plans_switch_but_never_executes():
     manager = monitor_manager()
     last, states, _ = run_frames(
         manager, [(H, U, ETH_IF), (D, U, ETH_IF), (D, U, ETH_IF), (D, U, ETH_IF),
-                  (D, H, WIFI_IF), (D, H, WIFI_IF)])
+                  (D, H, ETH_IF), (D, H, ETH_IF)])
     assert last.state is FailoverState.WIFI_PREPARING
     assert last.predicted_state is FailoverState.WIFI_SWITCHING
     assert last.would_switch is True
@@ -344,17 +366,17 @@ def test_u3_09_switch_cooldown_blocks_repeated_metric_write():
     result = manager.tick(t, snapshot(D, D, WIFI_IF))
     assert result.state is FailoverState.BOTH_OFFLINE
     t += STEP
-    result = manager.tick(t, snapshot(D, H, WIFI_IF))
+    result = manager.tick(t, snapshot(D, H, ETH_IF))
     assert result.state is FailoverState.WIFI_PREPARING
     for _ in range(3):
         t += STEP
-        result = manager.tick(t, snapshot(D, H, WIFI_IF))
+        result = manager.tick(t, snapshot(D, H, ETH_IF))
         assert result.state is FailoverState.WIFI_PREPARING
         assert "切换冷却未过" in "".join(result.notes)
     assert executor.calls.count(OpKind.METRIC_WRITE) == 1
     # 冷却过后才允许再次切换
     t = 75.0 + 300.0
-    result = manager.tick(t, snapshot(D, H, WIFI_IF))
+    result = manager.tick(t, snapshot(D, H, ETH_IF))
     assert result.state is FailoverState.WIFI_SWITCHING
     assert executor.calls.count(OpKind.METRIC_WRITE) == 2
 
@@ -437,8 +459,8 @@ def test_u3_11_all_eleven_states_are_reachable():
         (45.0, (D, U, ETH_IF)),       # ETHERNET_SUSPECT
         (60.0, (D, C, WIFI_IF)),      # WIFI_PREPARING
         (75.0, (D, C, WIFI_IF)),      # WIFI_AUTHENTICATING（portal_post）
-        (90.0, (D, H, WIFI_IF)),      # 认证完成 → 回到准备
-        (105.0, (D, H, WIFI_IF)),     # WIFI_SWITCHING（metric_write）
+        (90.0, (D, H, ETH_IF)),       # 认证完成 → 回到准备
+        (105.0, (D, H, ETH_IF)),      # WIFI_SWITCHING（metric_write）
         (120.0, (D, H, WIFI_IF)),     # WIFI_BACKUP_ACTIVE
         (135.0, (H, H, WIFI_IF)),     # ETHERNET_RECOVERY_CHECK
         (150.0, (H, H, WIFI_IF)),

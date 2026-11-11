@@ -370,6 +370,7 @@ class DualPathStatus:
     last_uu_ok: Optional[bool] = None
     verification_requests: int = 0
     verifications: int = 0
+    pending_roles: Tuple[str, ...] = ()
     notes: Tuple[str, ...] = ()
 
     def _path_text(self, label: str, record: Optional[Tuple[float, Any]],
@@ -437,6 +438,7 @@ class DualPathRecoveryController:
                  clock: Optional[Callable[[], float]] = None,
                  verification_max_age: float = DEFAULT_VERIFICATION_MAX_AGE,
                  verification_retry_interval: float = DEFAULT_VERIFICATION_RETRY_INTERVAL,
+                 refresh_active_verification: bool = False,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.coordinator = coordinator or RecoveryCoordinator()
         #: 时钟先于门禁设定：**自动**创建的门禁必须与整合层共用同一时钟，否则
@@ -447,6 +449,7 @@ class DualPathRecoveryController:
                      else VerifiedActionGate(clock=self._clock))
         self.gate.max_age = float(verification_max_age)
         self.verification_retry_interval = float(verification_retry_interval)
+        self.refresh_active_verification = refresh_active_verification
         self._verify = verifier
         self._verify_gate = gate_verifier
         self.uu_restart_enabled = uu_restart_enabled
@@ -491,6 +494,7 @@ class DualPathRecoveryController:
                 uu_enabled=_flag(self.uu_restart_enabled),
                 last_uu_ok=self.coordinator.last_uu_restart_ok,
                 verification_requests=self.verification_requests,
+                pending_roles=tuple(self._pending),
                 verifications=self.verifications)
 
     def verification_request(self, role: Optional[str], *,
@@ -580,11 +584,18 @@ class DualPathRecoveryController:
                 notes=tuple(notes)))
 
     def on_verification(self, verification: Any, *,
-                        now: Optional[float] = None) -> DualPathTick:
+                        now: Optional[float] = None,
+                        request_epoch: Optional[int] = None) -> DualPathTick:
         """消费一次**完整**接口受限验证结果：登记证据 + 推进协调器（零 I/O）。"""
         moment = self._clock() if now is None else float(now)
         with self._lock:
             notes: List[str] = []
+            if request_epoch is not None and request_epoch != self.network_epoch:
+                self._pending.pop(getattr(verification, "role", ""), None)
+                return self._finish(DualPathTick(
+                    at=moment, network_epoch=self.network_epoch,
+                    active_path=self.active_path, standby_path=self.standby_path,
+                    trusted=False, notes=("网络已变化，丢弃旧的验证结果",)))
             role = self.gate.note_verification(verification, now=moment)
             if role is not None:
                 self._pending.pop(role, None)
@@ -607,6 +618,11 @@ class DualPathRecoveryController:
                 event=self._last_event, verification=verification,
                 uu_request=plan.uu_restart, uu_enabled=enabled, recovery=plan,
                 steps=plan.steps, notes=tuple(notes)))
+
+    def cancel_verifications(self, requests) -> None:
+        with self._lock:
+            for request in requests:
+                self._pending.pop(request.role, None)
 
     def note_uu_outcome(self, ok: bool, *, detail: str = "",
                         now: Optional[float] = None) -> None:
@@ -735,6 +751,18 @@ class DualPathRecoveryController:
                 and self._should_reverify(target, moment):
             wanted.append((target, "切换前必须先证实目标路径能直连上网"
                                    "（验证前置门）"))
+        active = self.active_path
+        if (self.refresh_active_verification and active is not None
+                and _egress_if_index(self._last_snapshot) == _if_index(self._last_snapshot, active)
+                and _axis_state(self._last_snapshot, active) is HealthState.HEALTHY
+                and all(role != active for role, _ in wanted)):
+            evidence = self.gate.evidence(active)
+            last_attempt = self._attempted.get(active)
+            refresh_due = (evidence is None or not getattr(evidence[1], "allows_recovery", False)
+                           or moment - evidence[0] >= self.gate.max_age * 0.75)
+            retry_due = last_attempt is None or moment - last_attempt >= self.verification_retry_interval
+            if refresh_due and retry_due:
+                wanted.append((active, "刷新当前出口的公网验证"))
 
         requests: List[Any] = []
         for role, reason in wanted:

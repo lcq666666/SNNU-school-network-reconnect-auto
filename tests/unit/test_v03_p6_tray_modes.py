@@ -103,7 +103,7 @@ def test_u6_03_monitor_plans_but_never_executes():
     for index in range(5):
         result = bridge.tick(index * 15.0,
                              snap(eth_state=HealthState.INTERNET_UNREACHABLE,
-                                  egress_if=WIFI_IF))
+                                     egress_if=ETH_IF))
     assert result.executed == []
     assert any(p.kind is OpKind.METRIC_WRITE for p in result.plan)
     assert result.readonly is True
@@ -191,7 +191,7 @@ def test_u6_09_auto_authorized_attaches_executor_and_switches():
         result = bridge.tick(index * 15.0,
                              snap(eth_state=HealthState.INTERNET_UNREACHABLE,
                                   wifi_state=HealthState.HEALTHY,
-                                  egress_if=WIFI_IF))
+                                     egress_if=ETH_IF if index < 5 else WIFI_IF))
         executed.extend(o.kind for o in result.executed)
     assert executor.calls == [OpKind.METRIC_WRITE]
     assert executed == [OpKind.METRIC_WRITE]
@@ -290,7 +290,8 @@ def test_u6_14_records_last_switch():
     for index in range(6):
         bridge.tick(index * 15.0,
                     snap(eth_state=HealthState.INTERNET_UNREACHABLE,
-                         wifi_state=HealthState.HEALTHY, egress_if=WIFI_IF))
+                             wifi_state=HealthState.HEALTHY,
+                             egress_if=ETH_IF if index < 5 else WIFI_IF))
     status = bridge.status()
     assert status.last_switch_at == 60.0
     assert status.last_switch_reason and status.last_switch_result
