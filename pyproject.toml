@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "snnu-campus-reconnect"
 #: 与 campus_core.__version__ 保持一致（由 tests/unit/test_f22_build.py 校验）。
-version = "0.5.0"
+version = "0.6.0"
 description = "陕西师范大学校园网自动重连助手（CLI + 托盘），Windows 10/11 x64"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,7 @@ dependencies = [
 tray = [
     "pystray>=0.19,<0.20",
     "pillow>=10,<12",
+    "customtkinter>=5.2,<7",
 ]
 # 开发 / 测试 / 静态检查
 dev = [
@@ -48,9 +49,10 @@ pack = [
 Repository = "https://github.com/lcq666666/SNNU-school-network-reconnect-auto"
 
 [tool.setuptools]
-# 本项目不是包，而是 4 个顶层模块（源码模式直接以脚本运行）。
+# 本项目不是包，而是顶层模块集合（源码模式直接以脚本运行）。
 py-modules = ["campus_reconnect", "campus_core", "campus_windows",
-              "campus_reconnect_tray"]
+              "campus_reconnect_tray", "campus_clash_health",
+              "campus_wifi_bringup", "campus_uu_recovery"]
 
 # 说明：静态检查配置以仓库根 `ruff.toml` 为准，测试配置以 `pytest.ini` 为准
 # （避免同一份配置存在两个来源而产生分叉，F22）。

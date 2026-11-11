@@ -4,7 +4,7 @@
 target-version = "py310"
 line-length = 100
 
-exclude = [".venv", "build", "dist", "logs", "__pycache__"]
+exclude = [".venv", ".venv-linux", "build", "dist", "logs", "__pycache__"]
 
 [lint]
 # 默认规则集（E4/E7/E9/F）足够覆盖未使用导入/未定义名等基础缺陷；

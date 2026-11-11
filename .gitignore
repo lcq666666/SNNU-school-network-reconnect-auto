@@ -10,6 +10,7 @@ CampusReconnect_V*.exe
 
 # ---- 隔离开发环境（阶段 0 起）----
 .venv/
+.venv-linux/  # Linux 离线验证 venv（不提交）
 venv/
 
 # ---- 测试 / 静态检查缓存 ----

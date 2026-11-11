@@ -54,7 +54,7 @@ __all__ = [
 # 版本与取值范围
 # --------------------------------------------------------------------------- #
 #: 应用版本（唯一来源；``pyproject.toml`` 与打包版本资源均应与之一致，F22）。
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 SCHEMA_VERSION = 1
 
@@ -170,9 +170,9 @@ class Config:
     interface: Optional[str] = None
     operator: str = "mobile"
     account_format: str = "plain"
-    interval: int = 15
-    threshold: int = 3
-    cooldown: int = 180
+    interval: int = 5
+    threshold: int = 2
+    cooldown: int = 60
     browser_fallback: bool = True
     proxy_consent: Optional[bool] = None
     proxy_endpoint: Optional[str] = None
