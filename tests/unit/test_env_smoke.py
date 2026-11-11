@@ -11,6 +11,7 @@ import importlib.util
 import os
 import re
 import sys
+import sysconfig
 from pathlib import Path
 
 RUNTIME_PACKAGES = ["requests", "keyring"]
@@ -52,10 +53,18 @@ def test_dev_dependencies_importable():
 
 
 def test_ruff_cli_available():
-    """ruff 可执行文件存在于当前解释器所在 Scripts 目录。"""
-    scripts_dir = Path(sys.executable).parent
+    """ruff 可执行文件存在于 pip 安装控制台脚本的目录。"""
     exe = "ruff.exe" if os.name == "nt" else "ruff"
-    assert (scripts_dir / exe).exists(), f"ruff 未安装于 {scripts_dir}"
+    # V0.6.1：不要只查 sys.executable 所在目录。Linux / venv 里脚本
+    # 就在解释器旁边，但 GitHub setup-python 的 Windows 安装把
+    # python.exe 放 …\x64\、脚本放 …\x64\Scripts\，只查前者永远找
+    # 不到（第 1 项）。依赖清单没问题：lock 文件有 ruff==0.14.14，
+    # 同一任务里 python -m ruff check . 也通过，模块装着呢——错的是
+    # 测试查的位置，不是依赖。用 sysconfig 查 pip 真正的安装位置。
+    candidates = [Path(sysconfig.get_path("scripts")),
+                  Path(sys.executable).parent]
+    assert any((d / exe).exists() for d in candidates), (
+        "ruff 未安装于 %s" % " / ".join(str(d) for d in candidates))
 
 
 def test_requirements_files_exist(project_root: Path):
