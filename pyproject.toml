@@ -52,7 +52,7 @@ Repository = "https://github.com/lcq666666/SNNU-school-network-reconnect-auto"
 # 本项目不是包，而是顶层模块集合（源码模式直接以脚本运行）。
 py-modules = ["campus_reconnect", "campus_core", "campus_windows",
               "campus_reconnect_tray", "campus_clash_health",
-              "campus_wifi_bringup", "campus_uu_recovery"]
+              "campus_wifi_bringup", "campus_uu_recovery", "campus_update"]
 
 # 说明：静态检查配置以仓库根 `ruff.toml` 为准，测试配置以 `pytest.ini` 为准
 # （避免同一份配置存在两个来源而产生分叉，F22）。
