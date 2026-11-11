@@ -57,7 +57,7 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          PROBE_HTML_TITLE, BrowserLaunchResult, PortalResolution,
                          PortalStatus, ProbeResult, ProbeSpec, RepairAdapters,
                          RepairOptions, RepairResult, LoginOutcome,
-                         StatusPageResult, TimerTable, __version__,
+                         SingleInstanceResult, StatusPageResult, TimerTable, __version__,
                          check_redirect_target, classify_network,
                          extract_error_hint, normalize_account,
                          parse_status_page, probe_matches,
@@ -1791,27 +1791,30 @@ def status(session: requests.Session, args: argparse.Namespace) -> None:
 _SINGLE_INSTANCE_GUARD: Optional[SingleInstanceGuard] = None
 
 
-def ensure_single_instance(log: logging.Logger) -> bool:
+def claim_single_instance(log: logging.Logger) -> SingleInstanceResult:
     """进程级单实例保护（F18）。
 
     使用**正确声明 ABI** 的命名互斥体（``CreateMutexW`` 的 ``argtypes``/``restype``
     已声明，``HANDLE`` 按指针宽度处理）；持有可关闭句柄避免 GC 失效。
-    创建失败时 **fail-closed**：返回 ``False`` 拒绝启动后台认证，不再 fail-open 继续。
+    创建失败时 **fail-closed**：调用方须拒绝启动后台认证。
     ``once`` 与 ``watch``/托盘共用同一互斥体，避免 ``watch`` 单实例被 ``once`` 绕过。
     """
     global _SINGLE_INSTANCE_GUARD
     if os.name != "nt":
-        return True
+        return SingleInstanceResult(ok=True)
     guard = SingleInstanceGuard(log=log)
     result = guard.acquire()
     if result.already_running:
         log.error("已有一个监控实例在运行，本次退出（互斥体保护）。")
-        return False
-    if not result.ok:
+    elif not result.ok:
         log.error("%s（fail-closed，拒绝后台认证）", result.detail)
-        return False
-    _SINGLE_INSTANCE_GUARD = guard   # 持有句柄引用，进程存活期间保持互斥
-    return True
+    else:
+        _SINGLE_INSTANCE_GUARD = guard   # 持有句柄引用，进程存活期间保持互斥
+    return result
+
+
+def ensure_single_instance(log: logging.Logger) -> bool:
+    return claim_single_instance(log).ok
 
 
 def _mask_account(account: str) -> str:

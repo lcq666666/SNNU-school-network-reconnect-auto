@@ -121,7 +121,9 @@ def test_t33_set_autostart_writes_current_command(monkeypatch):
     monkeypatch.setattr(tray, "winreg", reg)
     monkeypatch.setattr(tray, "launcher_command", lambda: "CURRENT")
     assert tray.set_autostart(True) is True
-    assert reg.command == "CURRENT"
+    assert reg.command == "CURRENT --background"
+    assert tray.get_autostart() is True
+    assert tray.autostart_foreign_command() is None
     assert tray.set_autostart(False) is True
     assert reg.command is None
 
@@ -138,7 +140,7 @@ def test_t33_toggle_autostart_foreign_requires_confirmation(monkeypatch):
 
     app._ui_ask = lambda *a, **k: True           # 用户同意
     tray.TrayApp.on_toggle_autostart(app)
-    assert reg.command == "CURRENT"
+    assert reg.command == "CURRENT --background"
 
 
 def test_t33_toggle_autostart_plain_toggle(monkeypatch):
@@ -148,7 +150,7 @@ def test_t33_toggle_autostart_plain_toggle(monkeypatch):
     app = _FakeApp()
     app._ui_ask = lambda *a, **k: True
     tray.TrayApp.on_toggle_autostart(app)
-    assert reg.command == "CURRENT"
+    assert reg.command == "CURRENT --background"
 
 
 # --------------------------------------------------------------------------- #

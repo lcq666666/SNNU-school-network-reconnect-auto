@@ -37,6 +37,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -70,7 +71,7 @@ from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
                          load_config_text)
 import campus_reconnect as engine
 from campus_reconnect import (direct_session, edge_fallback,
-                              ensure_single_instance, get_credentials,
+                              get_credentials,
                               internet_ok, portal_login, portal_reachable,
                               resolve_port, setup_logging, verify_internet,
                               wifi_reconnect, wifi_state)
@@ -162,6 +163,7 @@ else:
 LOG_DIR = SCRIPT_DIR / "logs"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "CampusReconnectTray"
+BACKGROUND_FLAG = "--background"
 PYTHONW = str(Path(sys.executable).with_name("pythonw.exe"))
 CLASH_SERVER_DEFAULT = "127.0.0.1:7897"   # 仅在用户显式确认时作为**建议值**展示
 APP_NAME = "校园网自动重连助手"
@@ -563,7 +565,7 @@ def save_config(cfg: dict) -> bool:
 # 开机自启（F12 前置：核对命令内容，而非仅判断键是否存在）
 # --------------------------------------------------------------------------- #
 def launcher_command() -> str:
-    """当前安装对应的自启命令（F21）。
+    """当前安装的启动命令（F21）；注册自启时另加后台标志。
 
     - **打包模式**：仅启动**当前 exe**（``sys.executable``），不按文件名切换入口，
       避免调试新分支时点到旁边的旧二进制；
@@ -591,9 +593,12 @@ def get_autostart_command():
 
 def autostart_matches_current() -> bool:
     """自启命令是否指向**当前安装**（而非旧路径 / 旧 exe，F21）。"""
-    command = get_autostart_command()
-    return command is not None and \
-        _normalize_command(command) == _normalize_command(launcher_command())
+    return _autostart_is_current(get_autostart_command())
+
+
+def _autostart_is_current(command) -> bool:
+    current = _normalize_command(launcher_command())
+    return _normalize_command(command) in (current, f"{current} {BACKGROUND_FLAG}")
 
 
 def autostart_foreign_command():
@@ -601,7 +606,7 @@ def autostart_foreign_command():
     command = get_autostart_command()
     if command is None:
         return None
-    if _normalize_command(command) == _normalize_command(launcher_command()):
+    if _autostart_is_current(command):
         return None
     return command
 
@@ -616,7 +621,8 @@ def set_autostart(enabled: bool) -> bool:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0,
                             winreg.KEY_SET_VALUE) as key:
             if enabled:
-                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, launcher_command())
+                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ,
+                                  f"{launcher_command()} {BACKGROUND_FLAG}")
             else:
                 try:
                     winreg.DeleteValue(key, RUN_VALUE_NAME)
@@ -676,9 +682,9 @@ def clear_credentials() -> CredentialClear:
 
 
 class TrayApp:
-    def __init__(self, log):
+    def __init__(self, log, *, config=None):
         self.log = log
-        self.config = load_config()
+        self.config = load_config() if config is None else dict(config)
         self.session = None
         self.state = {"mode": "boot", "detail": "", "port": None,
                       "last_ok": None, "failures": 0}
@@ -4394,15 +4400,74 @@ def prompt_credentials_dialog(root, initial_user=""):
     return result["value"]
 
 
-def main():
+def _show_startup_error(detail: str) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        show = ctypes.WinDLL("user32").MessageBoxW
+        show.argtypes = (wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT)
+        show.restype = ctypes.c_int
+        # MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST：不依赖已隐藏的 Tk 根窗口。
+        show(None, detail, APP_NAME, 0x30 | 0x10000 | 0x40000)
+    else:
+        messagebox.showerror(APP_NAME, detail)
+
+
+def _startup_check(report: Path) -> int:
+    """验证打包后的仪表盘，不读取用户配置或凭据，不启动监测。"""
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        app = TrayApp(logging.getLogger("campus.startup_check"), config=DEFAULT_CONFIG)
+        app.root = root
+        # 发布包必须能打开深色仪表盘；不走可能掩盖打包错误的 ttk 回退路径。
+        if ctk is None:
+            raise RuntimeError("CustomTkinter failed to import")
+        callback_errors = []
+        root.report_callback_exception = lambda *error: callback_errors.append(
+            "".join(traceback.format_exception(*error)))
+        app._open_dashboard_ctk()
+        # CTk 在 Windows 用延时回调恢复窗口并设置图标，必须实际跑 Tk 事件循环。
+        root.after(500, root.quit)
+        root.mainloop()
+        if callback_errors:
+            raise RuntimeError(callback_errors[0])
+        if app.dashboard_win is None or not app.dashboard_win.winfo_viewable():
+            raise RuntimeError("Dashboard window was not displayed")
+        app._close_dashboard()
+        report.write_text("ok\n", encoding="utf-8")
+        return 0
+    except Exception:
+        report.write_text(traceback.format_exc(), encoding="utf-8")
+        return 1
+    finally:
+        if root is not None:
+            root.destroy()
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument(BACKGROUND_FLAG, action="store_true", help="在托盘后台启动")
+    parser.add_argument("--startup-check", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.startup_check is not None:
+        return _startup_check(args.startup_check)
+
     log = setup_logging(False)
-    if not ensure_single_instance(log):
-        root0 = tk.Tk()
-        root0.withdraw()
-        messagebox.showerror(APP_NAME,
-                             "已有一个监控实例在运行。\n如需重启，请先在托盘右键退出旧实例。")
-        root0.destroy()
-        return
+    instance = engine.claim_single_instance(log)
+    if not instance.ok:
+        if not args.background:
+            if instance.already_running:
+                detail = ("已有一份校园网助手在运行。\n\n"
+                          "要打开正在运行的助手，请点击任务栏时钟旁的 ^，找到校园网助手图标。\n"
+                          "要升级，请在该图标上右键选择「退出」，先退出旧版，再双击新版。\n"
+                          "升级后，可在新版里重新开启「开机自启」。")
+            else:
+                detail = "无法启用单实例保护，监测未启动。请查看日志后重试。"
+            _show_startup_error(detail)
+        return 1
     root = tk.Tk()
     root.withdraw()
     loaded = load_credentials()
@@ -4440,9 +4505,12 @@ def main():
                      name="campus-readiness", daemon=True).start()
     app._start_ui_pump()
     app.start()
+    if not args.background:
+        app.on_dashboard()
     root.mainloop()
     log.info("托盘助手已退出")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
