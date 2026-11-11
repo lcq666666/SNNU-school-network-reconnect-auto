@@ -774,17 +774,27 @@ def launch_detached(command: Any, timeout: float = 8.0) -> Tuple[bool, str]:
     """以**分离式**方式启动命令（不等待、不带控制台、随父进程退出而不结束）。
 
     工作目录取可执行文件所在目录（远控程序常依赖相对路径的资源）；
-    取不到则继承当前目录。启动异常返回 ``(False, 说明)``，不抛异常。
+    取不到则继承当前目录。目录不存在时 Popen 直接报错返回，不静默
+    用错误目录启动（否则远控起来也缺资源）。启动异常返回 ``(False, 说明)``，
+    不抛异常。
     """
     argv = split_command_line(command)
     if not argv:
         return False, "重启命令为空，未启动任何进程"
     cwd: Optional[str] = None
     exe = argv[0]
-    if os.path.sep in exe or "/" in exe:
-        directory = os.path.dirname(exe)
-        if directory and os.path.isdir(directory):
-            cwd = directory
+    # V0.6.1：按两种分隔符取目录，不依赖本机 os.path.sep。原来
+    # 用 os.path.sep 判断，Linux 上反斜杠路径永远进不去分支；
+    # 再叠加 os.path.isdir 把关，CI 上目录不存在也传不了 cwd。
+    # 现在只要命令里带分隔符就取目录（保持原样，不改斜杠方向），
+    # 目录真不存在时 Popen 报错、由下面的 except 转成 (False, 说明)。
+    directory = ""
+    for sep in ("\\", "/"):
+        if sep in exe:
+            directory = exe.rsplit(sep, 1)[0]
+            break
+    if directory:
+        cwd = directory
     kwargs: Dict[str, Any] = {"creationflags": DETACHED_PROCESS, "close_fds": True}
     if cwd:
         kwargs["cwd"] = cwd
