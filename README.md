@@ -375,3 +375,38 @@ Internet Verify → Route Switch → UU Restart）+ 按钮（立即检测 / **�
 
 不注销 Portal、不修改 Clash 配置/订阅/TUN、密码只留 Windows 凭据管理器、
 不设置 `verify=False`、日志不写账号/密码/Cookie/MAC、不覆盖既有版本产物。
+
+## 13. V0.6.0 版本能力（2026-11-11）
+
+针对用户实测反馈的四个问题（详见 `docs/V0.6开发计划_2026-11-11.md`）：
+
+### 13.1 双轴探测 + Clash 假死自愈
+
+探测从单轴（直连）变成双轴：直连轴仍按 V0.5 的接口受限验证，直连通但代理轴 timeout/connection
+失败即判 **Clash 假死**，不判在线。假死自愈分两步：先关开一次系统代理，还不行就重启
+Clash Verge Rev 进程；两步都失败则建议人工处理。探测默认值改快：interval 15→5 秒、
+threshold 3→2 次、cooldown 180→60 秒（配置仍可改，有限幅）。
+
+### 13.2 有线转 Wi-Fi（自启链）
+
+首次启动弹一次“开启智能自动切换？”确认，同意后 `failover_mode=AUTO` +
+`auto_switch_authorized=true`（拒绝则保持仅监测，不再弹）。有线故障时自启链按顺序执行：
+查网卡状态 → 禁用则启用（需管理员，失败如实报告）→ 射频关了就打开 →
+没有 SNNU profile 就建开放式 profile → `netsh wlan connect SNNU` → 等 IP 就绪 → 再走 Portal 认证。
+切回有线需连续稳定 120 秒。
+
+### 13.3 UU Remote 恢复（两档）
+
+触发条件改为：发生过断网再恢复、且恢复前 UU 在运行（`was_running`）、验证通过后后台重启，
+不弹窗。第一档只清退 `GameViewer.exe` / `GameViewerLauncher.exe`，重启后等 10 秒确认进程回来 +
+一次直连验证，通过算成功；60 秒内仍不通升第二档，连 `GameViewerServer.exe` /
+`GameViewerHealthd.exe` 一起清退，服务 `GameViewerService` 永远不动。保留 300 秒冷却
+（可配置，下限 60 秒），一次恢复事件最多重启一次（第二档计为同一次事件的升级，不另计）。
+
+### 13.4 界面：CustomTkinter 深色仪表盘
+
+仪表盘改用 CustomTkinter 深色主题：圆角卡片、状态灯呼吸动画（恢复中时闪烁）、
+恢复流水线进度条、网络时间线时间轴、最近一小时双链路状态图（Canvas 手绘）。
+无 CustomTkinter 时回退原生 ttk，保证仍能启动；设置仍是 5 页。
+**注意：Linux 上 PyInstaller 打不出 Windows exe**，打包须在 Windows 上跑
+`tools/build_release.py`，详见 V0.6 开发计划 §6。

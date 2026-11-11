@@ -152,9 +152,9 @@ def test_string_switch_is_rejected():
 def test_bool_as_int_is_rejected():
     """bool 充当 int 必须被拒绝（bool 是 int 子类）。"""
     result = validate_config({"interval": True, "threshold": False, "cooldown": True})
-    assert result.config.interval == 15
-    assert result.config.threshold == 3
-    assert result.config.cooldown == 180
+    assert result.config.interval == 5  # V0.6 默认值（原 15）
+    assert result.config.threshold == 2  # V0.6 默认值（原 3）
+    assert result.config.cooldown == 60  # V0.6 默认值（原 180）
     assert {i.key for i in result.issues} >= {"interval", "threshold", "cooldown"}
 
 
@@ -175,8 +175,8 @@ def test_numeric_out_of_range_or_wrong_type(key, value):
 def test_numeric_extremely_large_is_rejected():
     """超大值（如 10**9）超出范围被拒绝。"""
     result = validate_config({"interval": 10 ** 9, "cooldown": 10 ** 9})
-    assert result.config.interval == 15
-    assert result.config.cooldown == 180
+    assert result.config.interval == 5  # V0.6 默认值（原 15）
+    assert result.config.cooldown == 60  # V0.6 默认值（原 180）
 
 
 def test_unknown_schema_version_falls_back():

@@ -629,11 +629,22 @@ def test_ui80_dashboard_and_settings_windows_build_and_render(monkeypatch):
         app._open_dashboard()
         win = app.dashboard_win
         assert win is not None and win.winfo_exists()
-        app._render_dashboard(app.ui_state(now=5.0))
-        assert app._dash_light.cget("bg") == app.ui_state(now=5.0).overall_color
-        assert app._dash_widgets["ethernet"]["rows"]["角色"].get() == "PRIMARY"
-        assert app._dash_widgets["wifi"]["rows"]["Portal"].get() == "需要认证"
-        assert "Internet Verify" in app._dash_widgets["steps"]["internet"].cget("text")
+        if tray.ui_backend() == "customtkinter" \
+                and getattr(app, "_dash_ctk_widgets", None) is not None:
+            # V0.6 CustomTkinter 仪表盘：同一断言走 CTk 控件
+            app._render_dashboard_ctk(app.ui_state(now=5.0))
+            refs = app._dash_ctk_widgets
+            assert refs["light"].cget("text_color") == \
+                app.ui_state(now=5.0).overall_color
+            assert refs["ethernet"]["角色"].cget("text") == "PRIMARY"
+            assert refs["wifi"]["Portal"].cget("text") == "需要认证"
+            assert "Internet Verify" in refs["steps"]["internet"].cget("text")
+        else:
+            app._render_dashboard(app.ui_state(now=5.0))
+            assert app._dash_light.cget("bg") == app.ui_state(now=5.0).overall_color
+            assert app._dash_widgets["ethernet"]["rows"]["角色"].get() == "PRIMARY"
+            assert app._dash_widgets["wifi"]["rows"]["Portal"].get() == "需要认证"
+            assert "Internet Verify" in app._dash_widgets["steps"]["internet"].cget("text")
         app._close_dashboard()
         assert app.dashboard_win is None
 
