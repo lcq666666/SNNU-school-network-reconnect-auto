@@ -33,6 +33,24 @@ DIST_DIR = PROJECT_ROOT / "dist"
 EXE_NAME = "CampusReconnect.exe"
 
 
+def _ensure_utf8_stdio() -> None:
+    """把 stdout/stderr 重配为 UTF-8（Windows 控制台默认 cp1252）。
+
+    V0.6.1：构建脚本打印中文失败信息（“测试 / 静态检查未通过……”）
+    时，cp1252 控制台上 print 直接报 UnicodeEncodeError，构建日志
+    被异常截断。开篇重配后中文正常输出；失败仍返回非 0。
+    无 reconfigure 的流（如 StringIO）直接跳过，不报错。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def _run(args, **kwargs) -> int:
     print("+", " ".join(str(a) for a in args))
     return subprocess.run(args, cwd=str(PROJECT_ROOT), check=False, **kwargs).returncode
@@ -76,6 +94,7 @@ def write_manifest() -> Path:
 
 
 def main(argv=None) -> int:
+    _ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="CampusReconnect 受控构建")
     parser.add_argument("--skip-checks", action="store_true",
                         help="跳过测试与 ruff（CI 中单独执行时使用）")
