@@ -18,6 +18,11 @@ from tools import build_release
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def _norm(text):
+    """比较输出前把 CRLF 统一成 LF：Windows 控制台行尾是 CRLF。"""
+    return text.replace("\r\n", "\n")
+
+
 def _cp1252_stream():
     """返回 (原始字节缓冲, cp1252 文本流)，模拟 Windows 控制台 stdio。"""
     raw = io.BytesIO()
@@ -36,7 +41,23 @@ def test_ensure_utf8_stdio_reconfigures_cp1252_stream():
         print("测试中文")
     finally:
         sys.stdout = old
-    assert raw.getvalue().decode("utf-8") == "测试中文\n"
+    assert _norm(raw.getvalue().decode("utf-8")) == "测试中文\n"
+
+
+def test_stdout_newline_normalization_covers_windows_crlf():
+    """回归：Windows 行尾是 CRLF，断言须先归一化再比较。
+
+    ``newline="\\r\\n"`` 的流在 Linux 上复现 Windows 行尾：原始字节
+    含 ``\\r\\n``，归一化后仍应等于期望文本（不归一化则在 Windows
+    上失败，这正是 v0.6.1 release #3 / ci #82 报的两项）。
+    """
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n",
+                              write_through=True)
+    stream.write("测试中文\n")
+    stream.flush()
+    assert raw.getvalue().decode("utf-8") == "测试中文\r\n"
+    assert _norm(raw.getvalue().decode("utf-8")) == "测试中文\n"
 
 
 def test_ensure_utf8_stdio_ignores_streams_without_reconfigure():
@@ -68,4 +89,4 @@ def test_build_release_stdio_real_interpreter_under_cp1252():
     done = subprocess.run([sys.executable, "-c", code], cwd=str(PROJECT_ROOT),
                           capture_output=True, env=env, timeout=60)
     assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
-    assert done.stdout.decode("utf-8") == "测试中文\n"
+    assert _norm(done.stdout.decode("utf-8")) == "测试中文\n"
