@@ -107,6 +107,16 @@ except Exception:  # noqa: BLE001 - 无 CustomTkinter 即回退 ttk
     ctk = None  # type: ignore[assignment]
 
 
+# ---- V0.6.1：导入时抓一份真实 sleep ----
+# 托盘里 V0.6 新增的几处等待（Clash 自愈 / Wi-Fi 等 IP / UU Tier2 确认）
+# 必须用真实时间，不能走可被计时器测试替换的模块级 time。
+# V0.6 之前托盘里没有任何等待调用，只有 campus_remote_app._SLEEP
+# 是导入时抓取的；V0.6 加的 4 处若走模块级 time，计时器测试装上
+# 虚拟时钟后，残留的后台线程会把虚拟时间多推进几秒，i2_01 的探测
+# 时刻从 [0, 15, 30, 45] 漂到 [0, 15, 30, 50]。
+_REAL_SLEEP = time.sleep
+
+
 def ui_backend() -> str:
     """当前可用的仪表盘后端：``customtkinter`` 或 ``ttk``（回退）。"""
     return "customtkinter" if ctk is not None else "ttk"
@@ -3050,9 +3060,9 @@ class TrayApp:
         busy.set()
 
         def _run():
+            ok = None
             try:
                 ok, detail = verify_internet(direct_session())
-                self._dual_axis_clash_check(ok)
                 if ok:
                     self.log.info("连接后上网校验通过：%s", detail)
                     # V0.4-3：确认真连通后清退重启 UU 远程后台（默认关闭）
@@ -3066,8 +3076,38 @@ class TrayApp:
                 self.log.warning("连接后上网校验异常: %s", type(exc).__name__)
             finally:
                 busy.clear()
+                # V0.6.1：双轴 Clash 检查放后台线程（见 _start_clash_check_async）。
+                # V0.6 曾在这里同步做代理轴探测（每站 3 秒超时，最多约 9 秒，
+                # 自愈还要等 taskkill + 2 秒），校验通过后的 UU 重启与失败提示
+                # 都被它拖后，Windows CI 上 3 秒等待上限内收不到结果。
+                if ok is not None:
+                    self._start_clash_check_async(ok)
 
         threading.Thread(target=_run, daemon=True, name="campus-verify").start()
+
+    def _start_clash_check_async(self, direct_ok: bool) -> None:
+        """双轴 Clash 检查放独立短命线程（V0.6.1）。
+
+        校验线程只负责结果处理（UU 重启 / 失败提示），不再等代理轴；
+        自愈仍在后台完成，行为不变。已有一路检查在跑时不再叠加。
+        """
+        if not bool(self.config.get("clash_heal_enabled", True)):
+            return
+        busy = getattr(self, "_clash_check_busy", None)
+        if busy is None:
+            busy = self._clash_check_busy = threading.Event()
+        if busy.is_set():
+            return
+        busy.set()
+
+        def _run():
+            try:
+                self._dual_axis_clash_check(direct_ok)
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-clash-check").start()
 
 
     # ---------- V0.6：双轴 Clash 自愈 / Wi-Fi 自启 / UU 两档 ----------
@@ -3158,7 +3198,7 @@ class TrayApp:
                 endpoint = self.config.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
                 try:
                     apply_system_proxy(False)
-                    time.sleep(1.0)
+                    _REAL_SLEEP(1.0)
                     result = apply_system_proxy(True, endpoint)
                     ok = bool(result.ok)
                     self.log.info("[Clash] 系统代理开关一次：%s",
@@ -3173,7 +3213,7 @@ class TrayApp:
 
                     subprocess.run(["taskkill", "/f", "/im", "Clash Verge.exe"],
                                    capture_output=True, timeout=15)
-                    time.sleep(2.0)
+                    _REAL_SLEEP(2.0)
                     started = False
                     for candidate in ("Clash Verge.exe", "clash-verge.exe"):
                         path = shutil.which(candidate)
@@ -3248,7 +3288,7 @@ class TrayApp:
                                 return True
                         except Exception:
                             pass
-                        time.sleep(2.0)
+                        _REAL_SLEEP(2.0)
                     return False
 
             result = wifi_run_bringup(bringup_plan, _Ops(self))
@@ -3289,7 +3329,7 @@ class TrayApp:
             if not bool(ops.launch(command)):
                 self.log.warning("[UU Tier2] 重启命令执行失败")
                 return False
-            time.sleep(10.0)
+            _REAL_SLEEP(10.0)
             from campus_remote_app import discover
 
             after = discover(ops)

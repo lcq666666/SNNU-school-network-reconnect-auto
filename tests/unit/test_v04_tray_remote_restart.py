@@ -48,6 +48,17 @@ def _make_app(monkeypatch, online_series=None, **overrides):
     app = tray.TrayApp(LOG)
     app.config = dict(tray.DEFAULT_CONFIG)
     app.config.update(overrides)
+    # V0.6.1：V0.4 测试不测 Clash 轴——双轴检查做真实代理探测，
+    # 默认测试集零真实网络（AGENTS §2.4），且自愈会在 Windows 上真的
+    # 改系统代理 / 拉 taskkill；轴本身由 test_v06_clash_health 覆盖。
+    app.config["clash_heal_enabled"] = False
+    # V0.6.1：关掉后台三轴采集——它在独立线程里调 internet_ok，
+    # 会偷吃本测试 online_series 的条目（V0.5 引入的竞态：采集线程
+    # 恰好吃掉 False 那一条，在线段就不断，第二次校验永远不触发；
+    # Windows CI 上这正是第 4–6 项时过时不过的原因之一）。
+    # 采集返回 None 即快照不可信（fail-closed），只影响显示，不影响
+    # 本测试要验证的校验/重启逻辑；三轴本身由 test_v03_p75_1_* 覆盖。
+    app._snapshot_collector = lambda: None
     app.icon = None
     app.root = None
     monkeypatch.setattr(tray, "wifi_state", lambda: ("SNNU", "已连接"))
