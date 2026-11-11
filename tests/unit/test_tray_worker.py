@@ -46,6 +46,7 @@ def _make_app(monkeypatch, **overrides):
     app.icon = None
     app.root = None
     app._test_proxy_calls = []
+    app._snapshot_collector = lambda: None  # 托盘线程测试不启动真实的接口探测。
 
     monkeypatch.setattr(tray, "wifi_state", lambda: ("SNNU", "已连接"))
     monkeypatch.setattr(tray, "resolve_port", lambda session, requested: (8601, "fake"))

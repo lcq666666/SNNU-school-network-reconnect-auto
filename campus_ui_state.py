@@ -578,8 +578,8 @@ def build_pipeline(*, failover_state: Any, ethernet: Any, wifi: Any,
         route = _step("route", STEP_ACTIVE, "切换中")
     elif failover_state is FailoverState.ETHERNET_RECOVERY_CHECK:
         route = _step("route", STEP_PENDING, "有线恢复观察中")
-    elif failover_state is FailoverState.ETHERNET_PRIMARY:
-        route = _step("route", STEP_DONE, "以太网出口")
+    elif failover_state is FailoverState.ETHERNET_PRIMARY and active_path:
+        route = _step("route", STEP_DONE, "当前出口：%s" % PATH_LABEL[active_path])
     elif failover_state is FailoverState.PAUSED:
         route = _step("route", STEP_SKIPPED, "监测已暂停")
     elif failover_state is FailoverState.BOTH_OFFLINE:
@@ -615,16 +615,16 @@ def overall_status(*, failover_state: Any, ethernet: Any, wifi: Any,
         return OVERALL_PAUSED
     eth_state = axis_state(ethernet)
     wifi_state = axis_state(wifi)
-    if failover_state is None and eth_state is None and wifi_state is None:
+    if eth_state is None and wifi_state is None:
         return OVERALL_UNKNOWN
     if failover_state is FailoverState.BOTH_OFFLINE:
         return OVERALL_OFFLINE
     if failover_state in _TRANSITION_STATES or verify_roles or recovery_event:
         return OVERALL_RECOVERING
-    eth_down = eth_state is None or eth_state in _HARD_DOWN
-    wifi_down = wifi_state is None or wifi_state in _HARD_DOWN
-    if eth_down and wifi_down:
+    if eth_state in _HARD_DOWN and wifi_state in _HARD_DOWN:
         return OVERALL_OFFLINE
+    if all(state is None or state in _HARD_DOWN for state in (eth_state, wifi_state)):
+        return OVERALL_UNKNOWN
     if not monitor_alive or warnings:
         return OVERALL_DEGRADED
     if active_path is None:
@@ -662,6 +662,7 @@ def build_ui_state(*, now: float, ethernet: Any = None, wifi: Any = None,
                    standby_path: Optional[str] = None,
                    failover_state: Any = None,
                    mode_label: str = "", monitor_label: str = "",
+                   observation_note: str = "",
                    monitor_alive: bool = True, paused: bool = False,
                    recovery_event: Optional[str] = None,
                    verify_roles: Sequence[str] = (), uu_enabled: bool = False,
@@ -705,9 +706,9 @@ def build_ui_state(*, now: float, ethernet: Any = None, wifi: Any = None,
 
     return UiState(
         overall=overall,
-        headline=_headline(active_path=active_path, standby_path=standby_path,
-                           verification=records, now=now, max_age=max_age,
-                           monitor_alive=monitor_alive, overall=overall),
+        headline=observation_note or _headline(active_path=active_path, standby_path=standby_path,
+                                               verification=records, now=now, max_age=max_age,
+                                               monitor_alive=monitor_alive, overall=overall),
         active_path=active_path, standby_path=standby_path,
         mode_label=mode_label, monitor_label=monitor_label,
         network_epoch=int(network_epoch),

@@ -574,7 +574,8 @@ def evaluate(report: Any, engine: Any = None, *,
              roles: Optional[Dict[str, Optional[Any]]] = None,
              config: Optional[Dict[str, Any]] = None,
              route_lookup: Optional[Callable[[str], Any]] = None,
-             remote_targets: Sequence[Tuple[str, int]] = ()
+             remote_targets: Sequence[Tuple[str, int]] = (),
+             gateway_ports: Sequence[int] = DEFAULT_GATEWAY_PORTS,
              ) -> NetworkHealthSnapshot:
     """三轴健康评估入口（一次性快照，只读）。
 
@@ -596,8 +597,8 @@ def evaluate(report: Any, engine: Any = None, *,
     if lookup is None and engine is not None and hasattr(engine, "route_lookup"):
         lookup = engine.route_lookup
 
-    checker = InterfaceHealthChecker(engine,
-                                     remote_targets=remote_targets)
+    checker = InterfaceHealthChecker(engine, remote_targets=remote_targets,
+                                     gateway_ports=gateway_ports)
 
     ethernet = None
     if roles.get("ethernet") is not None:

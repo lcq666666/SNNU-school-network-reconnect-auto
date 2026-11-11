@@ -490,6 +490,21 @@ def test_all_diagnostic_commands_are_read_only():
 # --------------------------------------------------------------------------- #
 # powercfg / 远控 / 自启 / 自动登录解析（P0-T5）
 # --------------------------------------------------------------------------- #
+def test_monitor_collects_network_inputs_without_running_full_diagnostics(fake_runner):
+    fake_runner.responses.update({
+        "adapters": ADAPTERS_JSON, "cim_adapters": "[]", "ip_addresses": IP_ADDRESSES_JSON,
+        "dns_servers": "[]", "default_routes": DEFAULT_ROUTES_JSON, "egress_v4": EGRESS_V4_JSON,
+    })
+    report = netdiag.collect_health(fake_runner)
+
+    assert set(fake_runner.calls) == {
+        "adapters", "cim_adapters", "ip_addresses", "dns_servers", "default_routes", "egress_v4",
+    }
+    assert report.adapters and report.ip_addresses and report.default_routes
+    assert "public_ipv4" in report.egress
+    assert report.remote_control == {}
+
+
 def test_powercfg_parses_available_sleep_states():
     states = netdiag.parse_powercfg(POWERCFG_TEXT)
     assert states["standby_available"] is True

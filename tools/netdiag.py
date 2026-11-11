@@ -24,6 +24,7 @@ import platform
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1010,6 +1011,34 @@ class DiagReport:
         add("      --json 输出为 P1 接口契约（%s）。" % CONTRACT_VERSION)
         add("-" * 72)
         return "\n".join(lines)
+
+
+def collect_health(runner: Any) -> DiagReport:
+    """只采集接口健康评估所需的 Windows 数据。独立查询最多三项并行。"""
+    names = ("adapters", "cim_adapters", "ip_addresses", "dns_servers",
+             "default_routes", "egress_v4")
+
+    def query(name):
+        return runner.run(name, COMMANDS[name])
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        replies = dict(zip(names, pool.map(query, names)))
+
+    for name in ("adapters", "ip_addresses", "dns_servers", "default_routes"):
+        rc, output, _ = replies[name]
+        if rc != 0 and not output.strip():
+            # 读取失败不同于系统确实没有地址/路由。拒绝用错误的空数据判定掉线。
+            raise RuntimeError("网络采集查询失败：%s" % name)
+
+    return DiagReport(
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        adapters=parse_adapters(replies["adapters"][1], replies["cim_adapters"][1]),
+        ip_addresses=parse_ip_addresses(replies["ip_addresses"][1]),
+        dns_servers=parse_dns_servers(replies["dns_servers"][1]),
+        default_routes=parse_default_routes(replies["default_routes"][1]),
+        egress={"public_ipv4": parse_egress(replies["egress_v4"], EGRESS_TARGETS[0][1])},
+        commands_executed=list(names),
+    )
 
 
 def collect(runner: Any, *, target_ssid: str = DEFAULT_TARGET_SSID,

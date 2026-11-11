@@ -746,6 +746,7 @@ class TrayApp:
         self._snapshot_source = None
         self._snapshot_collector = None
         self._snapshot_spawn = None
+        self._last_system_probe: Optional[tuple[bool, str]] = None
         #: 最近一次三轴观测结论（含可信度与证据；供 UI 与告警展示）。
         self.last_observation = ObservationResult()
         #: 最近一次故障切换展示状态（由 :meth:`_failover_tick` 更新）。
@@ -943,22 +944,19 @@ class TrayApp:
         return self._real_collect_health_snapshot()
 
     def _real_collect_health_snapshot(self):
-        """真实三轴采集：``NetworkObserver`` + ``InterfaceHealthChecker`` + ``evaluate``。
+        """采集三轴健康所需的网卡、地址、DNS 和路由，再进行只读探测。
 
         全程**只读**（P0 ``netdiag`` 只读管道 + 只读探测），不切路由、不认证。
         """
         from tools import netdiag
-        from campus_network import (NetworkObserver, WindowsProbeEngine,
-                                    evaluate, resolve_roles)
+        from campus_network import WindowsProbeEngine, evaluate
 
-        cfg = self.get_config()
-        runner = netdiag.PowerShellRunner()
-        observer = NetworkObserver(runner)
-        report = observer.observe(target_ssid=cfg.get("ssid") or "SNNU")
-        roles = resolve_roles(report, engine._load_adapters_config())
+        system_probe = self._last_system_probe
+        report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
+        # 网关不开放 80/443 很常见。端口探测只用于详细诊断，不参与健康判定。
         return evaluate(report, WindowsProbeEngine(),
-                        system_probe=lambda: internet_ok(self.session),
-                        roles=roles, route_lookup=observer.route_lookup)
+                        system_probe=(lambda: system_probe) if system_probe is not None else None,
+                        config=engine._load_adapters_config(), gateway_ports=())
 
     def _observe_snapshot(self, now: Optional[float] = None) -> ObservationResult:
         """发起（必要时）并读取一次三轴观测；**永不阻塞**。
@@ -1006,7 +1004,8 @@ class TrayApp:
                 self.log.warning("故障切换快照提供者异常：%s", type(exc).__name__)
                 snapshot = None
         observation = getattr(self, "last_observation", None)
-        if observation is None or observation.snapshot is not snapshot:
+        if observation is None or (provider != self._full_snapshot
+                                   and observation.snapshot is not snapshot):
             # 外部注入的提供者（兼容路径 / 测试）：只做**结构**判定，
             # 不假定新鲜度 —— 轻量占位快照仍会被判为不可信。
             observation = ObservationResult(
@@ -1414,7 +1413,6 @@ class TrayApp:
         network_epoch = 0
         events = []
         max_age = None
-        active_path, standby_path = self._path_roles()
         if status is not None:
             verification = {"ethernet": status.ethernet, "wifi": status.wifi}
             uu_enabled = bool(status.uu_enabled)
@@ -1430,9 +1428,21 @@ class TrayApp:
             gate = getattr(controller, "gate", None)
             max_age = getattr(gate, "max_age", None)
         observation = getattr(self, "last_observation", None)
-        snapshot = getattr(observation, "snapshot", None) if observation is not None else None
+        snapshot = observation.snapshot if observation is not None and observation.trusted else None
         fs = getattr(self, "failover_status", None)
         failover_state = getattr(fs, "state", None)
+        observation_note = ""
+        if snapshot is None:
+            active_path = standby_path = failover_state = None
+            observation_note = observation.reason_text if observation is not None else "等待网络采集"
+        else:
+            egress = getattr(getattr(getattr(snapshot, "system", None), "egress", None),
+                             "if_index", None)
+            observed = {axis.if_index: role for role in ("ethernet", "wifi")
+                        if (axis := getattr(snapshot, role, None)) is not None and axis.if_index}
+            active_path = observed.get(egress)
+            standby_path = (next((role for role in observed.values() if role != active_path), None)
+                            if active_path is not None else None)
         tick = getattr(self, "dual_path_tick", None)
         verify_roles = tuple(getattr(tick, "verify_roles", ()) or ()) if tick is not None else ()
         uu_request = getattr(tick, "uu_request", None) if tick is not None else None
@@ -1456,6 +1466,7 @@ class TrayApp:
             monitor_label=str(worker.get("label") or ""),
             monitor_alive=bool(worker.get("alive")),
             paused=bool(self.config.get("paused")),
+            observation_note=observation_note,
             recovery_event=recovery_event, verify_roles=verify_roles,
             uu_enabled=uu_enabled, uu_last_ok=uu_last_ok,
             uu_pending=uu_request is not None, events=events,
@@ -3005,10 +3016,12 @@ class TrayApp:
         if next_probe and now < next_probe:
             return next_probe
         try:
-            online, _ = internet_ok(self.session)
+            online, detail = internet_ok(self.session)
+            self._last_system_probe = (online, detail)
         except Exception as exc:
             self.log.warning("探测异常: %s", type(exc).__name__)
             online = False
+            self._last_system_probe = None
         # V0.3 P6：把本轮只读观测喂给故障切换状态机（默认仅监测，零动作）。
         self._failover_tick(now, online)
         if online:

@@ -433,6 +433,35 @@ def test_ui52_tray_ui_state_works_without_a_tk_root(monkeypatch):
     assert isinstance(app.ui_state_lines(), list)
 
 
+def test_tray_waiting_for_observation_does_not_claim_offline_or_a_completed_route(monkeypatch):
+    app = _make_app(monkeypatch)
+    app.failover_status = FailoverStatus(state=FailoverState.ETHERNET_PRIMARY,
+                                         primary="ethernet", backup="wifi")
+    app.last_observation = ObservationResult(reason="COLLECT_TIMEOUT")
+
+    state = app.ui_state(now=100.0)
+
+    assert state.overall == ui.OVERALL_UNKNOWN
+    assert "超时" in state.headline
+    assert state.active_path is None
+    steps = {step.key: step.status for step in state.pipeline}
+    assert steps["detect"] == ui.STEP_PENDING
+    assert steps["route"] == ui.STEP_PENDING
+
+
+def test_tray_shows_observed_wifi_egress_in_monitor_mode(monkeypatch):
+    app = _make_app(monkeypatch)
+    app.last_observation = ObservationResult(snapshot=snapshot(D, H, WIFI_IF), trusted=True)
+    app.failover_status = FailoverStatus(state=FailoverState.ETHERNET_PRIMARY,
+                                         primary="ethernet", backup="wifi")
+
+    state = app.ui_state(now=100.0)
+
+    assert state.active_path == "wifi"
+    assert state.standby_path == "ethernet"
+    assert next(step for step in state.pipeline if step.key == "route").detail == "当前出口：Wi-Fi"
+
+
 def test_ui53_status_changes_do_not_block_or_raise(monkeypatch):
     """状态在两次取样之间变化：映射如实反映，且不抛错、不阻塞。"""
     app = _make_app(monkeypatch)
