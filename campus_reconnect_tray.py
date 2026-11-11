@@ -49,6 +49,7 @@ import time
 import tkinter as tk
 import traceback
 import uuid
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -65,7 +66,8 @@ from PIL import Image, ImageDraw
 from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
                          CredentialClear, CredentialLoad, CredentialSave,
                          ProxyApplyResult, RepairAdapters, RepairOptions,
-                         TimerTable, repair_service, load_config_text)
+                         TimerTable, __version__, repair_service,
+                         load_config_text)
 import campus_reconnect as engine
 from campus_reconnect import (direct_session, edge_fallback,
                               ensure_single_instance, get_credentials,
@@ -94,6 +96,9 @@ from campus_uu_recovery import (confirm_back as uu_confirm_back,
                                 tier2_processes as uu_tier2_processes)
 from campus_wifi_bringup import (build_snnu_open_profile_xml,
                                  run_bringup as wifi_run_bringup)
+from campus_update import (UPDATE_CHECK_INTERVAL_S,
+                           UPDATE_FIRST_CHECK_DELAY_S, check_latest,
+                           is_newer, should_notify)
 
 # ---- V0.6：CustomTkinter 界面（缺失时回退原生 ttk，仍能启动）----
 try:
@@ -208,6 +213,10 @@ DEFAULT_CONFIG = {
     "v06_auto_prompted": False,    # 是否已弹过一次智能自动确认
     "clash_heal_enabled": True,    # Clash 假死自愈（开关代理 / 重启 Verge）
     "uu_escalation_enabled": True,  # UU Tier1 满 60s 未恢复则升 Tier2
+    # ---- V0.6.2：自动更新提醒（只提醒，不下载、不安装）----
+    "update_check_enabled": True,  # 启动 60 秒后首次检查，之后每 6 小时
+    "update_notified_tag": None,   # 气泡已弹过的版本 tag（同一版本只弹一次）
+    "update_dismissed_tag": None,  # 用户点过“以后再说 / 下载更新”的版本 tag
 }
 CONFIG_KEYS = tuple(DEFAULT_CONFIG)
 
@@ -401,6 +410,26 @@ def _read_v06_keys(text: str) -> dict:
             "uu_escalation_enabled": esc}
 
 
+def _read_update_keys(text: str) -> dict:
+    """读取 V0.6.2 更新提醒三键（非法值一律回退安全默认）。
+
+    开关非法 → 默认开启检查；tag 非字符串 / 空串 → None（未提醒过）。
+    """
+    raw = _raw_config(text)
+    enabled = raw.get("update_check_enabled")
+    if not isinstance(enabled, bool):
+        enabled = DEFAULT_CONFIG["update_check_enabled"]
+
+    def _tag(value):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    return {"update_check_enabled": enabled,
+            "update_notified_tag": _tag(raw.get("update_notified_tag")),
+            "update_dismissed_tag": _tag(raw.get("update_dismissed_tag"))}
+
+
 def should_prompt_auto_switch(cfg: dict) -> bool:
     """V0.6 首次启动是否弹一次智能自动确认（纯函数，可单测）。
 
@@ -462,6 +491,7 @@ def load_config() -> dict:
     cfg.update(_read_snapshot_keys(text))
     cfg.update(_read_remote_app_keys(text))
     cfg.update(_read_v06_keys(text))
+    cfg.update(_read_update_keys(text))
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
@@ -736,6 +766,23 @@ class TrayApp:
         self.last_watchdog = None
 
         self.failover = self._build_failover_bridge()
+
+        # ---- V0.6.2 自动更新提醒（只记状态，不发网络）----
+        #: 最近一次查到的最新 Release（``campus_update.UpdateInfo`` 或 None）。
+        #: 由后台线程写入；仪表盘渲染（1 秒周期）读取后决定横幅是否显示，
+        #: 检查线程本身不直接碰 Tk 控件。
+        self._update_info = None
+        #: 检查线程在途标记（避免一次检查跑两个线程；测试可等待它清零）。
+        self._update_busy = threading.Event()
+        #: 最近一次检查线程（测试用 ``join`` 等它跑完；生产不依赖它）。
+        self._update_thread = None
+        #: 下一次定时检查时刻（monotonic）；启动后 60 秒首次检查。
+        self._update_next_check_at = (time.monotonic()
+                                      + UPDATE_FIRST_CHECK_DELAY_S)
+        #: 注入点：测试可替换为返回假 session 的工厂；默认用专用直连会话。
+        self._update_session_factory = None
+        #: 注入点：测试可替换为记录调用的 opener；默认打开系统浏览器。
+        self._update_opener = webbrowser.open
 
     # ---------- 故障切换桥接（V0.3 P6）----------
     def _build_failover_bridge(self) -> TrayFailoverBridge:
@@ -1638,9 +1685,28 @@ class TrayApp:
         headline.pack(fill="x", pady=(2, 10))
         refs = {"light": light, "overall": overall, "headline": headline}
 
+        # ---- V0.6.2：更新横幅（有新版本且未点过“以后再说”时才显示）----
+        banner = ctk.CTkFrame(outer, corner_radius=12, fg_color="#451a03",
+                              border_color="#d29922", border_width=1)
+        refs["update_banner"] = banner
+        refs["update_banner_visible"] = False
+        banner_label = ctk.CTkLabel(banner, text="",
+                                    text_color="#fcd34d",
+                                    font=ctk.CTkFont(size=13))
+        banner_label.pack(side="left", padx=10, pady=8)
+        refs["update_banner_label"] = banner_label
+        ctk.CTkButton(banner, text="下载更新", width=90,
+                      command=self._on_update_download).pack(
+                          side="right", padx=(4, 10), pady=6)
+        ctk.CTkButton(banner, text="以后再说", width=90,
+                      fg_color="#334155",
+                      command=self._on_update_dismiss).pack(
+                          side="right", padx=4, pady=6)
+
         # ---- E：三环仪表（Canvas 手绘圆环，不引新依赖）----
         gauges = ctk.CTkFrame(outer, fg_color="transparent")
         gauges.pack(fill="x")
+        refs["gauges_frame"] = gauges
         gauge_refs = {}
         for role, title in (("ethernet", "以太网"),
                             ("wifi", "SNNU Wi-Fi"), ("uu", "UU 远程")):
@@ -1839,6 +1905,8 @@ class TrayApp:
         refs["overall"].configure(text=state.overall_label,
                                   text_color=state.overall_color)
         refs["headline"].configure(text=state.headline or "—")
+        # V0.6.2：更新横幅显隐（只在状态变化时改布局）。
+        self._render_update_banner(refs)
         for role in ("ethernet", "wifi"):
             card = state.card(role)
             if card is None:
@@ -2861,6 +2929,8 @@ class TrayApp:
                     if self.stop_event.is_set():
                         break
                     next_probe = self._dispatch(cmd, next_probe)
+                    # V0.6.2：更新检查挂在已有工作循环上，不另起常驻线程。
+                    self._maybe_check_update()
                 except Exception as exc:   # 工作单元整体异常边界（F02）
                     self._report_worker_error("工作单元异常", exc)
                     self._repair_busy.clear()
@@ -3252,6 +3322,181 @@ class TrayApp:
             self.log.warning("智能自动确认保存失败：%s", type(exc).__name__)
         self.log.info("[V0.6] 智能自动确认：%s",
                       "已开启 AUTO" if answer else "保持仅监测")
+
+    # ---------- V0.6.2：自动更新提醒（只提醒，不下载、不安装）----------
+
+    def _maybe_check_update(self, now: float = None) -> None:
+        """工作循环每轮调用：到点才触发一次检查，其余时间直接返回。
+
+        首次检查在启动后 60 秒，之后每 6 小时；开关关闭时只推迟下次
+        检查，不发请求。检查本身走独立短命线程，不阻塞探测循环。
+        """
+        if self.stop_event.is_set():
+            return
+        now = time.monotonic() if now is None else now
+        if now < self._update_next_check_at:
+            return
+        self._update_next_check_at = now + UPDATE_CHECK_INTERVAL_S
+        if not bool(self.config.get("update_check_enabled", True)):
+            return
+        self._check_update_async()
+
+    def _check_update_async(self) -> None:
+        """在独立短命线程里查一次 GitHub 最新 Release（不阻塞工作循环）。
+
+        会话用专用直连会话（不与工作线程共享 Session，避免并发复用
+        连接池；与 :meth:`_verify_online_async` 同一做法）；测试可经
+        ``_update_session_factory`` 注入假 session。结果经
+        :meth:`_on_update_checked` 处理，该方法不直接碰 Tk 控件，
+        横幅由 1 秒渲染周期读取 ``_update_info`` 后决定是否显示。
+        """
+        if self._update_busy.is_set():
+            return
+        self._update_busy.set()
+
+        def _run():
+            try:
+                factory = getattr(self, "_update_session_factory", None)
+                session = factory() if factory is not None else direct_session()
+                info, reason = check_latest(session)
+                self._on_update_checked(info, reason)
+            except Exception as exc:  # noqa: BLE001 - 检查不得影响工作线程
+                self.log.info("[更新] 检查异常：%s", type(exc).__name__)
+            finally:
+                self._update_busy.clear()
+
+        thread = threading.Thread(target=_run, daemon=True,
+                                  name="campus-update")
+        self._update_thread = thread
+        thread.start()
+
+    def _on_update_checked(self, info, reason: str) -> None:
+        """一次检查的结果处理（后台线程调用；不直接碰 Tk）。
+
+        失败 → 只写日志，不弹窗、不报错、不影响主流程。
+        查到新版本 → 记下 ``_update_info``（仪表盘横幅与设置页读取它）；
+        同一版本只弹一次气泡（``update_notified_tag`` 已记在配置里时
+        不再弹）。是否显示横幅另由 ``update_dismissed_tag`` 决定。
+        """
+        if info is None:
+            self.log.info("[更新] 检查失败：%s", reason)
+            return
+        self._update_info = info
+        if not should_notify(info, __version__,
+                             self.config.get("update_notified_tag")):
+            return
+        self.log.info("[更新] 发现新版本 %s（当前 v%s）",
+                      info.tag, __version__)
+        self.notify("发现新版本 %s" % info.tag,
+                    "校园网助手有新版本可用：%s\n"
+                    "点仪表盘顶部的横幅或设置页查看并下载。" % info.name)
+        cfg = self.get_config()
+        cfg["update_notified_tag"] = info.tag
+        try:
+            save_config(cfg)
+        except Exception as exc:  # noqa: BLE001 - 保存失败只记日志
+            self.log.warning("[更新] 已提醒版本保存失败：%s",
+                             type(exc).__name__)
+        self.update_config({"update_notified_tag": info.tag})
+
+    def _update_mark_dismissed(self, tag: str) -> None:
+        """用户点过“以后再说 / 下载更新”：记下该版本，横幅不再出现。"""
+        cfg = self.get_config()
+        cfg["update_dismissed_tag"] = tag
+        try:
+            save_config(cfg)
+        except Exception as exc:  # noqa: BLE001 - 保存失败只记日志
+            self.log.warning("[更新] 已处理版本保存失败：%s",
+                             type(exc).__name__)
+        self.update_config({"update_dismissed_tag": tag})
+
+    def _update_banner_should_show(self) -> bool:
+        """仪表盘更新横幅是否显示：有新版本，且用户没点过“以后再说”。"""
+        info = getattr(self, "_update_info", None)
+        if info is None:
+            return False
+        if not is_newer(info.tag, __version__):
+            return False
+        return info.tag != (self.config.get("update_dismissed_tag") or "")
+
+    def _on_update_download(self) -> None:
+        """横幅“下载更新”：打开浏览器到 Release 页面，不下载、不安装。"""
+        info = getattr(self, "_update_info", None)
+        url = info.html_url if info is not None else (
+            "https://github.com/lcq666666/"
+            "SNNU-school-network-reconnect-auto/releases")
+        try:
+            self._update_opener(url)
+        except Exception as exc:  # noqa: BLE001 - 打开浏览器失败只记日志
+            self.log.warning("[更新] 打开下载页面失败：%s",
+                             type(exc).__name__)
+            return
+        if info is not None:
+            self._update_mark_dismissed(info.tag)
+            self._hide_update_banner()
+
+    def _on_update_dismiss(self) -> None:
+        """横幅“以后再说”：记下该版本，本次运行及以后启动都不再显示横幅。"""
+        info = getattr(self, "_update_info", None)
+        if info is not None:
+            self._update_mark_dismissed(info.tag)
+        self._hide_update_banner()
+
+    def _hide_update_banner(self) -> None:
+        """立即收起仪表盘横幅（按钮在 UI 线程调用，可直接碰 Tk）。"""
+        refs = getattr(self, "_dash_ctk_widgets", None)
+        if refs is None:
+            return
+        banner = refs.get("update_banner")
+        if banner is not None:
+            try:
+                banner.pack_forget()
+            except Exception:
+                pass
+        refs["update_banner_visible"] = False
+
+    def _render_update_banner(self, refs) -> None:
+        """按 1 秒渲染周期同步横幅显隐（只在状态变化时改布局）。"""
+        banner = refs.get("update_banner")
+        if banner is None:
+            return
+        show = self._update_banner_should_show()
+        if show == refs.get("update_banner_visible"):
+            return
+        refs["update_banner_visible"] = show
+        if show:
+            info = self._update_info
+            refs["update_banner_label"].configure(
+                text="发现新版本 %s（当前 v%s）— 只提醒，不自动下载安装"
+                     % (info.tag, __version__))
+            anchor = refs.get("gauges_frame")
+            if anchor is not None:
+                banner.pack(fill="x", pady=(0, 10), before=anchor)
+            else:
+                banner.pack(fill="x", pady=(0, 10))
+        else:
+            banner.pack_forget()
+
+    def _update_status_text(self) -> str:
+        """设置页“更新”区文案：当前版本与最新版本（只显示，不下载）。"""
+        info = getattr(self, "_update_info", None)
+        if info is None:
+            latest = "最新版本：尚未检查到（启动 60 秒后首次检查；失败只记日志）"
+        elif is_newer(info.tag, __version__):
+            latest = "最新版本：%s（有更新可用）" % info.tag
+        else:
+            latest = "最新版本：%s（已是最新）" % info.tag
+        return "当前版本：v%s · %s" % (__version__, latest)
+
+    def on_check_update_now(self, icon=None, item=None):
+        """设置页“立即检查更新”：跳过定时，马上查一次（开关关闭时也可用）。
+
+        手动检查不绕过去重逻辑：同一版本已弹过气泡的不再重复弹，
+        横幅是否显示仍按 ``update_dismissed_tag`` 决定。
+        """
+        self._update_next_check_at = (time.monotonic()
+                                      + UPDATE_CHECK_INTERVAL_S)
+        self._check_update_async()
 
     def _offline_detail(self) -> str:
         """达到失败阈值后的说明（按模式如实区分，不谎称"正在重连"）。"""
@@ -3726,6 +3971,9 @@ class TrayApp:
         v_interval = tk.IntVar(value=self._int_or(self.config.get("interval"), 15))
         v_thr = tk.IntVar(value=self._int_or(self.config.get("threshold"), 3))
         v_cd = tk.IntVar(value=self._int_or(self.config.get("cooldown"), 180))
+        # V0.6.2：自动更新提醒开关（默认开启；只提醒，不下载、不安装）。
+        v_update = tk.BooleanVar(
+            value=bool(self.config.get("update_check_enabled", True)))
 
         # ---- 页 1：基本 ----
         basic = page("基本")
@@ -3855,6 +4103,20 @@ class TrayApp:
                        row=8, column=0, columnspan=2, sticky="w")
         ttk.Button(diag, text="打开日志", command=self.on_open_log).grid(
             row=9, column=0, columnspan=2, sticky="w")
+        # V0.6.2：软件更新（只显示版本，不下载、不安装）。
+        ttk.Separator(diag, orient="horizontal").grid(
+            row=10, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(diag, text="软件更新", font=("Microsoft YaHei", 10, "bold")).grid(
+            row=11, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(
+            diag, text="自动检查更新（启动 60 秒后首次检查，之后每 6 小时）",
+            variable=v_update).grid(row=12, column=0, columnspan=2, sticky="w")
+        ttk.Label(diag, text=self._update_status_text(), justify="left",
+                  foreground="#8b949e", wraplength=520).grid(
+                      row=13, column=0, columnspan=2, sticky="w")
+        ttk.Button(diag, text="立即检查更新",
+                   command=self.on_check_update_now).grid(
+                       row=14, column=0, columnspan=2, sticky="w")
 
         # 面板打开时的原始值：保存时**只提交用户实际变更的项**（F12/T24）。
         initial = {
@@ -3880,6 +4142,8 @@ class TrayApp:
             "snapshot_max_age": self._int_or(self.config.get("snapshot_max_age"), 8),
             "snapshot_timeout": self._int_or(self.config.get("snapshot_timeout"), 12),
             "snapshot_interval": self._int_or(self.config.get("snapshot_interval"), 3),
+            "update_check_enabled": bool(
+                self.config.get("update_check_enabled", True)),
         }
 
         def on_save():
@@ -3955,6 +4219,9 @@ class TrayApp:
                 changes["snapshot_timeout"] = snap_timeout
             if snap_interval != initial["snapshot_interval"]:
                 changes["snapshot_interval"] = snap_interval
+            # V0.6.2：自动更新提醒开关。
+            if bool(v_update.get()) != initial["update_check_enabled"]:
+                changes["update_check_enabled"] = bool(v_update.get())
 
             if changes:
                 new_cfg = self.get_config()
