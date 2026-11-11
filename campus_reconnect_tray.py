@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import tempfile
 import threading
@@ -55,7 +56,10 @@ from typing import List, Optional
 
 import keyring
 import pystray
-import winreg
+try:
+    import winreg
+except ImportError:  # Linux 离线测试：winreg 只在 Windows 存在
+    winreg = None  # type: ignore[assignment]
 from PIL import Image, ImageDraw
 
 from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
@@ -78,6 +82,30 @@ from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
 from campus_remote import (MonitorWatchdog, RemoteSafetyGuard,
                            apply_watchdog_decision, build_windows_remote_ops)
 from campus_timeline import NetworkTimeline
+from campus_clash_health import (assess_dual_axis, check_endpoint,
+                                 clamp_cooldown as _clamp_cooldown,
+                                 clamp_interval as _clamp_interval,
+                                 clamp_threshold as _clamp_threshold,
+                                 heal_plan, probe_via_proxy)
+from campus_uu_recovery import (confirm_back as uu_confirm_back,
+                                decide as uu_decide,
+                                diagnose_snapshot as uu_diagnose,
+                                should_escalate as uu_should_escalate,
+                                tier2_processes as uu_tier2_processes)
+from campus_wifi_bringup import (build_snnu_open_profile_xml,
+                                 run_bringup as wifi_run_bringup)
+
+# ---- V0.6：CustomTkinter 界面（缺失时回退原生 ttk，仍能启动）----
+try:
+    import customtkinter as ctk
+except Exception:  # noqa: BLE001 - 无 CustomTkinter 即回退 ttk
+    ctk = None  # type: ignore[assignment]
+
+
+def ui_backend() -> str:
+    """当前可用的仪表盘后端：``customtkinter`` 或 ``ttk``（回退）。"""
+    return "customtkinter" if ctk is not None else "ttk"
+
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
@@ -120,9 +148,9 @@ DEFAULT_CONFIG = {
     "interface": None,
     "yys": "mobile",
     "account_format": "plain",
-    "interval": 15,
-    "threshold": 3,
-    "cooldown": 180,
+    "interval": 5,
+    "threshold": 2,
+    "cooldown": 60,
     "browser_fallback": True,
     "clash_auto_proxy": None,   # None=尚未询问; True=同意联动; False=拒绝
     "proxy_endpoint": None,     # 用户显式确认的代理端点
@@ -143,6 +171,10 @@ DEFAULT_CONFIG = {
     "snapshot_max_age": 8,            # 快照有效期（秒）；依据见 campus_tray_observer
     "snapshot_timeout": 12,           # 单次采集超时（秒）
     "snapshot_interval": 3,           # 两次采集最小间隔（秒）
+    # ---- V0.6：自动切换确认 / Clash 自愈 / UU 升级 ----
+    "v06_auto_prompted": False,    # 是否已弹过一次智能自动确认
+    "clash_heal_enabled": True,    # Clash 假死自愈（开关代理 / 重启 Verge）
+    "uu_escalation_enabled": True,  # UU Tier1 满 60s 未恢复则升 Tier2
 }
 CONFIG_KEYS = tuple(DEFAULT_CONFIG)
 
@@ -320,6 +352,49 @@ def _read_remote_app_keys(text: str) -> dict:
             "remote_restart_cooldown": max(60, min(3600, int(cooldown)))}
 
 
+def _read_v06_keys(text: str) -> dict:
+    """读取 V0.6 三键（非法值一律回退安全默认）。"""
+    raw = _raw_config(text)
+    prompted = raw.get("v06_auto_prompted")
+    if not isinstance(prompted, bool):
+        prompted = DEFAULT_CONFIG["v06_auto_prompted"]
+    heal = raw.get("clash_heal_enabled")
+    if not isinstance(heal, bool):
+        heal = DEFAULT_CONFIG["clash_heal_enabled"]
+    esc = raw.get("uu_escalation_enabled")
+    if not isinstance(esc, bool):
+        esc = DEFAULT_CONFIG["uu_escalation_enabled"]
+    return {"v06_auto_prompted": prompted, "clash_heal_enabled": heal,
+            "uu_escalation_enabled": esc}
+
+
+def should_prompt_auto_switch(cfg: dict) -> bool:
+    """V0.6 首次启动是否弹一次智能自动确认（纯函数，可单测）。
+
+    只在「从未问过 + 当前仍是仅监测 + 未授权」时弹一次；已问过、已是
+    AUTO、已授权、手动锁定，一律不再弹。
+    """
+    if not isinstance(cfg, dict):
+        return False
+    return (not bool(cfg.get("v06_auto_prompted"))
+            and cfg.get("failover_mode", "MONITOR") == "MONITOR"
+            and not bool(cfg.get("auto_switch_authorized")))
+
+
+def apply_auto_switch_consent(cfg: dict, agreed: bool) -> dict:
+    """把一次智能自动确认的结果写进配置副本（纯函数，不写盘）。
+
+    同意 ⇒ ``failover_mode=AUTO`` + ``auto_switch_authorized=True``；
+    拒绝 ⇒ 保持 MONITOR，但记 ``v06_auto_prompted=True``，下次不再弹。
+    """
+    out = dict(cfg or {})
+    out["v06_auto_prompted"] = True
+    if agreed:
+        out["failover_mode"] = "AUTO"
+        out["auto_switch_authorized"] = True
+    return out
+
+
 def config_to_dict(config) -> dict:
     """把 :class:`campus_core.Config` 转成托盘内部 dict。"""
     return {
@@ -353,6 +428,7 @@ def load_config() -> dict:
     cfg.update(_read_remote_keys(text))
     cfg.update(_read_snapshot_keys(text))
     cfg.update(_read_remote_app_keys(text))
+    cfg.update(_read_v06_keys(text))
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
@@ -949,6 +1025,31 @@ class TrayApp:
             self.log.info("[恢复] 已满足恢复条件，但 UU 自动恢复未开启"
                           "（remote_restart_enabled=False）：不清退")
             return
+        # V0.6：恢复事件触发条件（断网再恢复 + 恢复前 UU 在运行 + 验证通过）。
+        _was = getattr(self, "_v06_uu_was_running", None)
+        if _was is None:
+            try:
+                from campus_remote_app import discover as _discover
+
+                _was = bool(_discover(self._get_remote_app_ops()).user_processes)
+            except Exception:
+                _was = False
+        try:
+            _cooldown_ok, _ = self._get_restart_guard().allow()
+        except Exception:
+            _cooldown_ok = True
+        _decision = uu_decide(
+            had_outage=bool(getattr(self, "_v06_had_outage", True)),
+            was_running_before_outage=bool(_was),
+            verified_recovery=True,
+            remote_restart_enabled=True,
+            cooldown_ok=bool(_cooldown_ok),
+            epoch_already_restarted=self._uu_recovery_ledger().seen(
+                request.network_epoch))
+        if not _decision.should_restart:
+            self.log.info("[UU V0.6] 不重启：%s", _decision.reason)
+            return
+        self._v06_had_outage = False  # 本次断网事件已消费
         self._uu_recovery_async(request, verification)
 
     def _uu_recovery_async(self, request, verification):
@@ -976,6 +1077,12 @@ class TrayApp:
                 from campus_remote_app import restart_after_verified_recovery
 
                 self._timeline_uu_started(request)
+                try:
+                    from campus_remote_app import discover as _discover2
+
+                    _status_before = _discover2(ops)
+                except Exception:
+                    _status_before = None
                 outcome = restart_after_verified_recovery(
                     ops, active_path=request.active_path,
                     network_epoch=request.network_epoch, verification=verification,
@@ -994,6 +1101,9 @@ class TrayApp:
                 self._timeline_uu_outcome(outcome)
                 controller.note_uu_outcome(bool(outcome.restarted),
                                            detail=outcome.detail)
+                if outcome.restarted and not outcome.alive \
+                        and _status_before is not None:
+                    self._schedule_uu_tier2_check(ops, _status_before)
             except Exception as exc:       # 清退不得影响监测主流程（防御性边界）
                 self.log.warning("[恢复] UU 远程恢复异常：%s", type(exc).__name__)
                 controller.note_uu_outcome(
@@ -1006,6 +1116,36 @@ class TrayApp:
 
         threading.Thread(target=_run, daemon=True,
                          name="campus-uu-recovery").start()
+
+    def _schedule_uu_tier2_check(self, ops, status) -> None:
+        """Tier1 重启后 60 秒再确认一次，未回来则升 Tier2（同一事件升级）。"""
+        if not bool(self.config.get("uu_escalation_enabled", True)):
+            return
+
+        def _check():
+            try:
+                from campus_remote_app import discover as _discover3
+
+                after = _discover3(ops)
+                names = {proc.name for proc in after.user_processes}
+                try:
+                    _ok, _detail = engine.internet_ok(engine.direct_session())
+                except Exception:
+                    _ok = False
+                confirmed = uu_confirm_back(
+                    names, {proc.name for proc in status.user_processes}, bool(_ok))
+                decision = uu_should_escalate(confirmed, 60.0, confirmed)
+                if not decision.escalate:
+                    self.log.info("[UU] %s", decision.reason)
+                    return
+                self.log.warning("[UU] %s", decision.reason)
+                self._uu_tier2_restart(ops, status)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("[UU] Tier2 检查异常：%s", type(exc).__name__)
+
+        timer = threading.Timer(60.0, _check)
+        timer.daemon = True
+        timer.start()
 
     def _uu_recovery_ledger(self):
         """UU 恢复的**世代去重**台账（进程内；与冷却守卫正交，方案 §31）。"""
@@ -1288,6 +1428,12 @@ class TrayApp:
         """构建主窗口仪表盘（顶部状态灯 + 双网卡卡片 + 恢复流水线 + 操作按钮）。"""
         if self.root is None:
             return
+        if ui_backend() == "customtkinter":
+            try:
+                return self._open_dashboard_ctk()
+            except Exception as exc:  # noqa: BLE001 - 回退原生 ttk
+                self.log.warning("CustomTkinter 仪表盘打开失败，回退 ttk：%s",
+                                 type(exc).__name__)
         win = self.dashboard_win
         if win is not None:
             try:
@@ -1407,10 +1553,208 @@ class TrayApp:
         self._dash_widgets = refs
         self._refresh_dashboard()
 
+    def _open_dashboard_ctk(self):
+        """V0.6 CustomTkinter 深色仪表盘（失败时由调用方回退 ttk）。"""
+        if self.root is None:
+            return
+        win = self.dashboard_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+                    win.lift()
+                    win.focus_force()
+                    return
+            except Exception:
+                pass
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        from campus_ui_state import CARD_ROWS, PIPELINE_LABELS
+
+        win = ctk.CTkToplevel(self.root)
+        self.dashboard_win = win
+        win.title("%s · 双链路监控" % APP_NAME)
+        win.geometry("%dx%d" % (DASHBOARD_WIDTH, DASHBOARD_HEIGHT))
+        win.minsize(DASHBOARD_MIN_WIDTH, DASHBOARD_MIN_HEIGHT)
+        win.protocol("WM_DELETE_WINDOW", self._close_dashboard)
+        outer = ctk.CTkFrame(win, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=12, pady=12)
+        header = ctk.CTkFrame(outer, fg_color="transparent")
+        header.pack(fill="x")
+        ctk.CTkLabel(header, text=APP_NAME,
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(
+                         side="left")
+        light = ctk.CTkLabel(header, text="●", font=ctk.CTkFont(size=20),
+                             text_color="#3fb950")
+        light.pack(side="right", padx=(8, 2))
+        overall = ctk.CTkLabel(header, text="未知",
+                               font=ctk.CTkFont(size=15, weight="bold"))
+        overall.pack(side="right")
+        headline = ctk.CTkLabel(outer, text="正在读取状态…",
+                                text_color="#94a3b8")
+        headline.pack(fill="x", pady=(2, 8))
+        cards = ctk.CTkFrame(outer, fg_color="transparent")
+        cards.pack(fill="x")
+        refs = {"light": light, "overall": overall, "headline": headline}
+        for role in ("ethernet", "wifi"):
+            frame = ctk.CTkFrame(cards, corner_radius=12,
+                                 fg_color="#1e293b")
+            frame.pack(side="left", fill="both", expand=True,
+                       padx=(0, 6) if role == "ethernet" else (6, 0))
+            title = "以太网" if role == "ethernet" else "SNNU Wi-Fi"
+            ctk.CTkLabel(frame, text=title,
+                         font=ctk.CTkFont(size=14, weight="bold")).pack(
+                             anchor="w", padx=10, pady=(8, 2))
+            rows = {}
+            for label in CARD_ROWS:
+                row = ctk.CTkFrame(frame, fg_color="transparent")
+                row.pack(fill="x", padx=10)
+                ctk.CTkLabel(row, text=label, text_color="#94a3b8",
+                             width=70).pack(side="left")
+                var = ctk.CTkLabel(row, text="—")
+                var.pack(side="left")
+                rows[label] = var
+            refs[role] = rows
+        pipe = ctk.CTkFrame(outer, corner_radius=12, fg_color="#1e293b")
+        pipe.pack(fill="x", pady=(10, 0))
+        ctk.CTkLabel(pipe, text="恢复流水线",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+                         anchor="w", padx=10, pady=(8, 2))
+        steps_frame = ctk.CTkFrame(pipe, fg_color="transparent")
+        steps_frame.pack(fill="x", padx=10)
+        step_widgets = {}
+        for key, label in PIPELINE_LABELS:
+            cell = ctk.CTkFrame(steps_frame, fg_color="transparent")
+            cell.pack(side="left", fill="x", expand=True)
+            w = ctk.CTkLabel(cell, text="%s\n—" % label)
+            w.pack()
+            step_widgets[key] = w
+        progress = ctk.CTkProgressBar(pipe, height=8)
+        progress.pack(fill="x", padx=10, pady=(4, 8))
+        progress.set(0.0)
+        refs["steps"] = step_widgets
+        refs["progress"] = progress
+        uu = ctk.CTkLabel(outer, text="UU 远程自动恢复：—")
+        uu.pack(anchor="w", pady=(8, 0))
+        monitor = ctk.CTkLabel(outer, text="监测：—", text_color="#94a3b8")
+        monitor.pack(anchor="w")
+        timeline = ctk.CTkLabel(outer, text="尚无网络故障事件记录",
+                                text_color="#94a3b8", wraplength=820,
+                                justify="left")
+        timeline.pack(anchor="w")
+        manual = ctk.CTkLabel(outer, text="—", text_color="#94a3b8",
+                              wraplength=820, justify="left")
+        manual.pack(anchor="w")
+        refs["uu"] = uu
+        refs["monitor"] = monitor
+        refs["timeline"] = timeline
+        refs["manual"] = manual
+        chart = tk.Canvas(outer, height=64, bg="#0f172a",
+                          highlightthickness=0)
+        chart.pack(fill="x", pady=(8, 0))
+        refs["chart"] = chart
+        refs["history"] = []
+        refs["pulse"] = 0
+        buttons = ctk.CTkFrame(outer, fg_color="transparent")
+        buttons.pack(fill="x", pady=(12, 0))
+        for text, cmd in (
+                ("立即检测", self.on_detect_now),
+                ("立即验证以太网", lambda: self.on_verify_now("ethernet")),
+                ("立即验证 SNNU Wi-Fi", lambda: self.on_verify_now("wifi")),
+                ("手动重连", self.on_reconnect),
+                ("重启 UU Remote", self.on_restart_uu_remote),
+                ("设置", self.on_settings),
+                ("打开日志", self.on_open_log),
+                ("关闭", self._close_dashboard)):
+            ctk.CTkButton(buttons, text=text, command=cmd,
+                          width=96).pack(side="left", padx=3)
+        self._dash_ctk_widgets = refs
+        self._dash_widgets = None
+        self._refresh_dashboard()
+
+    def _render_dashboard_ctk(self, state) -> None:
+        """把 UiState 写进 CustomTkinter 控件（纯赋值，不做网络操作）。"""
+        refs = getattr(self, "_dash_ctk_widgets", None)
+        if refs is None:
+            return
+        refs["light"].configure(text_color=state.overall_color)
+        refs["overall"].configure(
+            text="%s · %s" % (state.overall_label, state.overall),
+            text_color=state.overall_color)
+        refs["headline"].configure(text=state.headline or "—")
+        for role in ("ethernet", "wifi"):
+            card = state.card(role)
+            if card is None:
+                continue
+            for label, var in (refs.get(role) or {}).items():
+                var.configure(text=card.field(label))
+        done = 0
+        for step in state.pipeline:
+            widget = (refs.get("steps") or {}).get(step.key)
+            if widget is not None:
+                widget.configure(text=step.display, text_color=step.color)
+            if step.status == "done":
+                done += 1
+        refs["progress"].set(done / 6.0 if state.pipeline else 0.0)
+        refs["uu"].configure(
+            text="UU 远程自动恢复：%s%s" % (
+                state.uu.label,
+                ("（%s）" % state.uu.detail) if state.uu.detail else ""))
+        notes = [state.monitor_label or "监测状态未知"]
+        if state.network_epoch:
+            notes.append("epoch=%d" % state.network_epoch)
+        if state.mode_label:
+            notes.append("模式：%s" % state.mode_label)
+        refs["monitor"].configure(text=" · ".join(notes))
+        timeline = self.timeline_status_lines(limit=3)
+        refs["timeline"].configure(
+            text="\n".join(timeline) if timeline else "尚无网络故障事件记录")
+        manual = []
+        for role in ("ethernet", "wifi"):
+            card = state.card(role)
+            if card is not None and card.manual:
+                manual.extend(card.manual)
+        refs["manual"].configure(text="\n".join(manual) if manual else "—")
+        history = refs["history"]
+        history.append((time.time(), state.overall))
+        refs["history"] = [h for h in history if h[0] > time.time() - 3600]
+        self._draw_history_chart(refs["chart"], refs["history"])
+        refs["pulse"] = refs.get("pulse", 0) + 1
+        if state.overall in ("RECOVERING", "DEGRADED"):
+            refs["light"].configure(
+                text_color="#facc15" if refs["pulse"] % 2 else state.overall_color)
+
+    def _draw_history_chart(self, canvas, history) -> None:
+        """最近一小时双链路状态图（Canvas 手绘，不引入新依赖）。"""
+        try:
+            canvas.delete("all")
+            width = int(canvas.winfo_width() or 820)
+            height = int(canvas.winfo_height() or 64)
+            colors = {"HEALTHY": "#3fb950", "DEGRADED": "#d29922",
+                      "RECOVERING": "#58a6ff", "OFFLINE": "#f85149",
+                      "PAUSED": "#8b949e", "UNKNOWN": "#6e7681"}
+            if not history:
+                canvas.create_text(width // 2, height // 2,
+                                   text="最近一小时状态图：暂无数据",
+                                   fill="#94a3b8")
+                return
+            now = time.time()
+            for stamp, overall in history:
+                x = width - max(0.0, (now - stamp)) / 3600.0 * width
+                canvas.create_rectangle(x - 2, 6, x + 2, height - 6,
+                                        fill=colors.get(overall, "#6e7681"),
+                                        outline="")
+            canvas.create_text(4, 8, anchor="w",
+                               text="最近 1 小时：绿正常 / 黄降级 / 蓝恢复中 / 红离线",
+                               fill="#94a3b8")
+        except Exception:
+            pass
+
     def _close_dashboard(self):
         win = self.dashboard_win
         self.dashboard_win = None
         self._dash_widgets = None
+        self._dash_ctk_widgets = None
         refresh = self._dash_refresh_id
         self._dash_refresh_id = None
         if refresh is not None and win is not None:
@@ -1435,6 +1779,17 @@ class TrayApp:
                 return
         except tk.TclError:
             self._close_dashboard()
+            return
+        if getattr(self, "_dash_ctk_widgets", None) is not None:
+            try:
+                self._render_dashboard_ctk(self.ui_state())
+            except Exception:                # 渲染故障不得让托盘崩溃
+                self.log.warning("主界面渲染异常：\n%s", traceback.format_exc())
+            try:
+                self._dash_refresh_id = win.after(
+                    DASHBOARD_REFRESH_MS, self._refresh_dashboard)
+            except tk.TclError:
+                self._dash_refresh_id = None
             return
         try:
             self._render_dashboard(self.ui_state())
@@ -1814,6 +2169,9 @@ class TrayApp:
                 from campus_remote_app import restart_user_app
 
                 result = restart_user_app(ops, guard=guard)
+                # V0.6：Tier1 失败时按 V0.4 行为如实提示、不改状态、不额外清退
+                # （重启命令本身失败时再杀 Server/Healthd 只会让 UU 更死；
+                # 升级只走 60 秒超时确认，见 _schedule_uu_tier2_check）。
                 if result.action == "restart":
                     self.log.info("UU 远程后台已清退重启：%s（%s）",
                                   result.detail, result.launched)
@@ -2117,6 +2475,12 @@ class TrayApp:
             return False, "监测已暂停，未发起认证", 0.0
         if self.session is None:
             self.session = direct_session()
+        try:
+            _ssid, _wstate = engine.wifi_state()
+            if _ssid != cfg.get("ssid", "SNNU"):
+                self._wifi_bringup(cfg.get("ssid", "SNNU"))
+        except Exception:
+            pass
         options = RepairOptions.from_mapping(cfg)
         result = repair_service(
             self.session, options, time.monotonic, self._repair_adapters(),
@@ -2265,24 +2629,24 @@ class TrayApp:
 
     def _interval(self) -> float:
         try:
-            value = int(self.config.get("interval", 15))
+            value = int(self.config.get("interval", 5))
         except (TypeError, ValueError):
-            value = 15
-        return float(max(1, value))
+            value = 5
+        return float(_clamp_interval(value))
 
     def _cooldown(self) -> float:
         try:
-            value = int(self.config.get("cooldown", 180))
+            value = int(self.config.get("cooldown", 60))
         except (TypeError, ValueError):
-            value = 180
-        return float(max(60, value))
+            value = 60
+        return float(_clamp_cooldown(value))
 
     def _threshold(self) -> int:
         try:
-            value = int(self.config.get("threshold", 3))
+            value = int(self.config.get("threshold", 2))
         except (TypeError, ValueError):
-            value = 3
-        return max(1, value)
+            value = 2
+        return _clamp_threshold(value)
 
     def _wait_timeout(self, next_probe: float) -> float:
         if self.config.get("paused") or not next_probe:
@@ -2396,6 +2760,8 @@ class TrayApp:
                 self.set_state("offline", "公网探测失败（%d/%d）"
                                % (self.state["failures"], threshold))
             return self._next_probe_time(now)
+        if not getattr(self, "_v06_had_outage", False):
+            self._note_outage_for_uu()
         # ---- P7.5-1（F75-02）：后台**永不**自动认证 ----
         # 旧实现在此调用 V0.2 的 ``_run_repair()``（Portal POST + Wi-Fi 重连），
         # 于是 MONITOR / LOCKED 下也会出现第二个副作用源。修复后：自动副作用
@@ -2434,6 +2800,7 @@ class TrayApp:
         def _run():
             try:
                 ok, detail = verify_internet(direct_session())
+                self._dual_axis_clash_check(ok)
                 if ok:
                     self.log.info("连接后上网校验通过：%s", detail)
                     # V0.4-3：确认真连通后清退重启 UU 远程后台（默认关闭）
@@ -2449,6 +2816,260 @@ class TrayApp:
                 busy.clear()
 
         threading.Thread(target=_run, daemon=True, name="campus-verify").start()
+
+
+    # ---------- V0.6：双轴 Clash 自愈 / Wi-Fi 自启 / UU 两档 ----------
+    def _note_outage_for_uu(self) -> None:
+        """断网段开始时记一笔：UU 恢复前是否在运行（V0.6 触发条件）。
+
+        只读探测（进程列表），失败时如实记 ``was_running=False``，不抛异常；
+        假死诊断行（PID + TCP 状态）一并记入日志，绝不含凭据。
+        """
+        self._v06_had_outage = True
+        was_running = False
+        try:
+            ops = self._get_remote_app_ops()
+            from campus_remote_app import discover
+
+            status = discover(ops)
+            was_running = bool(status.user_processes)
+            try:
+                rows = uu_diagnose(
+                    [{"pid": p.pid, "name": p.name} for p in status.user_processes],
+                    [])
+                for row in rows:
+                    self.log.info("[UU 诊断] %s", row)
+            except Exception:
+                pass
+        except Exception as exc:
+            self.log.warning("[UU 诊断] 断网时读取 UU 进程失败：%s",
+                             type(exc).__name__)
+        self._v06_uu_was_running = was_running
+        self.log.info("[UU] 断网段开始：UU 恢复前在运行=%s", was_running)
+
+    def _dual_axis_clash_check(self, direct_ok: bool) -> None:
+        """直连轴结果出来后补测代理轴；Clash 假死时按计划自愈。
+
+        只在 ``clash_heal_enabled`` 时动作；任何异常都只记日志，绝不影响
+        监测主流程。代理轴用显式 proxies 的会话（不走环境变量猜测）。
+        """
+        if not bool(self.config.get("clash_heal_enabled", True)):
+            return
+        try:
+            endpoint = self.config.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
+            host, _, port = endpoint.partition(":")
+            session = engine.direct_session()
+            session.proxies.update({
+                "http": "http://%s" % endpoint,
+                "https": "http://%s" % endpoint})
+            proxy_result = probe_via_proxy(session, engine.DEFAULT_PROBES)
+            health = assess_dual_axis(bool(direct_ok), proxy_result)
+            if health.verdict == "healthy":
+                self._clash_heal_attempts = 0
+                return
+            self.log.warning("[Clash] 双轴判定：%s", health.reason)
+            if health.verdict != "clash_fake_dead":
+                return
+            try:
+                endpoint_ok = bool(check_endpoint(
+                    host or "127.0.0.1", int(port or 7897), engine.tcp_probe))
+            except Exception:
+                endpoint_ok = False
+            attempts = int(getattr(self, "_clash_heal_attempts", 0) or 0)
+            plan = heal_plan(health, endpoint_ok, attempts)
+            self.log.warning("[Clash] 自愈计划（第 %d 次）：%s",
+                             attempts, plan.reason)
+            if plan.actions:
+                self._clash_heal_execute(plan)
+                self._clash_heal_attempts = attempts + 1
+                self.notify("Clash 假死自愈",
+                            "本地能上网但 Clash 代理不通，已尝试：%s"
+                            % "、".join(plan.actions))
+        except Exception as exc:  # noqa: BLE001 - 自愈不得影响监测
+            self.log.warning("[Clash] 双轴自愈异常：%s", type(exc).__name__)
+
+    def _clash_heal_execute(self, plan) -> bool:
+        """执行一次 Clash 自愈计划（toggle / restart_verge）。
+
+        注入点 ``_clash_heal_ops``（须有 ``execute(plan) -> bool``）供离线
+        测试替换；真实执行只在 Windows 上做，失败如实记日志、不谎报成功。
+        """
+        ops = getattr(self, "_clash_heal_ops", None)
+        if ops is not None:
+            return bool(ops.execute(plan))
+        if os.name != "nt":
+            self.log.warning("[Clash] 非 Windows：跳过自愈执行 %s", plan.actions)
+            return False
+        ok = True
+        for action in plan.actions:
+            if action == "toggle_system_proxy":
+                endpoint = self.config.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
+                try:
+                    apply_system_proxy(False)
+                    time.sleep(1.0)
+                    result = apply_system_proxy(True, endpoint)
+                    ok = bool(result.ok)
+                    self.log.info("[Clash] 系统代理开关一次：%s",
+                                  "成功" if ok else "失败")
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning("[Clash] 开关系统代理失败：%s",
+                                     type(exc).__name__)
+                    ok = False
+            elif action == "restart_verge":
+                try:
+                    import subprocess
+
+                    subprocess.run(["taskkill", "/f", "/im", "Clash Verge.exe"],
+                                   capture_output=True, timeout=15)
+                    time.sleep(2.0)
+                    started = False
+                    for candidate in ("Clash Verge.exe", "clash-verge.exe"):
+                        path = shutil.which(candidate)
+                        if path:
+                            subprocess.Popen([path],
+                                             stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+                            started = True
+                            break
+                    self.log.info("[Clash] 重启 Verge：%s",
+                                  "已尝试拉起" if started else
+                                  "未找到可执行文件，请手动打开 Verge")
+                    ok = started
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning("[Clash] 重启 Verge 失败：%s",
+                                     type(exc).__name__)
+                    ok = False
+        return ok
+
+    def _wifi_bringup(self, ssid: str):
+        """V0.6 Wi-Fi 自启链：网卡启用 → 射频开 → profile → 连接 → 等 IP。
+
+        只在 Windows 上执行；返回 :class:`BringupResult` 或 ``None``
+        （非 Windows / 异常时返回 None，调用方继续走旧的 ``wifi_reconnect``）。
+        profile XML 先写进临时文件再执行 ``add profile``（模块本身不写文件）。
+        """
+        if os.name != "nt":
+            return None
+        try:
+            import subprocess
+            import tempfile
+
+
+            code, text = engine._run_console(
+                ["netsh", "wlan", "show", "interfaces"])
+            from campus_wifi_bringup import adapter_state_from_netsh_text
+
+            state = adapter_state_from_netsh_text(text, ssid)
+            from campus_wifi_bringup import plan as _plan
+
+            has_profile = False
+            try:
+                _code, _out = engine._run_console(
+                    ["netsh", "wlan", "show", "profiles"])
+                has_profile = ssid in (_out or "")
+            except Exception:
+                has_profile = False
+            bringup_plan = _plan(state, has_profile, ssid)
+
+            class _Ops:
+                def __init__(self, owner):
+                    self.owner = owner
+
+                def run(self, cmd):
+                    cmd = list(cmd)
+                    if "add" in cmd and "profile" in cmd:
+                        xml_path = Path(tempfile.gettempdir()) / ("%s.xml" % ssid)
+                        xml_path.write_text(
+                            build_snnu_open_profile_xml(ssid), encoding="utf-8")
+                        cmd = [c if c != "%s.xml" % ssid else str(xml_path)
+                               for c in cmd]
+                    done = subprocess.run(cmd, capture_output=True,
+                                          timeout=20)
+                    return done.returncode, done.stdout.decode(
+                        "gbk", errors="replace")
+
+                def wait_ip(self):
+                    for _ in range(10):
+                        try:
+                            current, _state = engine.wifi_state()
+                            if current == ssid:
+                                return True
+                        except Exception:
+                            pass
+                        time.sleep(2.0)
+                    return False
+
+            result = wifi_run_bringup(bringup_plan, _Ops(self))
+            self.log.info("[Wi-Fi 自启] %s（步骤：%s）",
+                          result.detail, ",".join(result.steps_done) or "无")
+            return result
+        except Exception as exc:  # noqa: BLE001 - 自启失败不阻断旧路径
+            self.log.warning("[Wi-Fi 自启] 异常：%s", type(exc).__name__)
+            return None
+
+    def _uu_tier2_restart(self, ops, status) -> bool:
+        """UU Tier2 升级清退：Tier1 + GameViewerServer/Healthd 一起清退。
+
+        同一恢复事件的升级，不另计一次、不重置冷却；服务
+        ``GameViewerService`` 永远不动。成功 = Tier2 进程清退后按自启项
+        重启，且 10 秒内确认用户态进程回来。
+        """
+        try:
+            from campus_remote_app import _norm, launch_command
+
+            wanted = {_norm(name) for name in uu_tier2_processes()}
+            present = [p for p in status.user_processes + status.service_processes
+                       if _norm(p.name) in wanted]
+            if not present:
+                self.log.info("[UU Tier2] 无 Tier2 进程在运行，不清退")
+                return False
+            command = launch_command(status)
+            if not command:
+                self.log.warning("[UU Tier2] 未找到重启命令：未做任何改动")
+                return False
+            killed = []
+            for proc in present:
+                if not bool(ops.kill(proc.pid)):
+                    self.log.warning("[UU Tier2] 清退 %s（PID %d）失败，已中止",
+                                     proc.name, proc.pid)
+                    return False
+                killed.append(proc.pid)
+            if not bool(ops.launch(command)):
+                self.log.warning("[UU Tier2] 重启命令执行失败")
+                return False
+            time.sleep(10.0)
+            from campus_remote_app import discover
+
+            after = discover(ops)
+            names = {p.name for p in after.user_processes}
+            ok = uu_confirm_back(names, {p.name for p in status.user_processes},
+                                 True)
+            self.log.info("[UU Tier2] 清退 %d 个进程，确认回来：%s",
+                          len(killed), ok)
+            return bool(ok)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("[UU Tier2] 异常：%s", type(exc).__name__)
+            return False
+
+    def _prompt_auto_switch_once(self) -> None:
+        """V0.6 首次启动弹一次智能自动确认（只弹一次，拒绝也记下）。"""
+        if not should_prompt_auto_switch(self.config):
+            return
+        answer = self._ui_ask(
+            "开启智能自动切换？",
+            "检测到你还在「仅监测」模式：有线坏了不会自动切 Wi-Fi。\n"
+            "同意后，有线故障时自动开 Wi-Fi 连 SNNU，稳定后切回有线。\n"
+            "不同意就保持仅监测，以后可以在设置里再改。")
+        if answer is None:
+            return
+        new_cfg = apply_auto_switch_consent(self.config, bool(answer))
+        self.update_config(new_cfg)
+        try:
+            save_config(new_cfg)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("智能自动确认保存失败：%s", type(exc).__name__)
+        self.log.info("[V0.6] 智能自动确认：%s",
+                      "已开启 AUTO" if answer else "保持仅监测")
 
     def _offline_detail(self) -> str:
         """达到失败阈值后的说明（按模式如实区分，不谎称"正在重连"）。"""
@@ -3212,6 +3833,7 @@ class TrayApp:
                                  self.build_menu())
         threading.Thread(target=self.icon.run, daemon=True).start()
         self._ensure_worker()
+        threading.Timer(5.0, self._prompt_auto_switch_once).start()
         self._startup_timer = threading.Timer(2.0, self._startup_notify)
         self._startup_timer.daemon = True
         self._startup_timer.start()
