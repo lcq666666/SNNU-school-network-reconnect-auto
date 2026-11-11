@@ -107,6 +107,39 @@ def ui_backend() -> str:
     return "customtkinter" if ctk is not None else "ttk"
 
 
+# ---- V0.6.1 A+D+E 融合仪表盘：仪表数值映射（纯函数，不碰 Tk）----
+#
+# 诚实规则：仪表环上的百分比**不是实测速率**，只是把 UiState 已有的状态结论
+# 映射成弧长（已验证≈95%、降级≈50%、失败≈15%、无数据不画弧、不猜）。
+# 环中央显示状态词（"已验证"/"未连接"/"未验证"）为主，百分比只作辅助，
+# 仪表下方另有一行小字注明"状态映射，非实测速率"。
+def gauge_from_card(card) -> "tuple[float, str] | None":
+    """网卡卡片 →（弧长比例，中央状态词）；无数据返回 ``None``（不猜）。"""
+    if card is None:
+        return None
+    if card.verified is True:
+        return (0.95, "已验证")
+    if card.verified is None:
+        return None
+    # verified is False：按色调分档，中央写卡片自己的状态词
+    if card.tone == "bad":
+        return (0.15, card.state_label or "未通过")
+    if card.tone == "warn":
+        return (0.5, card.state_label or "降级")
+    return None
+
+
+def gauge_from_uu(uu) -> "tuple[float, str] | None":
+    """UU 视图 →（弧长比例，中央状态词）；未开启返回 ``None``（不猜）。"""
+    if uu is None or not uu.enabled:
+        return None
+    if uu.last_ok is True:
+        return (0.95, "就绪")
+    if uu.last_ok is False:
+        return (0.2, "异常")
+    return (0.5, "待确认")
+
+
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
 else:
@@ -1554,7 +1587,13 @@ class TrayApp:
         self._refresh_dashboard()
 
     def _open_dashboard_ctk(self):
-        """V0.6 CustomTkinter 深色仪表盘（失败时由调用方回退 ttk）。"""
+        """V0.6.1 A+D+E 融合仪表盘（失败时由调用方回退 ttk）。
+
+        布局（上 → 下）：A 大状态区 → E 三环仪表 → 恢复流水线 →
+        详情折叠（双网卡 10 行卡片，默认收起）→ D 历史时间线 →
+        UU 行 / 监测行 / 手动验证行 → 最近一小时状态图 → 8 个操作按钮。
+        内容区用 CTkScrollableFrame，窗口小也不挤；ttk 回退路径不动。
+        """
         if self.root is None:
             return
         win = self.dashboard_win
@@ -1577,44 +1616,54 @@ class TrayApp:
         win.geometry("%dx%d" % (DASHBOARD_WIDTH, DASHBOARD_HEIGHT))
         win.minsize(DASHBOARD_MIN_WIDTH, DASHBOARD_MIN_HEIGHT)
         win.protocol("WM_DELETE_WINDOW", self._close_dashboard)
-        outer = ctk.CTkFrame(win, fg_color="transparent")
+        scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        outer = ctk.CTkFrame(scroll, fg_color="transparent")
         outer.pack(fill="both", expand=True, padx=12, pady=12)
-        header = ctk.CTkFrame(outer, fg_color="transparent")
-        header.pack(fill="x")
-        ctk.CTkLabel(header, text=APP_NAME,
-                     font=ctk.CTkFont(size=18, weight="bold")).pack(
-                         side="left")
-        light = ctk.CTkLabel(header, text="●", font=ctk.CTkFont(size=20),
+
+        # ---- A：顶部大状态区（一眼只看好坏）----
+        hero = ctk.CTkFrame(outer, fg_color="transparent")
+        hero.pack(fill="x")
+        light = ctk.CTkLabel(hero, text="●", font=ctk.CTkFont(size=30),
                              text_color="#3fb950")
-        light.pack(side="right", padx=(8, 2))
-        overall = ctk.CTkLabel(header, text="未知",
-                               font=ctk.CTkFont(size=15, weight="bold"))
-        overall.pack(side="right")
+        light.pack(side="left", padx=(0, 10))
+        overall = ctk.CTkLabel(hero, text="未知",
+                               font=ctk.CTkFont(size=30, weight="bold"))
+        overall.pack(side="left")
+        ctk.CTkLabel(hero, text=APP_NAME, text_color="#94a3b8").pack(
+            side="right")
         headline = ctk.CTkLabel(outer, text="正在读取状态…",
-                                text_color="#94a3b8")
-        headline.pack(fill="x", pady=(2, 8))
-        cards = ctk.CTkFrame(outer, fg_color="transparent")
-        cards.pack(fill="x")
+                                text_color="#94a3b8",
+                                font=ctk.CTkFont(size=13))
+        headline.pack(fill="x", pady=(2, 10))
         refs = {"light": light, "overall": overall, "headline": headline}
-        for role in ("ethernet", "wifi"):
-            frame = ctk.CTkFrame(cards, corner_radius=12,
+
+        # ---- E：三环仪表（Canvas 手绘圆环，不引新依赖）----
+        gauges = ctk.CTkFrame(outer, fg_color="transparent")
+        gauges.pack(fill="x")
+        gauge_refs = {}
+        for role, title in (("ethernet", "以太网"),
+                            ("wifi", "SNNU Wi-Fi"), ("uu", "UU 远程")):
+            frame = ctk.CTkFrame(gauges, corner_radius=12,
                                  fg_color="#1e293b")
             frame.pack(side="left", fill="both", expand=True,
-                       padx=(0, 6) if role == "ethernet" else (6, 0))
-            title = "以太网" if role == "ethernet" else "SNNU Wi-Fi"
+                       padx=(0, 6) if role == "ethernet"
+                       else (6, 0) if role == "uu" else (6, 6))
             ctk.CTkLabel(frame, text=title,
                          font=ctk.CTkFont(size=14, weight="bold")).pack(
-                             anchor="w", padx=10, pady=(8, 2))
-            rows = {}
-            for label in CARD_ROWS:
-                row = ctk.CTkFrame(frame, fg_color="transparent")
-                row.pack(fill="x", padx=10)
-                ctk.CTkLabel(row, text=label, text_color="#94a3b8",
-                             width=70).pack(side="left")
-                var = ctk.CTkLabel(row, text="—")
-                var.pack(side="left")
-                rows[label] = var
-            refs[role] = rows
+                             pady=(8, 0))
+            canvas = tk.Canvas(frame, width=110, height=110, bg="#1e293b",
+                               highlightthickness=0)
+            canvas.pack(pady=(2, 0))
+            fact = ctk.CTkLabel(frame, text="—", text_color="#94a3b8",
+                                wraplength=220, justify="center")
+            fact.pack(padx=8, pady=(0, 8))
+            gauge_refs[role] = {"canvas": canvas, "fact": fact}
+        refs["gauges"] = gauge_refs
+        ctk.CTkLabel(outer, text="仪表百分比是状态映射（已验证≈95%），不是实测速率",
+                     text_color="#64748b").pack(anchor="w", pady=(2, 0))
+
+        # ---- 恢复流水线（仪表与时间线之间）----
         pipe = ctk.CTkFrame(outer, corner_radius=12, fg_color="#1e293b")
         pipe.pack(fill="x", pady=(10, 0))
         ctk.CTkLabel(pipe, text="恢复流水线",
@@ -1634,20 +1683,65 @@ class TrayApp:
         progress.set(0.0)
         refs["steps"] = step_widgets
         refs["progress"] = progress
+
+        # ---- 详情折叠：双网卡 10 行卡片，默认收起 ----
+        toggle = ctk.CTkButton(outer, text="展开详情 ▾", width=120,
+                               fg_color="#334155",
+                               command=self._toggle_dashboard_details)
+        toggle.pack(anchor="w", pady=(10, 0))
+        refs["details_toggle"] = toggle
+        refs["details_open"] = False
+        details = ctk.CTkFrame(outer, fg_color="transparent")
+        refs["details_frame"] = details
+        cards = ctk.CTkFrame(details, fg_color="transparent")
+        cards.pack(fill="x")
+        for role in ("ethernet", "wifi"):
+            frame = ctk.CTkFrame(cards, corner_radius=12,
+                                 fg_color="#1e293b")
+            frame.pack(side="left", fill="both", expand=True,
+                       padx=(0, 6) if role == "ethernet" else (6, 0))
+            title = "以太网" if role == "ethernet" else "SNNU Wi-Fi"
+            ctk.CTkLabel(frame, text=title,
+                         font=ctk.CTkFont(size=14, weight="bold")).pack(
+                             anchor="w", padx=10, pady=(8, 2))
+            rows = {}
+            for label in CARD_ROWS:
+                row = ctk.CTkFrame(frame, fg_color="transparent")
+                row.pack(fill="x", padx=10)
+                ctk.CTkLabel(row, text=label, text_color="#94a3b8",
+                             width=70).pack(side="left")
+                var = ctk.CTkLabel(row, text="—")
+                var.pack(side="left")
+                rows[label] = var
+            refs[role] = rows
+
+        # ---- D：历史时间线（真实事件，最新在上，最多 5 条）----
+        tl_frame = ctk.CTkFrame(outer, corner_radius=12, fg_color="#1e293b")
+        tl_frame.pack(fill="x", pady=(10, 0))
+        refs["timeline_frame"] = tl_frame
+        tl_head = ctk.CTkFrame(tl_frame, fg_color="transparent")
+        tl_head.pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkLabel(tl_head, text="历史时间线",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+                         side="left")
+        ctk.CTkButton(tl_head, text="查看全部日志", width=110,
+                      fg_color="#334155",
+                      command=self.on_open_log).pack(side="right")
+        timeline = ctk.CTkLabel(tl_frame, text="尚无网络故障事件记录",
+                                text_color="#94a3b8", wraplength=820,
+                                justify="left")
+        timeline.pack(anchor="w", padx=10, pady=(0, 8))
+        refs["timeline"] = timeline
+
         uu = ctk.CTkLabel(outer, text="UU 远程自动恢复：—")
         uu.pack(anchor="w", pady=(8, 0))
         monitor = ctk.CTkLabel(outer, text="监测：—", text_color="#94a3b8")
         monitor.pack(anchor="w")
-        timeline = ctk.CTkLabel(outer, text="尚无网络故障事件记录",
-                                text_color="#94a3b8", wraplength=820,
-                                justify="left")
-        timeline.pack(anchor="w")
         manual = ctk.CTkLabel(outer, text="—", text_color="#94a3b8",
                               wraplength=820, justify="left")
         manual.pack(anchor="w")
         refs["uu"] = uu
         refs["monitor"] = monitor
-        refs["timeline"] = timeline
         refs["manual"] = manual
         chart = tk.Canvas(outer, height=64, bg="#0f172a",
                           highlightthickness=0)
@@ -1657,6 +1751,7 @@ class TrayApp:
         refs["pulse"] = 0
         buttons = ctk.CTkFrame(outer, fg_color="transparent")
         buttons.pack(fill="x", pady=(12, 0))
+        btns = []
         for text, cmd in (
                 ("立即检测", self.on_detect_now),
                 ("立即验证以太网", lambda: self.on_verify_now("ethernet")),
@@ -1666,11 +1761,74 @@ class TrayApp:
                 ("设置", self.on_settings),
                 ("打开日志", self.on_open_log),
                 ("关闭", self._close_dashboard)):
-            ctk.CTkButton(buttons, text=text, command=cmd,
-                          width=96).pack(side="left", padx=3)
+            btn = ctk.CTkButton(buttons, text=text, command=cmd, width=96)
+            btn.pack(side="left", padx=3)
+            btns.append(btn)
+        refs["buttons"] = btns
         self._dash_ctk_widgets = refs
         self._dash_widgets = None
         self._refresh_dashboard()
+
+    def _draw_gauge(self, canvas, gauge, color) -> None:
+        """在 110×110 Canvas 上画一个环形仪表（无数据时只画底环 + “未验证”）。"""
+        try:
+            canvas.delete("all")
+            canvas.create_arc(8, 8, 102, 102, start=90, extent=-360,
+                              style="arc", outline="#334155", width=10)
+            if gauge is None:
+                canvas.create_text(55, 48, text="未验证", fill="#8b949e",
+                                   font=("Microsoft YaHei", 13, "bold"))
+                canvas.create_text(55, 68, text="无数据，不猜",
+                                   fill="#64748b",
+                                   font=("Microsoft YaHei", 10))
+                return
+            fraction, label = gauge
+            canvas.create_arc(8, 8, 102, 102, start=90,
+                              extent=-max(0.0, min(1.0, fraction)) * 360,
+                              style="arc", outline=color, width=10)
+            canvas.create_text(55, 48, text=label, fill=color,
+                               font=("Microsoft YaHei", 13, "bold"))
+            canvas.create_text(55, 68, text="%.0f%%" % (fraction * 100),
+                               fill="#94a3b8",
+                               font=("Microsoft YaHei", 10))
+        except Exception:
+            pass
+
+    def _dashboard_timeline_lines(self, limit: int = 5):
+        """仪表盘时间线：真实事件（断网/假死/切换/恢复/UU 重启），最新在上。
+
+        用 ``timeline.recent``（时间正序）再倒序；无时间线或无事件返回空表，
+        渲染时显示占位文案。只读，不写日志、不触发动作。
+        """
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return []
+        try:
+            events = timeline.recent(limit)
+        except Exception:
+            return []
+        return [event.line() for event in reversed(events)]
+
+    def _toggle_dashboard_details(self):
+        """详情折叠开关：默认收起；展开时把详情框插到流水线与时间线之间。"""
+        refs = getattr(self, "_dash_ctk_widgets", None)
+        if refs is None:
+            return
+        open_ = not refs.get("details_open", False)
+        refs["details_open"] = open_
+        frame = refs.get("details_frame")
+        toggle = refs.get("details_toggle")
+        if frame is not None:
+            if open_:
+                anchor = refs.get("timeline_frame")
+                if anchor is not None:
+                    frame.pack(fill="x", pady=(6, 0), before=anchor)
+                else:
+                    frame.pack(fill="x", pady=(6, 0))
+            else:
+                frame.pack_forget()
+        if toggle is not None:
+            toggle.configure(text="收起详情 ▴" if open_ else "展开详情 ▾")
 
     def _render_dashboard_ctk(self, state) -> None:
         """把 UiState 写进 CustomTkinter 控件（纯赋值，不做网络操作）。"""
@@ -1678,9 +1836,8 @@ class TrayApp:
         if refs is None:
             return
         refs["light"].configure(text_color=state.overall_color)
-        refs["overall"].configure(
-            text="%s · %s" % (state.overall_label, state.overall),
-            text_color=state.overall_color)
+        refs["overall"].configure(text=state.overall_label,
+                                  text_color=state.overall_color)
         refs["headline"].configure(text=state.headline or "—")
         for role in ("ethernet", "wifi"):
             card = state.card(role)
@@ -1688,6 +1845,31 @@ class TrayApp:
                 continue
             for label, var in (refs.get(role) or {}).items():
                 var.configure(text=card.field(label))
+        # E：三环仪表（数值只从 UiState 状态推导，见 gauge_from_*）
+        gauges = refs.get("gauges") or {}
+        for role in ("ethernet", "wifi"):
+            slot = gauges.get(role)
+            if slot is None:
+                continue
+            card = state.card(role)
+            gauge = gauge_from_card(card)
+            color = card.color if card is not None else "#6e7681"
+            self._draw_gauge(slot["canvas"], gauge, color)
+            if card is None:
+                slot["fact"].configure(text="—")
+            else:
+                slot["fact"].configure(
+                    text="源地址 %s · %s" % (card.field("源地址"),
+                                            card.field("最近验证")))
+        uu_slot = gauges.get("uu")
+        if uu_slot is not None:
+            gauge = gauge_from_uu(state.uu)
+            from campus_ui_state import TONE_COLOR
+            color = TONE_COLOR.get(state.uu.tone, "#6e7681")
+            self._draw_gauge(uu_slot["canvas"], gauge, color)
+            uu_slot["fact"].configure(
+                text=state.uu.detail or ("已开启" if state.uu.enabled
+                                        else "默认关闭（设置里打开）"))
         done = 0
         for step in state.pipeline:
             widget = (refs.get("steps") or {}).get(step.key)
@@ -1706,9 +1888,9 @@ class TrayApp:
         if state.mode_label:
             notes.append("模式：%s" % state.mode_label)
         refs["monitor"].configure(text=" · ".join(notes))
-        timeline = self.timeline_status_lines(limit=3)
+        lines = self._dashboard_timeline_lines(limit=5)
         refs["timeline"].configure(
-            text="\n".join(timeline) if timeline else "尚无网络故障事件记录")
+            text="\n".join(lines) if lines else "尚无网络故障事件记录")
         manual = []
         for role in ("ethernet", "wifi"):
             card = state.card(role)
