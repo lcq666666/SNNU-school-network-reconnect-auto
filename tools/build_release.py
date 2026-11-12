@@ -68,7 +68,10 @@ def _sha256(path: Path) -> str:
 
 def build_checks() -> int:
     """运行离线测试与静态检查（任一失败返回非 0）。"""
-    if _run([sys.executable, "-m", "pytest"]) != 0:
+    # Match the repository's documented Tk stress-test invocation. Automatic GC
+    # during threaded Tk fixtures can leave pytest hanging after its summary.
+    check = "import gc; gc.disable(); import pytest, sys; sys.exit(pytest.main())"
+    if _run([sys.executable, "-c", check]) != 0:
         return 1
     return _run([sys.executable, "-m", "ruff", "check", "."])
 

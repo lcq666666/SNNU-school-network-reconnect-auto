@@ -42,7 +42,7 @@ jobs:
         run: python -m ruff check .
 
       - name: Offline test suite
-        run: python -m pytest -vv --durations=10
+        run: python -c "import gc; gc.disable(); import pytest, sys; sys.exit(pytest.main(['-vv', '--durations=10']))"
 
   build:
     name: controlled build (windows)
