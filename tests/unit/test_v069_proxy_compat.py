@@ -313,32 +313,22 @@ def test_atomic_file_write_failure_rolls_back_earlier_files(tmp_path, monkeypatc
     assert all(p.read_bytes() == contents for p, contents in before.items())
 
 
-def test_legacy_healing_restores_same_machine_proxy_and_journals_failures(tmp_path, monkeypatch):
+def test_legacy_healing_restores_same_machine_proxy_and_journals_failures(tmp_path):
     import json
-    import logging
-    import os
-    import campus_reconnect_tray as tray
-    import campus_resilience_windows as native
-    from campus_clash_health import heal_plan, assess_dual_axis, ProxyAxisResult
-    if os.name != "nt":
-        pytest.skip("Windows adapter")
-    app = tray.TrayApp(logging.getLogger("campus"), config=dict(tray.DEFAULT_CONFIG, clash_auto_proxy=True))
+    from campus_resilience_windows import cycle_system_proxy
     original = {"ProxyServer": {"value": "127.0.0.1:8118", "type": 1},
                 "AutoConfigURL": {"value": "private PAC URL", "type": 1},
                 "ProxyEnable": {"value": 1, "type": 4}}
     calls = []
-    monkeypatch.setattr(tray, "data_directory", lambda: tmp_path)
-    monkeypatch.setattr(tray, "_REAL_SLEEP", lambda seconds: None)
-    monkeypatch.setattr(native, "proxy_snapshot", lambda: copy.deepcopy(original))
-    monkeypatch.setattr(native, "proxy_disable", lambda: calls.append("off"))
-    monkeypatch.setattr(native, "proxy_restore", lambda item: calls.append(item))
-    plan = heal_plan(assess_dual_axis(True, ProxyAxisResult(proxy_ok=False, proxy_error="timeout")), attempts=0)
-    assert app._clash_heal_execute(plan)
+    callbacks = dict(snapshot=lambda: copy.deepcopy(original), disable=lambda: calls.append("off"),
+                     restore=lambda item: calls.append(item), pause=lambda seconds: None)
+    assert cycle_system_proxy(tmp_path / "recovery.json", **callbacks)
     assert calls == ["off", original]
     def fail_restore(item):
         raise OSError("simulated restore failure")
-    monkeypatch.setattr(native, "proxy_restore", fail_restore)
-    assert not app._clash_heal_execute(plan)
+    callbacks["restore"] = fail_restore
+    with pytest.raises(OSError):
+        cycle_system_proxy(tmp_path / "recovery.json", **callbacks)
     state = json.loads((tmp_path / "recovery.json").read_text(encoding="utf-8"))
     assert state["proxy_before"] == original
 

@@ -3251,27 +3251,8 @@ class TrayApp:
         for action in plan.actions:
             if action == "toggle_system_proxy":
                 try:
-                    from campus_resilience_windows import proxy_snapshot, proxy_disable, proxy_restore
-                    before = proxy_snapshot()
-                    if not before.get("ProxyEnable", {}).get("value"):
-                        return False
-                    # Share the durable proxy journal/finally recovery used by the
-                    # three-stage controller, including process-crash recovery.
-                    journal_path = data_directory() / "recovery.json"
-                    state = json.loads(journal_path.read_text(encoding="utf-8")) if journal_path.is_file() else {}
-                    if state.get("proxy_before") is not None:
-                        return False
-                    from campus_install import atomic_json
-                    state["proxy_before"] = before
-                    atomic_json(journal_path, state)
-                    try:
-                        proxy_disable()
-                        _REAL_SLEEP(1.0)
-                    finally:
-                        proxy_restore(before)
-                        state["proxy_before"] = None
-                        atomic_json(journal_path, state)
-                    ok = True
+                    from campus_resilience_windows import cycle_system_proxy
+                    ok = cycle_system_proxy(data_directory() / "recovery.json", pause=_REAL_SLEEP)
                     self.log.info("[Clash] 系统代理开关一次：%s",
                                   "成功" if ok else "失败")
                 except Exception as exc:  # noqa: BLE001

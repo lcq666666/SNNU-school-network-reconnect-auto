@@ -67,6 +67,34 @@ def proxy_restore(values):
         raise OSError("原系统代理配置已写回，但刷新失败")
 
 
+def cycle_system_proxy(journal_path, *, snapshot=None, disable=None, restore=None, pause=None):
+    """One reversible cycle; injected callbacks keep tests independent of threads."""
+    import time
+    from pathlib import Path
+    from campus_install import atomic_json
+    snapshot = snapshot or proxy_snapshot
+    disable = disable or proxy_disable
+    restore = restore or proxy_restore
+    pause = pause or time.sleep
+    before = snapshot()
+    if not before.get("ProxyEnable", {}).get("value"):
+        return False
+    journal_path = Path(journal_path)
+    state = json.loads(journal_path.read_text(encoding="utf-8")) if journal_path.is_file() else {}
+    if state.get("proxy_before") is not None:
+        return False
+    state["proxy_before"] = before
+    atomic_json(journal_path, state)
+    try:
+        disable()
+        pause(1.0)
+    finally:
+        restore(before)
+        state["proxy_before"] = None
+        atomic_json(journal_path, state)
+    return True
+
+
 def uu_connected():
     """External established TCP is evidence of connectivity, not a remote session."""
     from tools.netdiag import PowerShellRunner
