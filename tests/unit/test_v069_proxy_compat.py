@@ -282,6 +282,90 @@ def test_proxy_dialog_is_renderable_without_host_io(tmp_path, monkeypatch):
         root.destroy()
 
 
+def test_proxy_dialog_follows_dark_theme_repaint(tmp_path, monkeypatch):
+    """P4: the proxy dialog must repaint fully under the dark palette, not just at build."""
+    from types import SimpleNamespace
+    import threading
+    import campus_desktop_ui as ud
+    import campus_proxy_ui as ui
+    from tests.fakes import desktop_test_root
+    root = desktop_test_root()
+    root.withdraw()
+    compat, folder, _ = fixture(tmp_path)
+    class InlineThread:
+        def __init__(self, target, **kwargs):
+            self.target = target
+        def start(self):
+            self.target()
+    monkeypatch.setattr(ui, "windows_compatibility", lambda: compat)
+    monkeypatch.setattr(ui, "discover_roots", lambda: [folder])
+    monkeypatch.setattr(ui, "runtime_summary", lambda: "isolated runtime")
+    monkeypatch.setattr(ui, "threading", SimpleNamespace(Thread=InlineThread))
+    monkeypatch.setattr(ud, "save_theme", lambda mode: True)
+    app = SimpleNamespace(root=root, _ui_post=lambda call: call(),
+                          get_config=lambda: {"paused": True},
+                          _repair_busy=threading.Event(), _lifeline_busy=threading.Event())
+    try:
+        ui.open_dialog(app)
+        root.update_idletasks()
+        win = app.proxy_compat_win
+        refs = app._proxy_ui_refs
+
+        def collect_role(role):
+            found = []
+            def visit(widget):
+                for child in widget.winfo_children():
+                    mark = getattr(child, "_campus_theme", None)
+                    if mark and mark[0] == role:
+                        found.append(child)
+                    visit(child)
+            visit(win)
+            return found
+
+        # Light baseline (v0.7.0 tokens).
+        light = ud.THEMES["light"]
+        assert win.cget("fg_color") == light["BG"]
+        assert refs["output"].cget("fg_color") == light["SURFACE"]
+        assert refs["output"].cget("text_color") == light["TEXT"]
+        primary_button = next(b for b in collect_role("button")
+                              if b.cget("text") == "重新检查")
+        assert primary_button.cget("fg_color") == light["ACCENT"]
+
+        # Switch to dark and repaint the whole window tree.
+        ud.set_theme("dark")
+        ud.apply_theme(root)
+        root.update_idletasks()
+        dark = ud.THEMES["dark"]
+        assert win.cget("fg_color") == dark["BG"]
+        assert refs["output"].cget("fg_color") == dark["SURFACE"]
+        assert refs["output"].cget("text_color") == dark["TEXT"]
+        assert primary_button.cget("fg_color") == dark["ACCENT"]
+        assert primary_button.cget("text_color") == dark["ACCENT_TEXT"]
+        panels = collect_role("panel")
+        assert panels and all(p.cget("fg_color") == dark["SURFACE"] for p in panels)
+        assert all(p.cget("border_color") == dark["BORDER"] for p in panels)
+        options = collect_role("option")
+        assert options and all(o.cget("button_color") == dark["ACCENT"] for o in options)
+
+        # Scrollbar inside the dialog's scrollable frame follows the palette too.
+        scroll_frame = next(
+            w for w in ud._walk(win)
+            if ud.ctk is not None and isinstance(w, ud.ctk.CTkScrollableFrame))
+        scrollbar = scroll_frame._scrollbar
+        assert scrollbar.cget("fg_color") == dark["SCROLL_TRACK"]
+        assert scrollbar.cget("button_color") == dark["SCROLL_THUMB"]
+
+        # Switch back to light; nothing stays pinned to the dark palette.
+        ud.set_theme("light")
+        ud.apply_theme(root)
+        root.update_idletasks()
+        assert win.cget("fg_color") == light["BG"]
+        assert refs["output"].cget("fg_color") == light["SURFACE"]
+        assert primary_button.cget("fg_color") == light["ACCENT"]
+    finally:
+        root.destroy()
+
+
 def test_real_readonly_adapter_scripts_pass_command_guard(monkeypatch):
     from tools import netdiag
     from campus_proxy_compat import windows_compatibility, runtime_summary

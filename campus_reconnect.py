@@ -919,10 +919,15 @@ def _decode_console(data: bytes) -> str:
 
 
 def _run_console(args, timeout: float = 5.0) -> Tuple[Optional[int], str]:
-    """运行控制台命令；返回 ``(returncode|None, 文本)``（``None`` 表示启动/超时失败）。"""
+    """运行控制台命令；返回 ``(returncode|None, 文本)``（``None`` 表示启动/超时失败）。
+
+    ``CREATE_NO_WINDOW`` 避免 GUI 进程拉起 netsh/ipconfig 时闪现黑色控制台窗口；
+    该常量仅 Windows 存在，非 Windows 下回退为 0，行为不变。
+    """
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         done = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, creationflags=creationflags)
     except (OSError, subprocess.TimeoutExpired):
         return None, ""
     return done.returncode, _decode_console(done.stdout)
@@ -979,9 +984,10 @@ def wifi_reconnect(ssid: str, log: logging.Logger, profile: Optional[str] = None
     args = ["netsh", "wlan", "connect", "name=%s" % name]
     if interface:
         args.append("interface=%s" % interface)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         done = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=10, check=False)
+                              timeout=10, check=False, creationflags=creationflags)
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("netsh 重连 Wi-Fi 异常: %s", type(exc).__name__)
         return False

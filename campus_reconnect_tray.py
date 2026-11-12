@@ -3058,7 +3058,8 @@ class TrayApp:
                         cmd = [c if c != "%s.xml" % ssid else str(xml_path)
                                for c in cmd]
                     done = subprocess.run(cmd, capture_output=True,
-                                          timeout=20)
+                                          timeout=20,
+                                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     return done.returncode, done.stdout.decode(
                         "gbk", errors="replace")
 
@@ -3981,9 +3982,10 @@ class TrayApp:
         win = tk.Toplevel(self.root)
         self.settings_win = win
         win.title("校园网自动重连助手 · 设置")
-        from campus_desktop_ui import configure_theme
+        from campus_desktop_ui import bind_theme, configure_theme, tokens
         configure_theme(self.root)
-        win.configure(background="#F6F6F8")
+        win.configure(background=tokens()["BG"])
+        bind_theme(win, "tk_window")
         win.resizable(True, True)
         outer = ttk.Frame(win, padding=10)
         outer.grid(sticky="nsew")
@@ -4552,6 +4554,9 @@ def main(argv=None) -> int:
             log.warning("旧版开机自启迁移失败")
     root = tk.Tk()
     root.withdraw()
+    from campus_desktop_ui import set_theme
+    from campus_ui_prefs import load_theme
+    set_theme(load_theme())
     boot_config = load_config()
     if (packaged and args.background and args.update_receipt is None and boot_config.get("lifeline_enabled", False)
             and boot_config.get("lock_after_autologon", True)):

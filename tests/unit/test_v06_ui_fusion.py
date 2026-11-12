@@ -9,6 +9,7 @@ import logging
 import pytest
 
 import campus_reconnect_tray as tray
+from campus_desktop_ui import CONSOLE
 from campus_timeline import NetworkTimeline
 from campus_ui_state import PathCard, StepView, UiState, UuView
 
@@ -78,7 +79,7 @@ def test_fusion_healthy_big_status_and_gauges():
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert refs["overall"].cget("text") == "网络正常"
-        assert refs["light"].cget("text_color") == "#237A50"
+        assert refs["light"].cget("text_color") == CONSOLE["TONES"]["ok"]
         assert refs["status_cards"]["ethernet"]["value"].cget("text") == "已验证"
         assert refs["status_cards"]["wifi"]["value"].cget("text") == "已验证"
         assert refs["status_cards"]["uu"]["value"].cget("text") == "就绪"
@@ -102,7 +103,7 @@ def test_fusion_offline_big_status_and_gauge():
         app._render_dashboard_ctk(state)
         root.update_idletasks()
         assert refs["overall"].cget("text") == "离线"
-        assert refs["light"].cget("text_color") == "#B43838"
+        assert refs["light"].cget("text_color") == CONSOLE["TONES"]["bad"]
         assert refs["status_cards"]["ethernet"]["value"].cget("text") == "未连接"
     finally:
         app._close_dashboard()
@@ -117,7 +118,7 @@ def test_recovering_status_color_is_stable():
         first = refs["light"].cget("text_color")
         app._render_dashboard_ctk(state)
         second = refs["light"].cget("text_color")
-        assert first == second == "#6554C0"
+        assert first == second == CONSOLE["TONES"]["busy"]
     finally:
         app._close_dashboard()
         root.destroy()
