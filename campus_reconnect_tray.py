@@ -3523,6 +3523,8 @@ class TrayApp:
             cfg.update(reconnect_wifi=True, browser_fallback=False)
             adapters = self._repair_adapters()
             adapters.probe_online = lambda session: verify_internet(session, stop_on_failed_gate=True)
+            adapters.login = lambda session, account, password, yys, port, log: engine.portal_login_detailed(
+                session, account, password, yys, port, log, force_login=True)
             with direct_session() as session:
                 result = repair_service(
                     session, RepairOptions.from_mapping(cfg), time.monotonic,

@@ -1138,7 +1138,8 @@ def portal_login(session: requests.Session, account: str, password: str,
 
 
 def portal_login_detailed(session: requests.Session, account: str, password: str,
-                          yys: str, port: int, log: logging.Logger) -> LoginOutcome:
+                          yys: str, port: int, log: logging.Logger, *,
+                          force_login: bool = False) -> LoginOutcome:
     base = portal_base(port)
     # 1) 打开登录页建立会话
     try:
@@ -1151,7 +1152,7 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
     # 2) 只读预检：已有会话且就是本账号 → 不 POST、不声称验证了新密码
     #    （F75-12：状态页显示 `学号@运营商`、提交为纯学号，须按规范化账号比较）
     pre = read_status_page(session, port, log)
-    if pre is not None and getattr(pre, "status", None) is PortalStatus.ONLINE \
+    if not force_login and pre is not None and getattr(pre, "status", None) is PortalStatus.ONLINE \
             and normalize_account(getattr(pre, "account", None)) \
             and normalize_account(getattr(pre, "account", None)) \
             == normalize_account(account):
@@ -1187,6 +1188,15 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
             else PortalStatus.AUTH_REQUIRED
         return LoginOutcome(False, error, status=status,
                             error_code=E_PORTAL_STRUCTURE_UNKNOWN)
+
+    # A stale "online" session may reveal its CAPTCHA only after the first POST.
+    if not re.search(r"密码.{0,4}(错误|有误|不正确)|账号不存在|账户不存在", body):
+        challenge = login_with_captcha(
+            session, body, base + LOGIN_JSP, payload, headers,
+            lambda response: _interpret_auth_response(session, base, response, log),
+            decode=decode_body, max_attempts=1)
+        if challenge is not None:
+            return challenge
 
     # 5) 状态页结构化校验（完整账号比较）
     outcome = parse_status_page(body, account)

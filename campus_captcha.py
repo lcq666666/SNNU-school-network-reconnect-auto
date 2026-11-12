@@ -70,14 +70,14 @@ def recognize_digits(image):
 
 
 def login_with_captcha(session, page_body, page_url, payload, headers,
-                       interpret, *, recognize=None, decode=None):
+                       interpret, *, recognize=None, decode=None, max_attempts=2):
     """Return None for ordinary forms. Recognition failures never submit guesses."""
     decode = decode or (lambda response: response.text)
     recognize = recognize or recognize_digits
     form = captcha_form(page_body, page_url)
     if form is None:
         return None
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         try:
             action, image_url, field, hidden = form
             image = session.get(image_url, timeout=(3, 5), allow_redirects=False)
@@ -106,7 +106,7 @@ def login_with_captcha(session, page_body, page_url, payload, headers,
             if re.search(r"密码.{0,4}(错误|有误|不正确)|账号不存在|账户不存在", body):
                 return LoginOutcome(False, "Portal 拒绝账号或密码",
                                     status=PortalStatus.NEEDS_USER, error_code=E_AUTH_REJECTED)
-            if attempt == 0:
+            if attempt + 1 < max_attempts:
                 # Refresh the page and image using the same session, preserving cookies.
                 page = session.get(page_url, timeout=(3, 5), allow_redirects=False)
                 try:
