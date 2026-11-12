@@ -8,7 +8,8 @@ from tests.unit.test_v080_ui_theme import _contrast
 
 
 @pytest.fixture(autouse=True)
-def _restore_light_theme():
+def _restore_light_theme(monkeypatch):
+    monkeypatch.setattr(ui, "save_theme", lambda mode: True)
     yield
     ui.set_theme("light")
 

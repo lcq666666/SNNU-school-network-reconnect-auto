@@ -4,12 +4,15 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from campus_ui_prefs import save_theme
+
 try:
     import customtkinter as ctk
 except ImportError:
     ctk = None
 
 FONT = "Microsoft YaHei UI"
+FONT_DISPLAY = "SimSun"  # P3: serif display face for editorial headings
 STEP_NAMES = {"detect": "检测网络", "wifi_ready": "连接无线", "portal": "校园认证",
               "internet": "验证上网", "route": "切换出口", "uu": "恢复 UU"}
 
@@ -162,6 +165,8 @@ def _paint(widget, palette):
                              text_color=colors["TEXT"])
         elif role == "strip":
             widget.configure(fg_color=colors["TONES"].get(info.get("tone"), colors["MUTED"]))
+        elif role == "rule":
+            widget.configure(fg_color=colors["BORDER"])
         elif role == "topology":
             widget.configure(bg=colors["SURFACE"])
             draw_topology(widget, colors, getattr(widget, "_campus_topology", {}))
@@ -205,6 +210,7 @@ def switch_theme(mode):
     Tcl objects from a non-main thread.
     """
     set_theme(mode)
+    save_theme(mode)
     root = tk._default_root
     if root is not None:
         configure_theme(root)
@@ -253,6 +259,43 @@ def font(size=14, bold=False):
     return root._campus_fonts[key]
 
 
+def display_font(size=24, bold=False):
+    """Serif display face for editorial headings; cached per Tk root like font()."""
+    root = tk._default_root
+    if root is None:
+        return ctk.CTkFont(family=FONT_DISPLAY, size=size,
+                           weight="bold" if bold else "normal")
+    if not hasattr(root, "_campus_display_fonts"):
+        root._campus_display_fonts = {}
+    key = (size, bold)
+    if key not in root._campus_display_fonts:
+        root._campus_display_fonts[key] = ctk.CTkFont(
+            family=FONT_DISPLAY, size=size, weight="bold" if bold else "normal")
+    return root._campus_display_fonts[key]
+
+
+def section(parent):
+    """Borderless, transparent block: the editorial alternative to a white card."""
+    return ctk.CTkFrame(parent, fg_color="transparent")
+
+
+def divider(parent):
+    colors = tokens()
+    return bind_theme(ctk.CTkFrame(parent, height=1, fg_color=colors["BORDER"],
+                                   corner_radius=0), "rule")
+
+
+def numbered(parent, index, title):
+    """Serial + serif heading + hairline, one line per section."""
+    head = section(parent)
+    head.pack(fill="x", padx=24, pady=(18, 6))
+    label(head, f"{index:02d}", size=12, muted=True, display=True).pack(
+        side="left", padx=(0, 12))
+    label(head, title, size=20, bold=True, display=True).pack(side="left")
+    divider(head).pack(side="left", fill="x", expand=True, padx=12)
+    return head
+
+
 def configure_theme(root):
     palette = tokens()
     if ctk is not None:
@@ -285,11 +328,13 @@ def fit_window(win, width, height, *, minimum=(760, 460)):
     win.minsize(min(minimum[0], max_w), min(minimum[1], max_h))
 
 
-def label(parent, text, *, size=14, bold=False, muted=False, console=False, **kwargs):
+def label(parent, text, *, size=14, bold=False, muted=False, console=False,
+          display=False, **kwargs):
     # Fixed logical line lengths avoid a Tk geometry feedback loop at fractional DPI.
     palette = CONSOLE if console else tokens()
+    text_font = display_font(size, bold) if display else font(size, bold)
     return bind_theme(
-        ctk.CTkLabel(parent, text=text, font=font(size, bold),
+        ctk.CTkLabel(parent, text=text, font=text_font,
                      text_color=palette["MUTED"] if muted else palette["TEXT"],
                      anchor="w", **kwargs),
         "label", muted=muted, console=console)
@@ -524,6 +569,129 @@ def render_console(refs, state, app):
     draw_topology(topo, CONSOLE, data)
 
 
+def build_network_page(app, body, refs):
+    """Editorial network page: numbered blocks separated by hairlines."""
+    numbered(body, 1, "联网保护")
+    block = section(body)
+    block.pack(fill="x", padx=24, pady=(0, 10))
+    refs["setup_status"] = label(block, "正在检查", muted=True,
+                                 wraplength=520, justify="left")
+    refs["setup_status"].pack(fill="x", pady=(0, 8))
+    button(block, "重新检查", app.on_check_connection, primary=True).pack(anchor="w")
+    divider(body).pack(fill="x", padx=24, pady=(8, 0))
+    for index, (role, title) in enumerate((("ethernet", "以太网"),
+                                           ("wifi", "SNNU Wi-Fi")), start=2):
+        numbered(body, index, title)
+        block = section(body)
+        block.pack(fill="x", padx=24, pady=(0, 10))
+        rows = {}
+        for name in ("状态", "Internet", "最近验证"):
+            row = section(block)
+            row.pack(fill="x", pady=1)
+            caption = {"Portal": "校园认证", "Internet": "上网验证",
+                       "ifIndex": "接口编号"}.get(name, name)
+            label(row, caption, muted=True, width=86).pack(side="left")
+            rows[name] = label(row, "—", wraplength=380, justify="left")
+            rows[name].pack(side="left", fill="x", expand=True)
+        button(block, "验证这条链路", lambda r=role: app.on_verify_now(r)).pack(
+            anchor="w", pady=(8, 0))
+        refs[role] = rows
+        divider(body).pack(fill="x", padx=24, pady=(8, 0))
+    refs["manual"] = label(body, "尚未手动验证", muted=True, wraplength=520, justify="left")
+    refs["manual"].pack(fill="x", padx=24, pady=(14, 24))
+
+
+def build_recovery_page(app, body, refs):
+    numbered(body, 1, "守护状态")
+    block = section(body)
+    block.pack(fill="x", padx=24, pady=(0, 10))
+    refs["uu"] = label(block, "", wraplength=520, justify="left")
+    refs["uu"].pack(fill="x", pady=(0, 4))
+    refs["protection"] = label(block, "", muted=True, wraplength=520, justify="left")
+    refs["protection"].pack(fill="x")
+    divider(body).pack(fill="x", padx=24, pady=(10, 0))
+    refs["steps"] = {}
+    for index, (key, title) in enumerate((("detect", "检查连接"),
+                                          ("internet", "保持网络在线"),
+                                          ("uu", "保持 UU 在线")), start=2):
+        row = section(body)
+        row.pack(fill="x", padx=24, pady=(10, 4))
+        label(row, f"{index:02d}", size=12, muted=True, display=True).pack(
+            side="left", padx=(0, 12))
+        label(row, title, size=16, bold=True).pack(side="left")
+        step = label(row, "待执行", muted=True)
+        step.pack(side="right")
+        refs["steps"][key] = step
+        divider(body).pack(fill="x", padx=24)
+    refs["progress"] = bind_theme(
+        ctk.CTkProgressBar(body, height=3, progress_color=tokens()["ACCENT"],
+                           fg_color=tokens()["BORDER"]), "progress")
+    refs["progress"].pack(fill="x", padx=24, pady=(14, 16))
+    actions = section(body)
+    actions.pack(fill="x", padx=24, pady=(0, 24))
+    button(actions, "重启 UU 远程", app.on_restart_uu_remote).pack(side="left", padx=(0, 10))
+    refs["recovery_guard_button"] = button(actions, "开启在线守护",
+                                           app.on_toggle_online_guard)
+    refs["recovery_guard_button"].pack(side="left")
+
+
+def build_activity_page(app, body, refs):
+    numbered(body, 1, "最近事件")
+    block = section(body)
+    block.pack(fill="x", padx=24, pady=(0, 8))
+    refs["timeline"] = label(block, "尚无网络故障事件记录", wraplength=520,
+                             justify="left")
+    refs["timeline"].pack(fill="x", pady=(0, 8))
+    label(block, "断网、认证恢复、出口切换与 UU 处理会按时间记录在这里，最新的在前。",
+          muted=True, size=12, wraplength=520, justify="left").pack(fill="x")
+    divider(body).pack(fill="x", padx=24, pady=(14, 0))
+    button(body, "查看完整日志", app.on_open_log).pack(anchor="w", padx=24, pady=(18, 24))
+
+
+def build_settings_page(app, body, refs):
+    entries = (
+        ("保持在线", "在线守护的唯一开关；开启后自动联网、恢复 UU，联网软件异常时自动处理并保留原设置。",
+         "开启在线守护", app.on_toggle_online_guard),
+        ("开机运行", "电脑登录后自动开始守护。", "设置开机运行", app.on_toggle_autostart),
+        ("校园网账号", "填写校园网账号和密码，供断网后自动登录使用。", "设置账号",
+         app.on_update_credentials),
+        ("软件更新", "检查新版本，在程序内下载并更新。", "检查更新",
+         app.on_check_update_now),
+    )
+    for index, (title, description, action, cmd) in enumerate(entries, start=1):
+        numbered(body, index, title)
+        block = section(body)
+        block.pack(fill="x", padx=24, pady=(0, 12))
+        label(block, description, muted=True, wraplength=520).pack(fill="x", pady=(0, 10))
+        control = button(block, action, cmd)
+        control.pack(anchor="w")
+        if title == "保持在线":
+            refs["guard_button"] = control
+        if title == "开机运行":
+            refs["autostart_button"] = control
+        divider(body).pack(fill="x", padx=24, pady=(6, 0))
+    advanced = section(body)
+
+    def toggle_advanced():
+        panel_widget = refs["advanced_section"]
+        toggle = refs["advanced_toggle"]
+        if panel_widget.winfo_manager():
+            panel_widget.pack_forget()
+            toggle.configure(text="显示高级选项")
+        else:
+            panel_widget.pack(fill="x", padx=24, pady=(0, 20))
+            toggle.configure(text="收起高级选项")
+
+    refs["advanced_section"] = advanced
+    advanced_toggle = button(body, "显示高级选项", toggle_advanced)
+    refs["advanced_toggle"] = advanced_toggle
+    advanced_toggle.pack(anchor="w", padx=24, pady=(16, 12))
+    label(advanced, "供进一步调整或技术排查使用，日常使用无需修改。", muted=True,
+          wraplength=520).pack(fill="x", pady=(0, 10))
+    button(advanced, "详细设置", app.on_settings).pack(anchor="w", pady=(0, 10))
+    button(advanced, "高级网络诊断", app._open_proxy_compat).pack(anchor="w", pady=(0, 14))
+
+
 def build_dashboard(app):
     configure_theme(app.root)
     palette = tokens()
@@ -565,14 +733,23 @@ def build_dashboard(app):
             bind_theme(nav, "nav", selected=selected)
         refs["selected_page"] = key
 
-    def page(key, title, subtitle, *, console=False):
+    def page(key, title, subtitle, *, console=False, editorial=False, index=0):
         colors = CONSOLE if console else tokens()
         body = ctk.CTkScrollableFrame(content, fg_color=colors["BG"], corner_radius=0)
         bind_theme(body, "surface", console=console)
         refs["pages"][key] = body
-        label(body, title, size=24, bold=True, console=console).pack(
-            fill="x", padx=24, pady=(24, 4))
-        label(body, subtitle, muted=True, wraplength=440, justify="left",
+        if editorial:
+            eyebrow = section(body)
+            eyebrow.pack(fill="x", padx=24, pady=(24, 2))
+            label(eyebrow, f"NO. {index:02d}", size=11, muted=True, display=True).pack(
+                side="left")
+            divider(eyebrow).pack(side="left", fill="x", expand=True, padx=12)
+            label(body, title, size=28, bold=True, display=True).pack(
+                fill="x", padx=24, pady=(8, 2))
+        else:
+            label(body, title, size=24, bold=True, console=console).pack(
+                fill="x", padx=24, pady=(24, 4))
+        label(body, subtitle, muted=True, wraplength=520, justify="left",
               console=console).pack(fill="x", padx=24, pady=(0, 20))
         return body
 
@@ -596,98 +773,18 @@ def build_dashboard(app):
     overview = page("overview", "概览", "查看网络连接和远程恢复状态。", console=True)
     build_console(app, overview, refs)
 
-    network = page("network", "连接状态", "助手会在后台检查并恢复连接，无需手动配置联网软件。")
-    p = panel(network)
-    p.pack(fill="x", padx=24, pady=(0, 16))
-    label(p, "联网保护", bold=True).pack(fill="x", padx=18, pady=(14, 4))
-    refs["setup_status"] = label(p, "正在检查", muted=True, wraplength=440, justify="left")
-    refs["setup_status"].pack(fill="x", padx=18)
-    button(p, "重新检查", app.on_check_connection, primary=True).pack(anchor="w", padx=18, pady=14)
-    for role, title in (("ethernet", "以太网"), ("wifi", "SNNU Wi-Fi")):
-        p = panel(network)
-        p.pack(fill="x", padx=24, pady=(0, 16))
-        label(p, title, size=17, bold=True).pack(fill="x", padx=18, pady=(14, 8))
-        rows = {}
-        for name in ("状态", "Internet", "最近验证"):
-            row = ctk.CTkFrame(p, fg_color="transparent")
-            row.pack(fill="x", padx=18, pady=1)
-            caption = {"Portal": "校园认证", "Internet": "上网验证", "ifIndex": "接口编号"}.get(
-                name, name)
-            label(row, caption, muted=True, width=86).pack(side="left")
-            rows[name] = label(row, "—", wraplength=320, justify="left")
-            rows[name].pack(side="left", fill="x", expand=True)
-        button(p, "验证这条链路", lambda r=role: app.on_verify_now(r)).pack(
-            anchor="w", padx=18, pady=14)
-        refs[role] = rows
-    refs["manual"] = label(network, "尚未手动验证", muted=True, wraplength=440, justify="left")
-    refs["manual"].pack(fill="x", padx=24, pady=(0, 20))
-
-    recovery = page("recovery", "在线守护", "自动保持网络连接，恢复 UU，必要时恢复联网软件。")
-    p = panel(recovery)
-    p.pack(fill="x", padx=24, pady=(0, 16))
-    refs["uu"] = label(p, "", wraplength=440, justify="left")
-    refs["uu"].pack(fill="x", padx=18, pady=16)
-    refs["protection"] = label(p, "", muted=True, wraplength=440, justify="left")
-    refs["protection"].pack(fill="x", padx=18, pady=(0, 16))
-    refs["steps"] = {}
-    for i, (key, title) in enumerate((("detect", "检查连接"), ("internet", "保持网络在线"),
-                                      ("uu", "保持 UU 在线")), start=1):
-        row = panel(recovery)
-        row.pack(fill="x", padx=24, pady=(0, 6))
-        label(row, f"{i}   {title}", bold=True).pack(side="left", padx=18, pady=10)
-        step = label(row, "待执行", muted=True)
-        step.pack(side="right", padx=18)
-        refs["steps"][key] = step
-    refs["progress"] = bind_theme(
-        ctk.CTkProgressBar(recovery, height=4, progress_color=palette["ACCENT"],
-                           fg_color=palette["BORDER"]),
-        "progress")
-    refs["progress"].pack(fill="x", padx=24, pady=(12, 18))
-    actions = ctk.CTkFrame(recovery, fg_color="transparent")
-    actions.pack(fill="x", padx=24, pady=(0, 20))
-    button(actions, "重启 UU 远程", app.on_restart_uu_remote).pack(side="left", padx=(0, 10))
-    refs["recovery_guard_button"] = button(actions, "开启在线守护", app.on_toggle_online_guard)
-    refs["recovery_guard_button"].pack(side="left")
-
-    activity = page("activity", "活动记录", "最近的网络中断、恢复和 UU 处理记录，最新的在前。")
-    p = panel(activity)
-    p.pack(fill="x", padx=24)
-    refs["timeline"] = label(p, "尚无网络故障事件记录", wraplength=440, justify="left")
-    refs["timeline"].pack(fill="x", padx=18, pady=18)
-    button(activity, "查看完整日志", app.on_open_log).pack(anchor="w", padx=24, pady=18)
-
-    settings = page("settings", "设置", "配置保存在本机，更新程序时沿用现有设置。")
-    for title, description, action, cmd in (
-        ("保持在线", "自动联网、恢复 UU；联网软件异常时自动处理并保留原设置。", "开启在线守护",
-         app.on_toggle_online_guard),
-        ("开机运行", "电脑登录后自动开始守护。", "设置开机运行", app.on_toggle_autostart),
-        ("校园网账号", "填写校园网账号和密码，供断网后自动登录使用。", "设置账号",
-         app.on_update_credentials),
-        ("软件更新", "检查新版本，在程序内下载并更新。", "检查更新", app.on_check_update_now)):
-        p = panel(settings)
-        p.pack(fill="x", padx=24, pady=(0, 14))
-        label(p, title, bold=True).pack(fill="x", padx=18, pady=(14, 4))
-        label(p, description, muted=True, wraplength=440).pack(fill="x", padx=18)
-        control = button(p, action, cmd)
-        control.pack(anchor="w", padx=18, pady=14)
-        if title == "保持在线":
-            refs["guard_button"] = control
-        if title == "开机运行":
-            refs["autostart_button"] = control
-    advanced = panel(settings)
-    def toggle_advanced():
-        if advanced.winfo_manager():
-            advanced.pack_forget()
-            advanced_toggle.configure(text="显示高级选项")
-        else:
-            advanced.pack(fill="x", padx=24, pady=(0, 20))
-            advanced_toggle.configure(text="收起高级选项")
-    advanced_toggle = button(settings, "显示高级选项", toggle_advanced)
-    advanced_toggle.pack(anchor="w", padx=24, pady=(4, 16))
-    label(advanced, "供进一步调整或技术排查使用，日常使用无需修改。", muted=True,
-          wraplength=440).pack(fill="x", padx=18, pady=14)
-    button(advanced, "详细设置", app.on_settings).pack(anchor="w", padx=18, pady=(0, 10))
-    button(advanced, "高级网络诊断", app._open_proxy_compat).pack(anchor="w", padx=18, pady=(0, 14))
+    network = page("network", "连接状态", "助手会在后台检查并恢复连接，无需手动配置联网软件。",
+                   editorial=True, index=2)
+    build_network_page(app, network, refs)
+    recovery = page("recovery", "在线守护", "自动保持网络连接，恢复 UU，必要时恢复联网软件。",
+                    editorial=True, index=3)
+    build_recovery_page(app, recovery, refs)
+    activity = page("activity", "活动记录", "最近的网络中断、恢复和 UU 处理记录，最新的在前。",
+                    editorial=True, index=4)
+    build_activity_page(app, activity, refs)
+    settings = page("settings", "设置", "配置保存在本机，更新程序时沿用现有设置。",
+                    editorial=True, index=5)
+    build_settings_page(app, settings, refs)
     refs["navigate"] = navigate
     app._dash_ctk_widgets = refs
     app._dash_widgets = None
@@ -722,9 +819,9 @@ def render_dashboard(app, state):
     startup = getattr(app, "_autostart_enabled", None)
     refs["autostart_button"].configure(text="关闭开机运行" if startup else "开启开机运行")
     refs["setup_status"].configure(text=getattr(app, "_automatic_setup_message", "等待后台检查"))
-    refs["protection"].configure(text="\n".join(
-        f"{title}：{'已启用' if cfg.get(key) else '未启用'}" for key, title in (
-            ("lifeline_enabled", "在线守护"), ("lifeline_reboot_enabled", "电脑重启恢复"))))
+    # The guard switch lives on the settings page; do not repeat its state here.
+    reboot = "已启用" if cfg.get("lifeline_reboot_enabled") else "未启用"
+    refs["protection"].configure(text=f"电脑重启恢复：{reboot}")
     lines = app._dashboard_timeline_lines(limit=10)
     refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines
                               else "尚无网络故障事件记录")

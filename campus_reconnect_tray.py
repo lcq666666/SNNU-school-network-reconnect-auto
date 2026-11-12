@@ -4469,6 +4469,9 @@ def main(argv=None) -> int:
             log.warning("旧版开机自启迁移失败")
     root = tk.Tk()
     root.withdraw()
+    from campus_desktop_ui import set_theme
+    from campus_ui_prefs import load_theme
+    set_theme(load_theme())
     boot_config = load_config()
     if (packaged and args.background and args.update_receipt is None and boot_config.get("lifeline_enabled", False)
             and boot_config.get("lock_after_autologon", True)):
