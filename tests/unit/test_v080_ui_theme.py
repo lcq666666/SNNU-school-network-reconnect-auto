@@ -105,6 +105,37 @@ def test_apply_theme_ignores_destroyed_widgets():
         root.destroy()
 
 
+def test_palettes_share_scrollbar_token_keys():
+    for name, palette in (("light", ui.THEMES["light"]), ("dark", ui.THEMES["dark"]),
+                          ("console", ui.CONSOLE)):
+        for key in ("SCROLL_TRACK", "SCROLL_THUMB", "SCROLL_HOVER"):
+            assert key in palette, (name, key)
+            assert palette[key].startswith("#")
+
+
+def test_scrollbar_colors_follow_theme_switch():
+    from tests.unit.test_v06_ui_fusion import _open_app
+    app, root, refs = _open_app()
+    try:
+        root.update_idletasks()
+        scrollbar = refs["pages"]["network"]._scrollbar
+        light = ui.THEMES["light"]
+        dark = ui.THEMES["dark"]
+        assert scrollbar.cget("fg_color") == light["SCROLL_TRACK"]
+        assert scrollbar.cget("button_color") == light["SCROLL_THUMB"]
+        assert scrollbar.cget("button_hover_color") == light["SCROLL_HOVER"]
+
+        ui.set_theme("dark")
+        ui.apply_theme(root)
+        root.update_idletasks()
+        assert scrollbar.cget("fg_color") == dark["SCROLL_TRACK"]
+        assert scrollbar.cget("button_color") == dark["SCROLL_THUMB"]
+        assert scrollbar.cget("button_hover_color") == dark["SCROLL_HOVER"]
+    finally:
+        app._close_dashboard()
+        root.destroy()
+
+
 def test_theme_switch_repaints_controls_without_touching_app_state(monkeypatch):
     from tests.unit.test_v06_ui_fusion import _open_app, _state
     app, root, refs = _open_app()

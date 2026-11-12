@@ -32,6 +32,10 @@ _LIGHT = {
     "NAV_HOVER": "#E3E1EC",
     "TONES": {"ok": "#237A50", "bad": "#B43838", "warn": "#956414",
               "busy": "#6554C0", "unknown": "#666673", "idle": "#666673"},
+    # P4: scrollbar track / thumb / thumb-hover, low-saturation and theme-bound.
+    "SCROLL_TRACK": "#E6E6EC",
+    "SCROLL_THUMB": "#C6C9D4",
+    "SCROLL_HOVER": "#A9ADBA",
 }
 _DARK = {
     "BG": "#0F1519",
@@ -47,6 +51,9 @@ _DARK = {
     "NAV_HOVER": "#223038",
     "TONES": {"ok": "#79CFAE", "bad": "#E58474", "warn": "#E0BE6B",
               "busy": "#8FB8C8", "unknown": "#96A2A8", "idle": "#96A2A8"},
+    "SCROLL_TRACK": "#1B252B",
+    "SCROLL_THUMB": "#3A4A52",
+    "SCROLL_HOVER": "#4C5E67",
 }
 THEMES = {"light": _LIGHT, "dark": _DARK}
 _current_theme = "light"
@@ -78,6 +85,9 @@ CONSOLE = {
     "NAV_HOVER": "#1D3037",
     "TONES": {"ok": "#79CFAE", "bad": "#E58474", "warn": "#E0BE6B",
               "busy": "#8FB8C8", "unknown": "#90A4A7", "idle": "#90A4A7"},
+    "SCROLL_TRACK": "#101E24",
+    "SCROLL_THUMB": "#3A4F57",
+    "SCROLL_HOVER": "#4C626C",
 }
 # Verbatim state identifiers from campus_ui_state, never invented status words.
 SIGNAL_WORDS = {"HEALTHY": "ONLINE", "DEGRADED": "DEGRADED",
@@ -170,6 +180,12 @@ def _paint(widget, palette):
         elif role == "topology":
             widget.configure(bg=colors["SURFACE"])
             draw_topology(widget, colors, getattr(widget, "_campus_topology", {}))
+        elif role == "scrollbar":
+            if ctk is not None and isinstance(widget, ctk.CTkScrollbar):
+                widget.configure(
+                    fg_color=colors["SCROLL_TRACK"],
+                    button_color=colors["SCROLL_THUMB"],
+                    button_hover_color=colors["SCROLL_HOVER"])
     except (tk.TclError, AttributeError, TypeError, ValueError):
         return
 
@@ -199,6 +215,18 @@ def apply_theme(*roots):
             if key in seen:
                 continue
             seen.add(key)
+            # CTkScrollableFrame creates its CTkScrollbar internally without a theme
+            # mark; colour it directly so scrollbars follow the active palette.
+            if ctk is not None and isinstance(widget, ctk.CTkScrollbar):
+                try:
+                    if widget.winfo_exists():
+                        widget.configure(
+                            fg_color=palette["SCROLL_TRACK"],
+                            button_color=palette["SCROLL_THUMB"],
+                            button_hover_color=palette["SCROLL_HOVER"])
+                except (tk.TclError, AttributeError, TypeError):
+                    pass
+                continue
             _paint(widget, palette)
 
 
@@ -317,6 +345,14 @@ def configure_theme(root):
               foreground=[("selected", palette["ACCENT"])])
     style.configure("TEntry", fieldbackground=palette["SURFACE"])
     style.configure("TCombobox", fieldbackground=palette["SURFACE"])
+    # P4: native ttk scrollbar fallback (CTkScrollableFrame uses CTkScrollbar,
+    # painted by apply_theme; this covers any ttk scrollbars in the shell).
+    style.configure("TScrollbar", background=palette["SCROLL_TRACK"],
+                    troughcolor=palette["SCROLL_TRACK"],
+                    bordercolor=palette["BORDER"])
+    style.map("TScrollbar",
+              background=[("active", palette["SCROLL_HOVER"])],
+              troughcolor=[("active", palette["SCROLL_TRACK"])])
 
 
 def fit_window(win, width, height, *, minimum=(760, 460)):
@@ -735,7 +771,11 @@ def build_dashboard(app):
 
     def page(key, title, subtitle, *, console=False, editorial=False, index=0):
         colors = CONSOLE if console else tokens()
-        body = ctk.CTkScrollableFrame(content, fg_color=colors["BG"], corner_radius=0)
+        body = ctk.CTkScrollableFrame(
+            content, fg_color=colors["BG"], corner_radius=0,
+            scrollbar_fg_color=colors["SCROLL_TRACK"],
+            scrollbar_button_color=colors["SCROLL_THUMB"],
+            scrollbar_button_hover_color=colors["SCROLL_HOVER"])
         bind_theme(body, "surface", console=console)
         refs["pages"][key] = body
         if editorial:

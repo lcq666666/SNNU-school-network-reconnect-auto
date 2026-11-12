@@ -57,7 +57,11 @@ def open_dialog(app):
     win.configure(fg_color=palette["BG"])
     bind_theme(win, "window")
     fit_window(win, 820, 480, minimum=(700, 470))
-    frame = ctk.CTkScrollableFrame(win, fg_color=palette["BG"], corner_radius=0)
+    frame = ctk.CTkScrollableFrame(
+        win, fg_color=palette["BG"], corner_radius=0,
+        scrollbar_fg_color=palette["SCROLL_TRACK"],
+        scrollbar_button_color=palette["SCROLL_THUMB"],
+        scrollbar_button_hover_color=palette["SCROLL_HOVER"])
     bind_theme(frame, "surface")
     frame.pack(fill="both", expand=True)
     label(frame, "代理兼容检查", size=24, bold=True).pack(fill="x", padx=24, pady=(24, 4))
