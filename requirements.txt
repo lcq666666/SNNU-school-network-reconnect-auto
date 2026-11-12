@@ -11,6 +11,7 @@
 
 # ---- CLI 核心运行依赖（campus_reconnect.py）----
 requests>=2.31,<3
+PyYAML>=6.0.3,<7
 keyring>=24,<26
 
 # ---- 托盘附加依赖（campus_reconnect_tray.py）----

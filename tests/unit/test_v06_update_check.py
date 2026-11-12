@@ -17,7 +17,7 @@ LOG = logging.getLogger("campus")
 
 
 def _app(**cfg):
-    app = tray.TrayApp(LOG)
+    app = tray.TrayApp(LOG, config=dict(tray.DEFAULT_CONFIG))
     app.config = dict(tray.DEFAULT_CONFIG)
     app.config.update(cfg)
     return app
@@ -342,7 +342,12 @@ def test_banner_download_opens_local_progress_dialog(monkeypatch):
         def start(self):
             started.append(self.name)
     monkeypatch.setattr(tray.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(tray.threading, "Thread", DownloadThread)
+    from types import SimpleNamespace
+    monkeypatch.setattr(tray, "threading", SimpleNamespace(**{**vars(tray.threading), "Thread": DownloadThread}))
+    from concurrent.futures import ThreadPoolExecutor
+    # Download's test double must not replace the standard library's threads.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(lambda: "isolated").result(timeout=1) == "isolated"
     try:
         app._update_opener = lambda url: opened.append(url)
         app._update_info = _info()
@@ -370,7 +375,7 @@ def test_settings_shows_update_section(monkeypatch):
     except tk.TclError:
         pytest.skip("无显示环境")
     root.withdraw()
-    app = tray.TrayApp(LOG)
+    app = tray.TrayApp(LOG, config=dict(tray.DEFAULT_CONFIG))
     app.root = root
     app.config = dict(tray.DEFAULT_CONFIG)
     try:

@@ -42,7 +42,6 @@ import json
 import logging
 import os
 import queue
-import shutil
 import sys
 import tempfile
 import threading
@@ -2779,7 +2778,7 @@ class TrayApp:
                 if self._cancelled():
                     proxy_note = "\n已取消，未改动系统代理"
                 else:
-                    endpoint = cfg.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
+                    endpoint = self.config.get("proxy_endpoint")
                     result = apply_system_proxy(True, endpoint)
                     if result.ok:
                         proxy_note = "\n已自动开启系统代理（%s）" % (result.endpoint or endpoint)
@@ -2831,10 +2830,19 @@ class TrayApp:
         try:
             if self.root is None:
                 return None
-            endpoint = self.config.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
+            endpoint = self._observed_proxy_endpoint()
+            if endpoint is None:
+                self.log.info("未确认本机代理端点，跳过代理联动询问；可在设置中配置")
+                return None
+            version = self.config_version()
             body = ("校园网重连成功。\n\n是否同意：以后每次重连成功后，自动开启系统代理？\n"
                     "将启用端点：%s\n（可随时在托盘菜单或设置面板更改）" % endpoint)
-            return self._ui_ask("系统代理联动", body, timeout=60.0)
+            answer = self._ui_ask("系统代理联动", body, timeout=60.0)
+            if self.config_version() != version or self.config.get("clash_auto_proxy") is not None:
+                return None
+            if answer is True:
+                self.update_config({"proxy_endpoint": endpoint})
+            return answer
         finally:
             self._consent_lock.release()
 
@@ -3111,6 +3119,8 @@ class TrayApp:
         """
         if not bool(self.config.get("clash_heal_enabled", True)):
             return
+        if self._cancelled() or self._repair_busy.is_set() or self.config.get("lifeline_enabled", False):
+            return
         busy = getattr(self, "_clash_check_busy", None)
         if busy is None:
             busy = self._clash_check_busy = threading.Event()
@@ -3129,6 +3139,17 @@ class TrayApp:
 
 
     # ---------- V0.6：双轴 Clash 自愈 / Wi-Fi 自启 / UU 两档 ----------
+    def _observed_proxy_endpoint(self):
+        from campus_proxy_compat import local_proxy_endpoint
+        explicit = self.config.get("proxy_endpoint")
+        if explicit:
+            return local_proxy_endpoint({}, explicit)
+        try:
+            from campus_resilience_windows import proxy_snapshot
+            return local_proxy_endpoint(proxy_snapshot())
+        except (OSError, ImportError, ValueError):
+            return None
+
     def _note_outage_for_uu(self) -> None:
         """断网段开始时记一笔：UU 恢复前是否在运行（V0.6 触发条件）。
 
@@ -3168,13 +3189,21 @@ class TrayApp:
         if not bool(self.config.get("clash_heal_enabled", True)):
             return
         try:
-            endpoint = self.config.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
-            host, _, port = endpoint.partition(":")
+            endpoint = self._observed_proxy_endpoint()
+            if endpoint is None:
+                return
+            from campus_windows import parse_endpoint
+            host, port = parse_endpoint(endpoint)
             session = engine.direct_session()
             session.proxies.update({
                 "http": "http://%s" % endpoint,
                 "https": "http://%s" % endpoint})
-            proxy_result = probe_via_proxy(session, engine.DEFAULT_PROBES)
+            try:
+                proxy_result = probe_via_proxy(session, engine.DEFAULT_PROBES)
+            finally:
+                close = getattr(session, "close", None)
+                if close:
+                    close()
             health = assess_dual_axis(bool(direct_ok), proxy_result)
             if health.verdict == "healthy":
                 self._clash_heal_attempts = 0
@@ -3184,19 +3213,21 @@ class TrayApp:
                 return
             try:
                 endpoint_ok = bool(check_endpoint(
-                    host or "127.0.0.1", int(port or 7897), engine.tcp_probe))
+                    host, port, engine.tcp_probe))
             except Exception:
                 endpoint_ok = False
             attempts = int(getattr(self, "_clash_heal_attempts", 0) or 0)
             plan = heal_plan(health, endpoint_ok, attempts)
             self.log.warning("[Clash] 自愈计划（第 %d 次）：%s",
                              attempts, plan.reason)
-            if plan.actions:
-                self._clash_heal_execute(plan)
+            if (plan.actions and self.config.get("clash_auto_proxy") is True and not self._cancelled()
+                    and not self._repair_busy.is_set() and not self.config.get("lifeline_enabled", False)):
+                applied = self._clash_heal_execute(plan)
                 self._clash_heal_attempts = attempts + 1
-                self.notify("Clash 假死自愈",
-                            "本地能上网但 Clash 代理不通，已尝试：%s"
-                            % "、".join(plan.actions))
+                if applied:
+                    self.notify("代理恢复", "已按本机原有配置恢复系统代理，请确认联网状态。")
+                else:
+                    self.notify("代理仍不可用", "请检查代理客户端，助手保留原有配置。")
         except Exception as exc:  # noqa: BLE001 - 自愈不得影响监测
             self.log.warning("[Clash] 双轴自愈异常：%s", type(exc).__name__)
 
@@ -3212,15 +3243,35 @@ class TrayApp:
         if os.name != "nt":
             self.log.warning("[Clash] 非 Windows：跳过自愈执行 %s", plan.actions)
             return False
+        if self.config.get("clash_auto_proxy") is not True:
+            return False
+        if self._cancelled() or self._repair_busy.is_set() or self.config.get("lifeline_enabled", False):
+            return False
         ok = True
         for action in plan.actions:
             if action == "toggle_system_proxy":
-                endpoint = self.config.get("proxy_endpoint") or CLASH_SERVER_DEFAULT
                 try:
-                    apply_system_proxy(False)
-                    _REAL_SLEEP(1.0)
-                    result = apply_system_proxy(True, endpoint)
-                    ok = bool(result.ok)
+                    from campus_resilience_windows import proxy_snapshot, proxy_disable, proxy_restore
+                    before = proxy_snapshot()
+                    if not before.get("ProxyEnable", {}).get("value"):
+                        return False
+                    # Share the durable proxy journal/finally recovery used by the
+                    # three-stage controller, including process-crash recovery.
+                    journal_path = data_directory() / "recovery.json"
+                    state = json.loads(journal_path.read_text(encoding="utf-8")) if journal_path.is_file() else {}
+                    if state.get("proxy_before") is not None:
+                        return False
+                    from campus_install import atomic_json
+                    state["proxy_before"] = before
+                    atomic_json(journal_path, state)
+                    try:
+                        proxy_disable()
+                        _REAL_SLEEP(1.0)
+                    finally:
+                        proxy_restore(before)
+                        state["proxy_before"] = None
+                        atomic_json(journal_path, state)
+                    ok = True
                     self.log.info("[Clash] 系统代理开关一次：%s",
                                   "成功" if ok else "失败")
                 except Exception as exc:  # noqa: BLE001
@@ -3228,29 +3279,8 @@ class TrayApp:
                                      type(exc).__name__)
                     ok = False
             elif action == "restart_verge":
-                try:
-                    import subprocess
-
-                    subprocess.run(["taskkill", "/f", "/im", "Clash Verge.exe"],
-                                   capture_output=True, timeout=15)
-                    _REAL_SLEEP(2.0)
-                    started = False
-                    for candidate in ("Clash Verge.exe", "clash-verge.exe"):
-                        path = shutil.which(candidate)
-                        if path:
-                            subprocess.Popen([path],
-                                             stdout=subprocess.DEVNULL,
-                                             stderr=subprocess.DEVNULL)
-                            started = True
-                            break
-                    self.log.info("[Clash] 重启 Verge：%s",
-                                  "已尝试拉起" if started else
-                                  "未找到可执行文件，请手动打开 Verge")
-                    ok = started
-                except Exception as exc:  # noqa: BLE001
-                    self.log.warning("[Clash] 重启 Verge 失败：%s",
-                                     type(exc).__name__)
-                    ok = False
+                self.log.warning("[Clash] 需要在客户端检查代理；未自动停止代理进程")
+                ok = False
         return ok
 
     def _wifi_bringup(self, ssid: str):
@@ -4067,6 +4097,7 @@ class TrayApp:
                              checked=lambda item: bool(self.config.get("browser_fallback"))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("设置面板", self.on_settings),
+            pystray.MenuItem("校园网代理兼容检查", lambda icon, item: self._ui_post(self._open_proxy_compat)),
             pystray.MenuItem("更新账号/密码", self.on_update_credentials),
             pystray.MenuItem("清除凭据", self.on_clear_credentials),
             pystray.MenuItem("重启监测", self.restart_monitor),
@@ -4100,6 +4131,10 @@ class TrayApp:
             messagebox.showerror("清除失败", result.detail)
 
     # ---------- 设置面板 ----------
+    def _open_proxy_compat(self):
+        from campus_proxy_ui import open_dialog
+        open_dialog(self)
+
     def _open_settings(self):
         """设置面板：Notebook 五页（基本 / 网络 / 恢复 / UU Remote / 诊断，方案 §5.5）。
 
@@ -4231,6 +4266,8 @@ class TrayApp:
         ttk.Label(net, text="采集最小间隔（秒）").grid(row=8, column=0, sticky="e", **pad)
         ttk.Spinbox(net, from_=1, to=60, textvariable=v_snap_interval, width=18).grid(
             row=8, column=1, sticky="w", **pad)
+        ttk.Button(net, text="校园网代理兼容检查与修复…",
+                   command=self._open_proxy_compat).grid(row=9, column=0, columnspan=2, sticky="w", pady=10)
 
         # ---- 页 3：恢复 ----
         recover = page("恢复")
@@ -4589,6 +4626,9 @@ def _startup_check(report: Path) -> int:
     """验证打包后的仪表盘，不读取用户配置或凭据，不启动监测。"""
     root = None
     try:
+        from campus_proxy_compat import enhance_config, CAMPUS_RULES
+        if enhance_config({})["rules"] != list(CAMPUS_RULES):
+            raise RuntimeError("Packaged proxy compatibility self-check failed")
         if getattr(sys, "frozen", False):
             import io
             from PIL import Image, ImageDraw, ImageFont
@@ -4720,6 +4760,9 @@ def main(argv=None) -> int:
     app.start()
     if not args.background:
         app.on_dashboard()
+    if packaged:
+        from campus_proxy_ui import offer_onboarding
+        offer_onboarding(app, background=args.background)
     if args.update_receipt is not None:
         from campus_install import atomic_json
         atomic_json(args.update_receipt, {"version": __version__})

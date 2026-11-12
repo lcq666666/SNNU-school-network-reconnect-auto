@@ -98,7 +98,7 @@ def _open_app():
     except tk.TclError:
         pytest.skip("无显示环境")
     root.withdraw()
-    app = tray.TrayApp(LOG)
+    app = tray.TrayApp(LOG, config=dict(tray.DEFAULT_CONFIG))
     app.root = root
     app.config = dict(tray.DEFAULT_CONFIG)
     app._open_dashboard()

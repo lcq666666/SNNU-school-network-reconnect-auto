@@ -39,6 +39,9 @@ def test_background_duplicate_exits_without_dialog(monkeypatch):
 @pytest.mark.parametrize("packaged", [False, True])
 def test_manual_start_queues_dashboard_after_starting_tray(monkeypatch, args, open_dashboard, packaged):
     import campus_resilience_windows as native
+    import campus_proxy_ui
+    onboarding = Mock()
+    monkeypatch.setattr(campus_proxy_ui, "offer_onboarding", onboarding)
     monkeypatch.setattr(tray.sys, "frozen", packaged, raising=False)
     monkeypatch.setattr(tray, "get_autostart_command", lambda: '"C:/old/CampusReconnect.exe" --background')
     monkeypatch.setattr(tray, "autostart_matches_current", lambda: False)
@@ -61,5 +64,6 @@ def test_manual_start_queues_dashboard_after_starting_tray(monkeypatch, args, op
     assert tray.set_autostart.call_count == int(packaged)
     app.start.assert_called_once_with()
     assert app.on_dashboard.call_count == int(open_dashboard)
+    assert onboarding.call_count == int(packaged)
     if open_dashboard:
         assert app.method_calls.index(call.on_dashboard()) > app.method_calls.index(call.start())

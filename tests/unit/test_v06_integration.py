@@ -19,7 +19,7 @@ LOG = logging.getLogger("campus")
 
 
 def _app(**cfg):
-    app = tray.TrayApp(LOG)
+    app = tray.TrayApp(LOG, config=dict(tray.DEFAULT_CONFIG))
     app.config = dict(tray.DEFAULT_CONFIG)
     app.config.update(cfg)
     return app
@@ -124,7 +124,8 @@ def test_clash_heal_execute_uses_injected_ops():
 
 
 def test_dual_axis_check_heals_on_proxy_timeout(monkeypatch):
-    app = _app()
+    app = _app(proxy_endpoint="127.0.0.1:10999", clash_auto_proxy=True)
+    monkeypatch.setattr(tray.engine, "tcp_probe", lambda *args: False)
     executed = []
     monkeypatch.setattr(
         app, "_clash_heal_execute", lambda plan: executed.append(plan) or True)
@@ -141,7 +142,7 @@ def test_dual_axis_check_heals_on_proxy_timeout(monkeypatch):
 
 
 def test_dual_axis_check_healthy_resets_attempts(monkeypatch):
-    app = _app()
+    app = _app(proxy_endpoint="127.0.0.1:10999")
     app._clash_heal_attempts = 2
     monkeypatch.setattr(
         tray, "probe_via_proxy",
