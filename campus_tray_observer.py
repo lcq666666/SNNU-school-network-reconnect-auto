@@ -59,6 +59,24 @@
 ``RefusingExecutor`` 依旧零副作用，既有消费方零行为变化。分级信息
 （``mode`` / ``stale_for`` / ``grace_left`` / ``lkg_snapshot``）只是为阶段 C
 的白名单执行器准备的依据；宽限窗口有界（默认 60s），不会形成永久自锁。
+
+阶段 C（V0.7.1，2026-11-12）：分级执行器
+========================================
+阶段 B 只给出「是否可以有限降级」的判定；状态机 ``NetworkFailoverManager.tick``
+在 ``trusted=False`` 时**根本不调用 ``_decide()``**，动作计划恒为空，所以仅替换
+执行器无法解除自锁。阶段 C 在用户确认的三条边界内第一次放宽 fail-closed：
+
+* 只有调用方**显式**登记 ``MODE_DEGRADED`` 才启用；缺省登记路径仍是
+  ``FULL`` / ``REFUSED`` 二元语义（阶段 A/B 的全部既有行为零变化）；
+* ``DEGRADED`` 时把 ``usable_snapshot``（LKG，年龄 <= 90s）作为**只读上下文**
+  喂给状态机，动作仍只经单一副作用门；``GradedExecutor`` 只放行
+  ``PORTAL_POST`` / ``WIFI_RECONNECT``，其余一律 ``attempted=False`` 拒绝；
+* 每个 ``network_epoch`` 限次 + 全局 >=180s 冷却；宽限耗尽 / 无 LKG /
+  非 AUTO 授权 / 冷却中立即退化回 ``RefusingExecutor``；
+* 双链路整合层与时间线仍收到 ``trusted=False``：**不安排验证、不重启 UU**。
+
+观测数据结构未变，故 ``CONTRACT_VERSION`` 保持 ``v03-p75-obs-2``；新增的
+``GRADED_CONTRACT_VERSION`` 只标记分级执行器契约。
 """
 from __future__ import annotations
 
@@ -79,8 +97,12 @@ __all__ = [
     "MODE_FULL", "MODE_DEGRADED", "MODE_REFUSED", "OBSERVATION_MODES",
     "DEFAULT_DEGRADED_GRACE", "MAX_DEGRADED_GRACE", "DEGRADABLE_REASONS",
     "ObservationResult", "snapshot_signature", "is_full_snapshot",
-    "check_snapshot_budget", "check_degraded_window", "TraySnapshotSource",
-    "RefusingExecutor", "format_observation", "is_auto_executable_snapshot",
+    "check_snapshot_budget", "check_degraded_window", "check_graded_budget",
+    "GRADED_CONTRACT_VERSION", "DEGRADED_ALLOWED_KINDS",
+    "DEFAULT_GRADED_MAX_PER_EPOCH", "MIN_GRADED_COOLDOWN",
+    "DEFAULT_GRADED_COOLDOWN", "MAX_GRADED_COOLDOWN",
+    "TraySnapshotSource", "RefusingExecutor", "GradedExecutor",
+    "format_observation", "is_auto_executable_snapshot",
 ]
 
 #: 阶段 B 新增 mode / stale_for / grace_left / lkg_snapshot 字段，契约升版。
@@ -148,6 +170,30 @@ DEGRADABLE_REASONS: frozenset = frozenset({
     SNAPSHOT_STALE, SNAPSHOT_COLLECT_ERROR, SNAPSHOT_COLLECT_TIMEOUT,
     SNAPSHOT_COLLECTING,
 })
+
+# --------------------------------------------------------------------------- #
+# 阶段 C：分级执行器的安全参数
+# --------------------------------------------------------------------------- #
+#: 分级执行器契约版本（观测数据结构未变，故与 CONTRACT_VERSION 分开标记）。
+GRADED_CONTRACT_VERSION = "v03-p75-graded-1"
+
+#: DEGRADED 唯一允许执行的动作（按 ``OpKind.value`` 字符串比较，避免模块级
+#: 循环依赖；``METRIC_WRITE`` / ``CLASH_TOUCH`` 与 UU 重启一律拒绝）。
+# 用户 2026-11-12 确认：只放行「用来把网络修好」的 Portal 认证与 Wi-Fi 重连，
+# 且这两类本来就不在 VerifiedActionGate 的验证前置门内。
+DEGRADED_ALLOWED_KINDS: frozenset = frozenset({
+    "portal_post", "wifi_reconnect",
+})
+
+#: 每个 ``network_epoch`` 最多放行的白名单动作次数（用户确认值）。
+DEFAULT_GRADED_MAX_PER_EPOCH = 2
+#: 冷却硬下限：阶段 A 文档 §6 要求 >=180s，构造期钳位，禁止配小。
+MIN_GRADED_COOLDOWN = 180.0
+#: 全局冷却默认值（用户确认值）。因 180s > 90s 降级窗口，
+#: 实际每个降级窗口最多执行 1 次白名单动作。
+DEFAULT_GRADED_COOLDOWN = 180.0
+#: 冷却硬上限：防止把「限次」配成事实上的永久禁用。
+MAX_GRADED_COOLDOWN = 3600.0
 
 #: 各结论的人类可读说明（托盘告警与日志用）。
 STATE_TEXT: Dict[str, str] = {
@@ -234,6 +280,36 @@ def check_degraded_window(max_age: float, degraded_grace: float, *,
     if math.isfinite(grace) and max_age + grace < cycle:
         reasons.append("总窗口 %.1fs < 病态采集周期 %.1fs：宽限会在采集期间提前耗尽"
                        % (max_age + grace, cycle))
+    return (not reasons, tuple(reasons))
+
+
+def check_graded_budget(max_per_epoch: int, cooldown: float
+                        ) -> Tuple[bool, Tuple[str, ...]]:
+    """校验阶段 C「限次 + 冷却」是否自洽（纯函数，零 I/O）。
+
+    三条不变量：
+
+    1. ``max_per_epoch`` 必须是 1..10 的整数 —— 否则等于无限放行或形同虚设；
+    2. ``cooldown >= MIN_GRADED_COOLDOWN``（180s）—— 阶段 A 文档 §6 的硬下限；
+    3. ``cooldown <= MAX_GRADED_COOLDOWN`` 且为有限值 —— 不得变成永久禁用。
+
+    默认 ``(2, 180)`` 通过。返回 ``(coherent, reasons)``。
+    """
+    reasons = []
+    if isinstance(max_per_epoch, bool) or not isinstance(max_per_epoch, int) \
+            or not 1 <= max_per_epoch <= 10:
+        reasons.append("每 epoch 限次 %r 必须是 1..10 的整数" % (max_per_epoch,))
+    try:
+        value = float(cooldown)
+    except (TypeError, ValueError):
+        reasons.append("冷却 %r 不是数值" % (cooldown,))
+        return (False, tuple(reasons))
+    if not math.isfinite(value) or value < MIN_GRADED_COOLDOWN:
+        reasons.append("冷却 %.1fs 低于下限 %.0fs：不得高频冲击 Portal / Wi-Fi"
+                       % (value, MIN_GRADED_COOLDOWN))
+    elif value > MAX_GRADED_COOLDOWN:
+        reasons.append("冷却 %.1fs 超过上限 %.0fs：等同永久禁用降级恢复"
+                       % (value, MAX_GRADED_COOLDOWN))
     return (not reasons, tuple(reasons))
 
 
@@ -860,6 +936,151 @@ class RefusingExecutor:
         return OpOutcome(kind, gate_passed=True, attempted=False,
                          executed=False,
                          detail="拒绝执行：%s" % self.reason)
+
+
+# --------------------------------------------------------------------------- #
+# 阶段 C：DEGRADED 白名单执行器
+# --------------------------------------------------------------------------- #
+class GradedExecutor:
+    """有界降级期间**只放行白名单动作**的执行器（阶段 C）。
+
+    包住真实执行器（``delegate``），协议与 ``NetworkOpScheduler._invoke()``
+    完全一致：``execute(request)`` 可返回 ``OpOutcome`` / ``True|None`` /
+    ``False`` / ``str``。桥接层只在**显式登记** ``MODE_DEGRADED`` 且本执行器
+    :attr:`active` 为真时把它接入单一副作用门；其余情况一律换回
+    :class:`RefusingExecutor`。
+
+    安全边界（用户 2026-11-12 确认）：
+
+    * 白名单仅 ``PORTAL_POST`` / ``WIFI_RECONNECT``；``METRIC_WRITE`` /
+      ``CLASH_TOUCH`` 一律拒绝，UU 重启由整合层的 ``trusted=False`` 拒绝；
+    * 拒绝时沿用 P7.5-1A 语义：``attempted=False``、``executed=False``，
+      **不消耗**状态机的认证 / 重连 / 切换冷却，也不谎报状态迁移；
+    * 每个 ``network_epoch`` 最多 ``max_per_epoch`` 次（默认 2），全局
+      ``cooldown``（默认 180s）内不重复尝试；参数由
+      :func:`check_graded_budget` 在构造期钳位；
+    * ``grace_left <= 0``（宽限耗尽）/ 无 LKG / 无真实执行层 ⇒ ``active=False``，
+      调用方应立即退化回 ``RefusingExecutor``。
+
+    所有判定数据都由调用方通过 :meth:`update` 每轮显式注入（``grace_left`` /
+    ``epoch`` / ``now``），本类**不读时钟、不做 I/O**，可被虚拟时钟精确测试。
+    """
+
+    def __init__(self, delegate: Any, *, grace_left: float = 0.0,
+                 epoch: int = 0, now: float = 0.0,
+                 max_per_epoch: int = DEFAULT_GRADED_MAX_PER_EPOCH,
+                 cooldown: float = DEFAULT_GRADED_COOLDOWN,
+                 log: Optional[Callable[[str], None]] = None) -> None:
+        coherent, reasons = check_graded_budget(max_per_epoch, cooldown)
+        if not coherent:
+            raise ValueError("分级执行器预算不合法：%s" % "；".join(reasons))
+        self.delegate = delegate
+        self.grace_left = max(0.0, float(grace_left))
+        self.epoch = int(epoch)
+        self.now = float(now)
+        self.max_per_epoch = int(max_per_epoch)
+        self.cooldown = float(cooldown)
+        self._log = log
+        #: epoch -> 已放行（attempted）的动作次数。
+        self._epoch_counts: Dict[int, int] = {}
+        self._last_attempt_at: Optional[float] = None
+        #: 审计台账：放行的 ``(epoch, kind, now, outcome)`` 与被拒的 ``(kind, 理由)``。
+        self.allowed: list = []
+        self.refused: list = []
+
+    # ---- 每轮由桥接层注入上下文 ---- #
+    def update(self, *, grace_left: float, epoch: int, now: float) -> bool:
+        """登记本轮 DEGRADED 上下文，返回分级窗口是否仍 ``active``。"""
+        self.grace_left = max(0.0, float(grace_left))
+        self.epoch = int(epoch)
+        self.now = float(now)
+        return self.active
+
+    @property
+    def actions_left(self) -> int:
+        """当前 ``network_epoch`` 还剩几次白名单动作名额。"""
+        return max(0, self.max_per_epoch - self._epoch_counts.get(self.epoch, 0))
+
+    @property
+    def cooldown_left(self) -> float:
+        """距下一次可尝试还剩多少秒（从未尝试则为 0）。"""
+        if self._last_attempt_at is None:
+            return 0.0
+        elapsed = max(0.0, self.now - self._last_attempt_at)
+        return max(0.0, self.cooldown - elapsed)
+
+    @property
+    def active(self) -> bool:
+        """当前是否允许桥接层把 LKG 交给状态机并接入本执行器。
+
+        宽限耗尽 / 限次用尽 / 冷却中 / 无真实执行层都会使窗口立即关闭，
+        调用方据此把单一副作用门换回 ``RefusingExecutor``（fail-closed）。
+        """
+        return bool(self.delegate is not None and self.grace_left > 0
+                    and self.actions_left > 0 and self.cooldown_left <= 0.0)
+
+    # ---- 门禁 ---- #
+    def block_reason(self, kind_value: str) -> str:
+        """返回拒绝理由；空串表示可放行（纯函数，不改状态）。"""
+        if kind_value not in DEGRADED_ALLOWED_KINDS:
+            return "非 DEGRADED 白名单动作（%s）" % (kind_value or "未知")
+        if self.delegate is None:
+            return "真实执行层未接入"
+        if self.grace_left <= 0:
+            return "DEGRADED 有界宽限已耗尽"
+        if self.actions_left <= 0:
+            return "本 network_epoch 限次已用尽"
+        if self.cooldown_left > 0:
+            return "降级动作冷却剩余 %.0fs" % self.cooldown_left
+        return ""
+
+    def execute(self, request: Any) -> Any:
+        """通过白名单与预算门禁后才调用真实执行器。"""
+        from campus_failover import OpOutcome
+
+        kind = getattr(request, "kind", None)
+        label = str(getattr(kind, "value", kind) or "")
+        reason = self.block_reason(label)
+        if reason:
+            self.refused.append((kind, reason))
+            self._note("拒绝执行 %s：%s" % (label or "?", reason))
+            return OpOutcome(kind, gate_passed=True, attempted=False,
+                             executed=False, detail="拒绝执行：%s" % reason)
+        outcome = self._invoke_delegate(request, kind)
+        self.allowed.append((self.epoch, kind, self.now, outcome))
+        if outcome.attempted:
+            self._epoch_counts[self.epoch] = self._epoch_counts.get(self.epoch, 0) + 1
+            self._last_attempt_at = self.now
+        self._note("DEGRADED 放行 %s：%s" % (label, outcome.detail or "已执行"))
+        return outcome
+
+    def _invoke_delegate(self, request: Any, kind: Any) -> Any:
+        """复用 ``NetworkOpScheduler._invoke`` 的返回值语义（含异常兜底）。"""
+        from campus_failover import OpOutcome
+
+        try:
+            if hasattr(self.delegate, "execute"):
+                raw = self.delegate.execute(request)
+            else:
+                raw = self.delegate(request)
+        except Exception as exc:                       # 执行器故障不得上抛
+            return OpOutcome(kind, gate_passed=True, attempted=True,
+                             detail="执行器异常：%s: %s"
+                                    % (type(exc).__name__, exc))
+        if isinstance(raw, OpOutcome):
+            return raw
+        if raw is None or raw is True:
+            return OpOutcome(kind, gate_passed=True, attempted=True,
+                             executed=True, detail="已执行")
+        if raw is False:
+            return OpOutcome(kind, gate_passed=True, attempted=True,
+                             detail="执行失败")
+        return OpOutcome(kind, gate_passed=True, attempted=True,
+                         executed=True, detail=str(raw))
+
+    def _note(self, message: str) -> None:
+        if self._log is not None:
+            self._log(message)
 
 
 # --------------------------------------------------------------------------- #

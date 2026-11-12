@@ -78,7 +78,8 @@ from campus_windows import CredentialStore, ProxyController, default_refresh
 from campus_install import data_directory, migrate_config, previous_install_directory
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
                                   parse_lock, parse_mode, tray_mode_label)
-from campus_tray_observer import (ObservationResult, TraySnapshotSource,
+from campus_tray_observer import (MODE_DEGRADED, MODE_REFUSED,
+                                  ObservationResult, TraySnapshotSource,
                                   is_auto_executable_snapshot,
                                   is_full_snapshot)
 from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
@@ -978,14 +979,18 @@ class TrayApp:
         return self.last_observation
 
     def _full_snapshot(self):
-        """默认快照提供者：仅在观测**可信**时返回完整三轴快照。
+        """默认快照提供者：返回本轮**可用**的完整三轴快照（阶段 C）。
 
-        不可信（缺失 / 过期 / 代次失效 / 结构不完整 / 采集失败）时返回 ``None``，
-        由 :meth:`_build_failover_snapshot` 回退到轻量占位快照 —— 该占位快照
-        **只用于显示**，不授权任何网络副作用。
+        - ``FULL``：本轮可信快照；
+        - ``DEGRADED``：``usable_snapshot`` 即 LKG（年龄 <= 90s 的只读上下文），
+          仅喂给状态机产生动作计划，动作仍由 ``GradedExecutor`` 白名单把关；
+        - ``REFUSED``：``None`` → 轻量占位快照（只用于显示，不授权任何副作用）。
+
+        注意：LKG 不是「新鲜可信数据」，``observation.trusted`` 仍为 ``False``；
+        双链路整合层 / 时间线 / UU 重启仍按 ``trusted=False`` 保持 fail-closed。
         """
         observation = self._observe_snapshot()
-        return observation.snapshot if observation.trusted else None
+        return observation.usable_snapshot
 
     def invalidate_snapshot(self, reason: str = "") -> int:
         """作废旧的三轴观测代次（SSID / 模式 / 配置变化后调用）。"""
@@ -1032,19 +1037,42 @@ class TrayApp:
         snapshot = self._build_failover_snapshot(online)
         observation = getattr(self, "last_observation", None)
         trusted = bool(observation is not None and observation.trusted)
+        obs_mode = (str(getattr(observation, "mode", "") or "")
+                    if observation is not None else "")
         reason = observation.reason_text if observation is not None else ""
+        grace_left = float(getattr(observation, "grace_left", 0.0) or 0.0)
         # AUTO 需要识别目标网卡。已确认只有 Wi-Fi 的电脑仅执行无线恢复。
         if trusted and bridge.mode is FailoverMode.AUTO:
             ok, auto_reason = is_auto_executable_snapshot(snapshot)
             if not ok:
                 trusted = False
+                obs_mode = MODE_REFUSED
                 reason = "AUTO 快照契约不满足：%s" % auto_reason
                 self.log.warning(reason)
-        # 可信度门禁（P7.5-1）：数据不足时 AUTO 一律拒绝执行网络副作用。
-        bridge.set_snapshot_trust(trusted, reason)
+        # 阶段 C：DEGRADED 必须同时满足「显式开关 + LKG 可定位目标接口 +
+        # 宽限未耗尽」才登记；任一不满足立即退回严格 fail-closed。
+        if obs_mode == MODE_DEGRADED:
+            usable = getattr(observation, "usable_snapshot", None)
+            ok, auto_reason = is_auto_executable_snapshot(usable)
+            if not self.config.get("graded_recovery_enabled", True):
+                obs_mode = MODE_REFUSED
+                reason = "DEGRADED 降级恢复已被配置关闭"
+            elif not ok or grace_left <= 0:
+                obs_mode = MODE_REFUSED
+                reason = "DEGRADED LKG 不满足 AUTO 契约或宽限耗尽：%s" % auto_reason
+        epoch = int(getattr(getattr(self, "dual_path", None),
+                            "network_epoch", 0) or 0)
+        # 可信度门禁（P7.5-1 / 阶段 C）：不可信时按观测模式选择拒绝或白名单执行器。
+        bridge.set_snapshot_trust(trusted, reason, mode=obs_mode,
+                                  grace_left=grace_left, epoch=epoch, now=now)
         if not trusted:
-            self.log.info("三轴快照不可信（%s）：本轮不执行任何网络副作用",
-                          reason)
+            if bridge.graded_active:
+                self.log.info(
+                    "三轴快照不可信（%s）：DEGRADED 有界降级，仅放行白名单动作"
+                    "（剩余宽限 %.0fs，epoch=%d）", reason, grace_left, epoch)
+            else:
+                self.log.info("三轴快照不可信（%s）：本轮不执行任何网络副作用",
+                              reason)
         elif (self.config.get("remote_restart_enabled", False)
               and not getattr(self, "_v06_had_outage", False)
               and getattr(getattr(snapshot, "ethernet", None), "state", None) is not HealthState.HEALTHY
@@ -1057,11 +1085,15 @@ class TrayApp:
         if result is not None and result.executed:
             self.log.info("故障切换已执行动作：%s",
                           ", ".join(o.kind.value for o in result.executed))
-        # V0.5-4：把本轮迁移交给恢复整合层（零 I/O 判定；需要验证时起后台线程）。
+        # V0.5-4：整合层仍收到 trusted=False —— 不安排验证、不切换、不重启 UU。
         self._dual_path_step(now, snapshot, trusted=trusted, result=result)
         # V0.5-6：把本轮观测记入网络事件时间线（只记录，不判定；零 I/O）。
+        timeline_detail = reason
+        if obs_mode == MODE_DEGRADED:
+            timeline_detail = "%s；观测模式 DEGRADED（LKG 剩余宽限 %.0fs）" % (
+                reason, grace_left)
         self._timeline_observe(now, online, trusted=trusted, snapshot=snapshot,
-                               result=result, detail=reason)
+                               result=result, detail=timeline_detail)
         return result
 
     # ---------- V0.5-4：双链路恢复整合（路径验证 + 恢复协调器 + UU 恢复）----------

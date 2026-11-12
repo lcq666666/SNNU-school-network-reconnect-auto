@@ -18,12 +18,23 @@
 - **Clash 保持原样**（``clash_keep``，方案 §9）：默认开启；本模块不做任何
   Clash 触碰，仅记录该策略（``CLASH_TOUCH`` 由 P5 显式拒绝）。
 
+阶段 C（V0.7.1）：有界降级的分级执行器
+--------------------------------------
+``set_snapshot_trust()`` 新增**可选**关键字 ``mode`` / ``grace_left`` /
+``epoch`` / ``now``。不传 ``mode`` 时行为与 P7.5-1 完全一致（``FULL`` →
+真实执行器、``REFUSED`` → :class:`RefusingExecutor`）。只有调用方**显式**登记
+``MODE_DEGRADED`` 且宽限 / 限次 / 冷却均允许时，才把真实执行器包进
+:class:`GradedExecutor`，并允许状态机基于 LKG 只读上下文继续生成动作计划；
+其余情况立即退化回 ``RefusingExecutor``。双链路整合层与 UU 重启的
+``trusted`` 判定**不在本层**，由托盘保持 ``False``（不重启 UU）。
+
 测试分级：``U-6-*`` 单元 / 离线 Mock；``I-6-*`` 离线集成闭合回路。
 约束：零真实网络 / 零真实路由写入 / 零真实注册表写入 / 零真实凭据读取 /
 零真实浏览器启动 / 零真实 sleep。
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -33,7 +44,10 @@ from campus_failover import (RELIABLE_FAILURE_STATES, UNRELIABLE_STATES,
                              TickResult)
 from campus_network import (HealthState, InterfaceHealth,
                             NetworkHealthSnapshot)
-from campus_tray_observer import RefusingExecutor
+from campus_tray_observer import (DEFAULT_GRADED_COOLDOWN,
+                                  DEFAULT_GRADED_MAX_PER_EPOCH,
+                                  MODE_DEGRADED, MODE_FULL, MODE_REFUSED,
+                                  GradedExecutor, RefusingExecutor)
 
 __all__ = [
     "CONTRACT_VERSION", "MODE_ORDER", "DEFAULT_MODE", "DEFAULT_CLASH_KEEP",
@@ -41,6 +55,7 @@ __all__ = [
     "REMOTE_SENSITIVE", "STATE_LABEL", "TRAY_MODE_LABEL", "parse_mode",
     "parse_lock", "tray_mode_label", "light_snapshot", "FailoverStatus",
     "TrayFailoverBridge", "format_status",
+    "DEFAULT_GRADED_MAX_PER_EPOCH", "DEFAULT_GRADED_COOLDOWN",
 ]
 
 CONTRACT_VERSION = "v03-p6-tray-1"
@@ -231,6 +246,10 @@ class FailoverStatus:
     clash_keep: bool = DEFAULT_CLASH_KEEP
     authorized: bool = False
     executor_attached: bool = False
+    #: 阶段 C：本轮观测模式（``""`` = 未登记，按 P7.5-1 的 trusted 二元语义）。
+    observation_mode: str = ""
+    #: 阶段 C：当前 network_epoch 剩余的白名单动作名额（非 DEGRADED 恒为 0）。
+    graded_actions_left: int = 0
     last_switch_at: Optional[float] = None
     last_switch_reason: str = ""
     last_switch_result: str = ""
@@ -266,6 +285,8 @@ class FailoverStatus:
             "clash_keep": self.clash_keep,
             "authorized": self.authorized,
             "executor_attached": self.executor_attached,
+            "observation_mode": self.observation_mode,
+            "graded_actions_left": self.graded_actions_left,
             "last_switch_at": self.last_switch_at,
             "last_switch_reason": self.last_switch_reason,
             "last_switch_result": self.last_switch_result,
@@ -305,6 +326,9 @@ class FailoverStatus:
         add("  本轮副作用  : %s" % ("只读（零执行）" if self.readonly else "已执行动作"))
         add("  执行层      : %s"
             % ("已接入（显式授权）" if self.executor_attached else "未接入"))
+        if self.observation_mode == MODE_DEGRADED:
+            add("  观测模式    : DEGRADED（有界降级；白名单剩余 %d 次）"
+                % self.graded_actions_left)
         for warning in self.warnings:
             add("  告警        : %s" % warning)
         return lines
@@ -339,6 +363,8 @@ class TrayFailoverBridge:
                  remote_guard: Optional[Any] = None,
                  defer_failback: bool = True,
                  action_gate: Optional[Any] = None,
+                 graded_max_per_epoch: int = DEFAULT_GRADED_MAX_PER_EPOCH,
+                 graded_cooldown: float = DEFAULT_GRADED_COOLDOWN,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.mode = parse_mode(mode)
         self.lock_target = parse_lock(lock_target)
@@ -370,6 +396,15 @@ class TrayFailoverBridge:
         #: AUTO 下**拒绝**执行任何网络副作用（F75-01）。
         self.snapshot_trust: Optional[bool] = None
         self.snapshot_reason: str = ""
+        # ---- 阶段 C：有界降级上下文（全部带安全缺省，既有构造零变化）---- #
+        #: 本轮观测模式；空串 = 未登记，按 ``trusted`` 推导 FULL / REFUSED。
+        self.observation_mode: str = ""
+        self.graded_max_per_epoch = int(graded_max_per_epoch)
+        self.graded_cooldown = float(graded_cooldown)
+        self._graded_grace_left: float = 0.0
+        self._graded_epoch: int = 0
+        self._graded_now: float = 0.0
+        self._graded: Optional[GradedExecutor] = None
         self._sync_executor()
 
     # ---- 执行器接线（默认不接入；显式授权 + 工厂齐备才接入） ---- #
@@ -378,50 +413,106 @@ class TrayFailoverBridge:
         """单一副作用门当前是否已接入真实执行器（未接入=动作仅计划不执行）。"""
         return self.manager.scheduler.executor is not None
 
-    def set_snapshot_trust(self, trusted: bool, reason: str = "") -> bool:
-        """登记本轮快照的可信度，据此门控单一副作用门（P7.5-1）。
+    def set_snapshot_trust(self, trusted: bool, reason: str = "", *,
+                           mode: Optional[str] = None,
+                           grace_left: float = 0.0, epoch: int = 0,
+                           now: Optional[float] = None) -> bool:
+        """登记本轮快照的可信度，据此门控单一副作用门（P7.5-1 / 阶段 C）。
 
         - ``trusted=True`` → 按「模式 + 授权 + 工厂」恢复真实执行器；
-        - ``trusted=False`` → 换成 :class:`RefusingExecutor`：动作照常登记为
-          "已尝试"，但 ``executed`` 恒为 ``False``，Portal POST / Wi-Fi 重连 /
-          Metric 写入**一个都不会发生**。
+        - ``trusted=False`` + **未传 ``mode``**（阶段 A/B 的全部既有调用）→
+          换成 :class:`RefusingExecutor`，语义逐字不变；
+        - ``trusted=False`` + 显式 ``mode=DEGRADED`` → 仅在宽限 / 限次 / 冷却
+          均允许且真实执行层在位时接入 :class:`GradedExecutor`（白名单），
+          否则**立即退化**回 :class:`RefusingExecutor`；
+        - ``mode=REFUSED``（或不一致的 ``DEGRADED`` + ``trusted=True``）→
+          严格 fail-closed。
+
+        ``grace_left`` / ``epoch`` / ``now`` 只喂给分级执行器做有界判定，
+        本层不读时钟也不做 I/O；``now`` 缺省时才退化为 ``time.monotonic()``。
         """
         value = bool(trusted)
+        resolved = str(mode) if mode else (MODE_FULL if value else MODE_REFUSED)
+        if resolved == MODE_DEGRADED and value:
+            # trusted 与 DEGRADED 矛盾：按更严格的一侧处理，绝不误放行。
+            resolved = MODE_REFUSED
+        if resolved not in (MODE_FULL, MODE_DEGRADED, MODE_REFUSED):
+            resolved = MODE_REFUSED
         if self.snapshot_trust is not value or reason != self.snapshot_reason:
             self._note("三轴快照可信度：%s（%s）"
                        % ("可信" if value else "不可信", reason or "未说明"))
         self.snapshot_trust = value
         self.snapshot_reason = str(reason or "")
+        self.observation_mode = resolved
+        self._graded_grace_left = max(0.0, float(grace_left))
+        self._graded_epoch = int(epoch)
+        moment = time.monotonic() if now is None else float(now)
+        self._graded_now = moment
         self._sync_executor()
         return value
 
+    @property
+    def graded_active(self) -> bool:
+        """本轮是否处于「可放行白名单动作」的有界降级窗口。"""
+        if self.snapshot_trust is not False \
+                or self.observation_mode != MODE_DEGRADED:
+            return False
+        executor = self.manager.scheduler.executor
+        return isinstance(executor, GradedExecutor) and executor.active
+
+    def _base_executor(self) -> Optional[Any]:
+        """按「模式 + 显式授权 + 工厂」解析真实执行器（失败返回 ``None``）。"""
+        want = (self.mode is FailoverMode.AUTO and self.authorized
+                and self.executor_factory is not None)
+        if not want:
+            return None
+        if self._executor is None:
+            try:
+                self._executor = self.executor_factory()
+            except Exception as exc:            # 工厂故障不得让托盘崩溃
+                self._note("执行器工厂构造失败：%s: %s"
+                           % (type(exc).__name__, exc))
+                self._executor = None
+        return self._executor
+
+    def _graded_executor(self) -> Optional[GradedExecutor]:
+        """复用同一个分级执行器实例（保留 epoch 计数与冷却台账）。"""
+        delegate = self._base_executor()
+        if delegate is None:
+            return None
+        if self._graded is None or self._graded.delegate is not delegate:
+            try:
+                self._graded = GradedExecutor(
+                    delegate, max_per_epoch=self.graded_max_per_epoch,
+                    cooldown=self.graded_cooldown, log=self._log)
+            except ValueError as exc:          # 非法预算一律 fail-closed
+                self._note("分级执行器构造失败：%s" % exc)
+                return None
+        self._graded.update(grace_left=self._graded_grace_left,
+                            epoch=self._graded_epoch, now=self._graded_now)
+        return self._graded
+
     def _sync_executor(self) -> None:
-        """按「快照可信度 + 模式 + 授权 + 工厂」决定单一副作用门的执行器。
+        """按「观测模式 + 快照可信度 + 授权 + 工厂」决定单一副作用门的执行器。
 
-        门禁顺序（P7.5-1：**数据可信优先于授权**）：
+        门禁顺序（P7.5-1：**数据可信优先于授权**；阶段 C 增加分级分支）：
 
-        1. 快照不可信 → :class:`RefusingExecutor`（零副作用，如实登记拒绝）；
-        2. 非 AUTO / 未授权 / 无工厂 → ``None``（动作仅计划不执行，P6 语义）；
-        3. AUTO + 已授权 + 工厂齐备 → 真实执行器。
+        1. 不可信 + DEGRADED + 有界窗口可用 → :class:`GradedExecutor`（白名单）；
+        2. 不可信（REFUSED / 宽限耗尽 / 无授权 / 冷却中）→ :class:`RefusingExecutor`；
+        3. 非 AUTO / 未授权 / 无工厂 → ``None``（动作仅计划不执行，P6 语义）；
+        4. AUTO + 已授权 + 工厂齐备 → 真实执行器。
         """
         if self.snapshot_trust is False:
+            if self.observation_mode == MODE_DEGRADED:
+                graded = self._graded_executor()
+                if graded is not None and graded.active:
+                    self.manager.scheduler.executor = graded
+                    return
             self.manager.scheduler.executor = RefusingExecutor(
                 "三轴快照不可信：%s" % (self.snapshot_reason or "数据不足"),
                 log=self._log)
             return
-        want = (self.mode is FailoverMode.AUTO and self.authorized
-                and self.executor_factory is not None)
-        if want:
-            if self._executor is None:
-                try:
-                    self._executor = self.executor_factory()
-                except Exception as exc:            # 工厂故障不得让托盘崩溃
-                    self._note("执行器工厂构造失败：%s: %s"
-                               % (type(exc).__name__, exc))
-                    self._executor = None
-            self.manager.scheduler.executor = self._executor
-        else:
-            self.manager.scheduler.executor = None
+        self.manager.scheduler.executor = self._base_executor()
 
     # ---- 远程保障接线（V0.3 P7）---- #
     def _failback_gate(self) -> Optional[Callable[[float], Any]]:
@@ -490,9 +581,15 @@ class TrayFailoverBridge:
 
     # ---- 主循环 ---- #
     def tick(self, now: float, snapshot: NetworkHealthSnapshot) -> TickResult:
-        """推进一轮：喂入只读快照，回传 :class:`TickResult`。"""
+        """推进一轮：喂入只读快照，回传 :class:`TickResult`。
+
+        阶段 C：仅当 ``graded_active``（显式 DEGRADED + 有界窗口可用）时，
+        才允许状态机基于调用方传入的 LKG 只读上下文继续 ``_decide()``；
+        动作仍全部经过单一副作用门的 :class:`GradedExecutor` 白名单。
+        """
         self._last_snapshot = snapshot
-        result = self.manager.tick(now, snapshot, trusted=self.snapshot_trust is not False)
+        decide = self.snapshot_trust is not False or self.graded_active
+        result = self.manager.tick(now, snapshot, trusted=decide)
         self.last_result = result
         self._record_switch(now, result)
         return result
@@ -533,13 +630,33 @@ class TrayFailoverBridge:
             warnings.extend(n for n in result.notes if "告警" in n)
         if self.snapshot_trust is False:
             # V0.3 P7.5-1：数据不可信时明确告知"不会执行"，而不是静默无动作。
-            warnings.append("三轴快照不可信（%s）：本轮不执行任何网络副作用"
-                            % (self.snapshot_reason or "数据不足"))
+            if self.observation_mode == MODE_DEGRADED:
+                graded = self.manager.scheduler.executor
+                if isinstance(graded, GradedExecutor) and graded.active:
+                    warnings.append(
+                        "三轴快照不可信（%s）：DEGRADED 有界降级，仅放行 "
+                        "Portal 认证 / Wi-Fi 重连（剩余宽限 %.0fs，名额 %d）"
+                        % (self.snapshot_reason or "数据不足",
+                           self._graded_grace_left, graded.actions_left))
+                elif self._graded_grace_left > 0:
+                    warnings.append(
+                        "三轴快照不可信（%s）：DEGRADED 冷却/限次中，"
+                        "本轮不执行任何网络副作用"
+                        % (self.snapshot_reason or "数据不足"))
+                else:
+                    warnings.append(
+                        "三轴快照不可信（%s）：DEGRADED 窗口已耗尽，"
+                        "本轮不执行任何网络副作用"
+                        % (self.snapshot_reason or "数据不足"))
+            else:
+                warnings.append("三轴快照不可信（%s）：本轮不执行任何网络副作用"
+                                % (self.snapshot_reason or "数据不足"))
         if manager.mode is FailoverMode.AUTO and not self.authorized:
             warnings.append("智能自动未授权：动作仅计划不执行（默认仅监测语义）")
         if locked and result is None:
             warnings.append("手动锁定：等待首次只读观察")
 
+        graded = self.manager.scheduler.executor
         return FailoverStatus(
             mode=manager.mode, state=manager.state, preferred=preferred,
             primary=primary, backup=backup,
@@ -553,6 +670,9 @@ class TrayFailoverBridge:
             readonly=(result.readonly if result is not None else True),
             clash_keep=self.clash_keep, authorized=self.authorized,
             executor_attached=self.executor_attached,
+            observation_mode=self.observation_mode,
+            graded_actions_left=(graded.actions_left
+                                 if isinstance(graded, GradedExecutor) else 0),
             last_switch_at=self.last_switch_at,
             last_switch_reason=self.last_switch_reason,
             last_switch_result=self.last_switch_result,
