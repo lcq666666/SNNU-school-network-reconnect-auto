@@ -112,10 +112,7 @@ class RecoveryController:
             elapsed = now - self.state["outage_at"]
             last_reboot = self.state["last_reboot"]
             reboot_due = last_reboot is None or now - last_reboot >= 6 * 3600
-            if elapsed >= 900 and allow_reboot and reboot_due:
-                if not self.ops.reboot_ready():
-                    self.detail = "第三层等待：请先完成本机重启后自动登录恢复设置"
-                    return
+            if elapsed >= 900 and allow_reboot and reboot_due and self.ops.reboot_ready():
                 self.log("第三层恢复：60 秒后强制重启，恢复记录已保存")
                 previous = self.state.copy()
                 self.state.update(last_reboot=now, reboot_pending=True,

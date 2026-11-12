@@ -105,8 +105,10 @@ def test_reboot_requires_enabled_and_startup_readiness(tmp_path):
     controller.tick(2000)
     assert "reboot" not in calls
     controller.ops.reboot_ready = lambda: False
+    repairs = calls.count("repair")
     controller.tick(2301, allow_reboot=True)
     assert "reboot" not in calls
+    assert calls.count("repair") == repairs + 1
 
 
 def test_migration_prefers_existing_stable_config(tmp_path):
