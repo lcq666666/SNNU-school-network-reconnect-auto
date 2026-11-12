@@ -20,7 +20,15 @@ $incoming = $target + '.incoming'
 $replaced = $false
 $started = $null
 try {
-    if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash -ne $taskConfig.sha256) {
+    $stream = [IO.File]::OpenRead($staged)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $hasher.Dispose()
+    }
+    if ($digest -ne $taskConfig.sha256) {
         throw 'Staged update SHA256 mismatch'
     }
     $old = Get-Process -Id $taskConfig.pid -ErrorAction SilentlyContinue
@@ -53,9 +61,26 @@ try {
 } catch {
     $_.Exception.Message | Out-File -LiteralPath $taskConfig.error -Encoding utf8
     if ($replaced -and (Test-Path -LiteralPath $backup)) {
-        if ($started) { & taskkill.exe /PID $started.Id /T /F 2>$null | Out-Null }
+        if ($started -and (-not $started.HasExited)) {
+            $savedPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { & taskkill.exe /PID $started.Id /T /F 2>$null | Out-Null }
+            finally { $ErrorActionPreference = $savedPreference }
+        }
         Start-Sleep -Seconds 2
-        Copy-Item -LiteralPath $backup -Destination $target -Force
+        $restored = $false
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            try {
+                Copy-Item -LiteralPath $backup -Destination $target -Force
+                $restored = $true
+                break
+            } catch { Start-Sleep -Seconds 1 }
+        }
+        if (-not $restored) {
+            'Rollback failed. The previous executable is preserved in the .previous file.' |
+                Out-File -LiteralPath $taskConfig.error -Encoding utf8 -Append
+            exit 1
+        }
     }
     Start-Process -FilePath $target -ArgumentList '--background' -WindowStyle Hidden
     exit 1
@@ -67,12 +92,18 @@ def launch_installer(staged: Path, target: Path, version: str, directory: Path):
     directory.mkdir(parents=True, exist_ok=True)
     receipt = directory / "update-receipt.json"
     receipt.unlink(missing_ok=True)
+    error = directory / "install-error.txt"
+    error.unlink(missing_ok=True)
     manifest = directory / "install.json"
+    digest = hashlib.sha256()
+    with staged.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
     atomic_json(manifest, {
         "staged": str(staged.resolve()), "target": str(target.resolve()),
         "pid": os.getpid(), "version": version.lstrip("vV"),
-        "sha256": hashlib.sha256(staged.read_bytes()).hexdigest(),
-        "receipt": str(receipt.resolve()), "error": str((directory / "install-error.txt").resolve()),
+        "sha256": digest.hexdigest(),
+        "receipt": str(receipt.resolve()), "error": str(error.resolve()),
     })
     script = directory / "install-update.ps1"
     script.write_text(UPDATE_SCRIPT, encoding="utf-8-sig")
