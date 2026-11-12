@@ -43,7 +43,7 @@ import time
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 try:
@@ -367,6 +367,70 @@ def verify_internet(session: requests.Session, *,
     if not ok and gate_result.ok:
         lines.append("交叉命中 %d/%d（需 ≥%d）" % (hits, len(cross), min_cross))
     return ok, "；".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# V0.7.1 阶段 D：IP + 域名双通道校验分类（DNS_DEGRADED）
+# --------------------------------------------------------------------------- #
+#: 连接后校验的三态结论（阶段 D，2026-11-12 用户确认：只改分类与告警，
+#: 不改变任何门禁 / 状态机 / UU 重启行为）。
+VERIFY_OK = "OK"
+#: 域名探测失败但免 DNS 的 IP 级通道可达：整网没断，只是本机域名解析失败。
+VERIFY_DNS_DEGRADED = "DNS_DEGRADED"
+#: 域名通道与 IP 通道都失败：整网离线（旧「疑似假死」失败分支的定性）。
+VERIFY_OFFLINE = "OFFLINE"
+
+VERIFY_VERDICTS: Tuple[str, ...] = (VERIFY_OK, VERIFY_DNS_DEGRADED,
+                                    VERIFY_OFFLINE)
+
+
+def ip_channel_ok(*, tcp_probe: Optional[Callable[[str, int, float], bool]] = None,
+                  targets: Optional[Sequence[Tuple[str, int]]] = None,
+                  timeout: Optional[float] = None) -> bool:
+    """免 DNS 的 IP 级通道是否可用（任一目标 TCP 握手成功即视为可用）。
+
+    探测点**复用** :data:`campus_network.DEFAULT_TCP_TARGETS`
+    （``223.5.5.5:443`` / ``120.53.53.53:443``，IPv4 字面量、K-6 实机验证
+    可达）——与 :func:`internet_ok` 的 IP 级通道完全同源，不新增任何探测
+    目标。探测异常只算该点不可达，绝不向上抛。
+    """
+    probe = tcp_probe or IP_TCP_PROBE
+    points = DEFAULT_TCP_TARGETS if targets is None else tuple(targets)
+    seconds = IP_PROBE_TIMEOUT if timeout is None else float(timeout)
+    for host, port in points:
+        try:
+            if bool(probe(host, port, seconds)):
+                return True
+        except Exception:              # 探测自身异常只算"该点不可达"
+            continue
+    return False
+
+
+def verify_internet_classified(session: requests.Session, *,
+                               tcp_probe: Optional[
+                                   Callable[[str, int, float], bool]] = None,
+                               ) -> Tuple[bool, str, str]:
+    """三态版连接后校验：域名通道（:func:`verify_internet`）+ IP 通道联合定性。
+
+    - 域名通道通过 → ``(True, OK, 域名明细)``；
+    - 域名通道失败但 IP 通道可达 → ``(False, DNS_DEGRADED, 明细 + IP 证据)``：
+      整网没有断，只是本机域名解析失败（DNS 降级）——代理软件的**远端解析**
+      仍可用（2026-11-12 16:30「直连不通但代理通：结论矛盾」的真实成因），
+      而浏览器等依赖本机 DNS 的应用不可用；
+    - 两路都失败 → ``(False, OFFLINE, 域名明细)``：整网离线，与旧「疑似假死」
+      失败分支语义一致。
+
+    :func:`verify_internet` 的 ``(ok, detail)`` 契约**逐字不变**；本函数是
+    其只读包装，**不改变任何门禁语义**（结果仅供分类、日志与告警展示，
+    2026-11-12 用户确认）。
+    """
+    ok, detail = verify_internet(session)
+    if ok:
+        return True, VERIFY_OK, detail
+    if ip_channel_ok(tcp_probe=tcp_probe):
+        return (False, VERIFY_DNS_DEGRADED,
+                "%s；IP 通道可达（免 DNS，非整网离线）" % detail)
+    return False, VERIFY_OFFLINE, detail
 
 
 def _verify_after_connect(session: requests.Session, log: logging.Logger) -> bool:

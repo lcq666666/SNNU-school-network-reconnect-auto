@@ -158,6 +158,9 @@ def test_v04_tray_verify_failure_notifies_and_does_not_change_state(monkeypatch)
     monkeypatch.setattr(app, "notify", lambda *a, **k: notices.append(a))
     monkeypatch.setattr(tray, "verify_internet",
                         lambda session: (False, "闸门 www.baidu.com(timeout)"))
+    # V0.7.1 阶段 D：失败分支先经 IP 通道复核；此处打桩为不可达，
+    # 保持旧「疑似假死」分支语义（离线封闭测试不依赖真实探测）。
+    monkeypatch.setattr(tray, "ip_channel_ok", lambda **kwargs: False)
 
     app._probe_tick(0.0)
 

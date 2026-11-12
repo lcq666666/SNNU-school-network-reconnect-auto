@@ -69,9 +69,11 @@ from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
                          TimerTable, __version__, repair_service,
                          load_config_text)
 import campus_reconnect as engine
-from campus_reconnect import (direct_session, edge_fallback,
+from campus_reconnect import (VERIFY_DNS_DEGRADED,
+                              direct_session, edge_fallback,
                               get_credentials,
-                              internet_ok, portal_login, portal_reachable,
+                              internet_ok, ip_channel_ok, portal_login,
+                              portal_reachable,
                               resolve_port, setup_logging, verify_internet,
                               wifi_reconnect, wifi_state)
 from campus_windows import CredentialStore, ProxyController, default_refresh
@@ -2817,10 +2819,22 @@ class TrayApp:
                 if ok:
                     self.log.info("连接后上网校验通过：%s", detail)
                 else:
-                    self.log.warning("连接后上网校验未通过，疑似「假死」：%s", detail)
-                    self.notify("网络校验未通过",
-                                "已连上校园网，但真实网页访问失败（疑似假死）：\n%s"
-                                % detail)
+                    # V0.7.1 阶段 D：域名通道失败后用免 DNS 的 IP 级通道复核，
+                    # 把「疑似假死」进一步分类为 DNS_DEGRADED / OFFLINE。
+                    # 只改分类与告警，不改变任何门禁 / 状态机 / UU 行为。
+                    if ip_channel_ok():
+                        self.log.warning(
+                            "连接后上网校验未通过：%s（IP 通道可达，非假死）：%s",
+                            VERIFY_DNS_DEGRADED, detail)
+                        self.notify("网络校验未通过",
+                                    "已连上校园网，但域名访问失败而 IP 通道可达"
+                                    "（%s，非假死）：\n%s"
+                                    % (VERIFY_DNS_DEGRADED, detail))
+                    else:
+                        self.log.warning("连接后上网校验未通过，疑似「假死」：%s", detail)
+                        self.notify("网络校验未通过",
+                                    "已连上校园网，但真实网页访问失败（疑似假死）：\n%s"
+                                    % detail)
             except Exception as exc:   # 校验不得影响工作线程（防御性边界）
                 self.log.warning("连接后上网校验异常: %s", type(exc).__name__)
             finally:
@@ -2932,6 +2946,20 @@ class TrayApp:
                 self._clash_heal_attempts = 0
                 return
             self.log.warning("[Clash] 双轴判定：%s", health.reason)
+            # V0.7.1 阶段 D：「直连不通但代理通」结论矛盾时补充证据——
+            # 若免 DNS 的 IP 通道可达，则直连轴失败更可能是本机 DNS 降级
+            # （代理轴域名由代理远端解析，故代理通）。verdict 保持 unknown
+            # 不变，只记证据日志、不做任何自动操作（2026-11-12 用户确认）。
+            if (health.verdict == "unknown" and not direct_ok
+                    and bool(getattr(health, "proxy_ok", False))):
+                try:
+                    ip_ok = bool(ip_channel_ok())
+                except Exception:
+                    ip_ok = False
+                if ip_ok:
+                    self.log.warning(
+                        "[Clash] 证据补充：直连轴域名失败但 IP 通道可达（免 DNS），"
+                        "疑似本机 DNS 降级——代理轴域名由代理远端解析，故代理通。")
             if health.verdict != "clash_fake_dead":
                 return
             try:
