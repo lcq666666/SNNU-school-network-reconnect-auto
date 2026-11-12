@@ -1142,7 +1142,7 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
     base = portal_base(port)
     # 1) 打开登录页建立会话
     try:
-        session.get(base + LOGIN_JSP, timeout=(3, 6), allow_redirects=False)
+        login_page = session.get(base + LOGIN_JSP, timeout=(3, 6), allow_redirects=False)
     except requests.RequestException as exc:
         return LoginOutcome(False, "无法打开登录页: %s" % type(exc).__name__,
                             status=PortalStatus.AUTH_REQUIRED,
@@ -1164,6 +1164,14 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
     headers = {"Referer": base + LOGIN_JSP, "Origin": base,
                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                "Accept-Language": "zh-CN,zh;q=0.9"}
+    from campus_captcha import login_with_captcha
+    initial_body = decode_body(login_page) if login_page.status_code == 200 else ""
+    captcha = login_with_captcha(
+        session, initial_body or "", base + LOGIN_JSP, payload, headers,
+        lambda response: _interpret_auth_response(session, base, response, log),
+        decode=decode_body)
+    if captcha is not None:
+        return captcha
     try:
         resp = session.post(base + LOGIN_ACTION, data=payload, headers=headers,
                             timeout=(3, 8), allow_redirects=False)

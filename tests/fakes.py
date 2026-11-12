@@ -175,6 +175,9 @@ class FakeResponse:
     def text(self) -> str:
         return self._content.decode(self.encoding, errors="replace")
 
+    def close(self) -> None:
+        pass
+
 
 class FakeSession:
     """按脚本返回响应的假 Session，不产生真实连接。

@@ -329,12 +329,20 @@ def test_banner_shows_for_newer_and_dismiss_hides(monkeypatch):
         root.destroy()
 
 
-def test_banner_download_opens_releases_page(monkeypatch):
+def test_banner_download_opens_local_progress_dialog(monkeypatch):
     from tests.unit.test_v06_ui_fusion import _open_app, _state
 
     monkeypatch.setattr(tray, "save_config", lambda cfg_dict: True)
     opened = []
     app, root, refs = _open_app()
+    started = []
+    class DownloadThread:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+        def start(self):
+            started.append(self.name)
+    monkeypatch.setattr(tray.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(tray.threading, "Thread", DownloadThread)
     try:
         app._update_opener = lambda url: opened.append(url)
         app._update_info = _info()
@@ -342,9 +350,10 @@ def test_banner_download_opens_releases_page(monkeypatch):
         root.update_idletasks()
         assert refs["update_banner"].winfo_ismapped()
         app._on_update_download()
-        assert opened == ["https://example.invalid/releases/tag/" + _newer_tag()]
-        assert app.config["update_dismissed_tag"] == _newer_tag()
-        assert not refs["update_banner"].winfo_ismapped()
+        assert opened == []
+        assert started == ["campus-download"]
+        assert app._update_install_busy.is_set()
+        assert app.config["update_dismissed_tag"] != _newer_tag()
     finally:
         app._close_dashboard()
         root.destroy()

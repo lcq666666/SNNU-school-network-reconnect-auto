@@ -76,6 +76,7 @@ from campus_reconnect import (direct_session, edge_fallback,
                               resolve_port, setup_logging, verify_internet,
                               wifi_reconnect, wifi_state)
 from campus_windows import CredentialStore, ProxyController, default_refresh
+from campus_install import data_directory, migrate_config, previous_install_directory
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
                                   parse_lock, parse_mode, tray_mode_label)
 from campus_tray_observer import (ObservationResult, TraySnapshotSource,
@@ -227,6 +228,9 @@ DEFAULT_CONFIG = {
     "clash_heal_enabled": True,    # Clash 假死自愈（开关代理 / 重启 Verge）
     "uu_escalation_enabled": True,  # UU Tier1 满 60s 未恢复则升 Tier2
     # ---- V0.6.2：自动更新提醒（只提醒，不下载、不安装）----
+    "lifeline_enabled": False,
+    "lifeline_reboot_enabled": False,
+    "lock_after_autologon": True,
     "update_check_enabled": True,  # 启动 60 秒后首次检查，之后每 6 小时
     "update_notified_tag": None,   # 气泡已弹过的版本 tag（同一版本只弹一次）
     "update_dismissed_tag": None,  # 用户点过“以后再说 / 下载更新”的版本 tag
@@ -266,16 +270,10 @@ YYS_VALUE_TO_LABEL = {value: label for value, label in YYS_CHOICES}
 def resolve_config_file() -> Path:
     """默认配置位置。
 
-    - 打包（便携）模式：与 exe 同级；
-    - 源码模式：``%LOCALAPPDATA%\\CampusReconnect\\tray_config.json``
-      （exe 所在目录可能只读，见 F13/T37）。
+    源码与 EXE 共用 ``%LOCALAPPDATA%\\CampusReconnect\\tray_config.json``。
+    启动入口迁移旧便携配置与旧自启路径。
     """
-    if getattr(sys, "frozen", False):
-        return SCRIPT_DIR / "tray_config.json"
-    base = os.environ.get("LOCALAPPDATA")
-    if base:
-        return Path(base) / "CampusReconnect" / "tray_config.json"
-    return SCRIPT_DIR / "tray_config.json"
+    return data_directory() / "tray_config.json"
 
 
 CONFIG_FILE = resolve_config_file()
@@ -505,6 +503,9 @@ def load_config() -> dict:
     cfg.update(_read_remote_app_keys(text))
     cfg.update(_read_v06_keys(text))
     cfg.update(_read_update_keys(text))
+    raw = _raw_config(text)
+    for key in ("lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon"):
+        cfg[key] = raw.get(key) if isinstance(raw.get(key), bool) else DEFAULT_CONFIG[key]
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
@@ -784,6 +785,10 @@ class TrayApp:
         self._supervisor_thread = None
         self.last_watchdog = None
 
+        self._lifeline = None
+        self._lifeline_busy = threading.Event()
+        self._lifeline_next = 0.0
+        self._update_install_busy = threading.Event()
         self.failover = self._build_failover_bridge()
 
         # ---- V0.6.2 自动更新提醒（只记状态，不发网络）----
@@ -2623,6 +2628,12 @@ class TrayApp:
         with self._config_lock:
             self.config.update(changes)
             self._config_version += 1
+            if (changes.get("paused") is True or changes.get("lifeline_enabled") is False
+                    or changes.get("lifeline_reboot_enabled") is False):
+                controller = getattr(self, "_lifeline", None)
+                if controller is not None:
+                    threading.Thread(target=controller.cancel_pending, daemon=True,
+                                     name="campus-cancel-reboot").start()
             return self._config_version
 
     def config_version(self) -> int:
@@ -2978,6 +2989,11 @@ class TrayApp:
 
     def _probe_tick(self, next_probe: float) -> float:
         now = time.monotonic()
+        awake = bool(self.config.get("lifeline_enabled", False) and not self.config.get("paused"))
+        if awake != getattr(self, "_sleep_prevention", False):
+            from campus_resilience_windows import set_awake
+            set_awake(awake)
+            self._sleep_prevention = awake
         if self.config.get("paused"):
             if self.state["mode"] != "paused":
                 self.set_state("paused", "监测已暂停")
@@ -2988,6 +3004,10 @@ class TrayApp:
             self.set_state("boot", "监测恢复，正在检查网络")
         if next_probe and now < next_probe:
             return next_probe
+        if self.config.get("lifeline_enabled", False):
+            self._observe_snapshot()  # Read-only interface data for the dashboard.
+            self._lifeline_tick()
+            return self._next_probe_time(now)
         try:
             online, detail = internet_ok(self.session)
             self._last_system_probe = (online, detail)
@@ -3389,8 +3409,15 @@ class TrayApp:
         def _run():
             try:
                 factory = getattr(self, "_update_session_factory", None)
-                session = factory() if factory is not None else direct_session()
+                if factory is not None:
+                    session = factory()
+                else:
+                    import requests
+                    session = requests.Session()
                 info, reason = check_latest(session)
+                if info is None and factory is None:
+                    with direct_session() as fallback:
+                        info, reason = check_latest(fallback)
                 self._on_update_checked(info, reason)
             except Exception as exc:  # noqa: BLE001 - 检查不得影响工作线程
                 self.log.info("[更新] 检查异常：%s", type(exc).__name__)
@@ -3451,21 +3478,140 @@ class TrayApp:
             return False
         return info.tag != (self.config.get("update_dismissed_tag") or "")
 
-    def _on_update_download(self) -> None:
-        """横幅“下载更新”：打开浏览器到 Release 页面，不下载、不安装。"""
-        info = getattr(self, "_update_info", None)
-        url = info.html_url if info is not None else (
-            "https://github.com/lcq666666/"
-            "SNNU-school-network-reconnect-auto/releases")
-        try:
-            self._update_opener(url)
-        except Exception as exc:  # noqa: BLE001 - 打开浏览器失败只记日志
-            self.log.warning("[更新] 打开下载页面失败：%s",
-                             type(exc).__name__)
+    def _configure_boot_recovery(self):
+        import ctypes
+        import subprocess
+        arguments = ["--configure-autologon"]
+        if not getattr(sys, "frozen", False):
+            arguments.insert(0, str(SCRIPT_DIR / "campus_reconnect_tray.py"))
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, subprocess.list2cmdline(arguments), None, 1)
+        if result <= 32:
+            self.notify("重启恢复设置未启动", "需要在本机接受 Windows 管理员权限提示。")
+
+    def _lifeline_tick(self):
+        if self._lifeline_busy.is_set() or self._repair_busy.is_set():
             return
-        if info is not None:
-            self._update_mark_dismissed(info.tag)
-            self._hide_update_banner()
+        now = time.monotonic()
+        if now < self._lifeline_next:
+            return
+        self._lifeline_next = now + 15
+        self._lifeline_busy.set()
+        self._repair_busy.set()
+
+        def active(action):
+            def run(*args):
+                if self._cancelled() or not self.get_config().get("lifeline_enabled", False):
+                    raise RuntimeError("三层恢复已暂停或关闭")
+                return action(*args)
+            return run
+
+        def network_ok():
+            with direct_session() as session:
+                return bool(verify_internet(session)[0])
+
+        def repair():
+            cfg = self.get_config()
+            cfg.update(reconnect_wifi=True, browser_fallback=False)
+            with direct_session() as session:
+                result = repair_service(
+                    session, RepairOptions.from_mapping(cfg), time.monotonic,
+                    self._repair_adapters(), get_credentials,
+                    cancelled=self._cancelled, sleep=self.stop_event.wait, log=self.log)
+            return result.ok, result.detail
+
+        def run():
+            try:
+                from campus_resilience import RecoveryController, RecoveryOps
+                import campus_resilience_windows as native
+                from campus_boot import autologon_ready
+                if self._lifeline is None:
+                    ops = RecoveryOps(
+                        network_ok=network_ok, uu_ok=native.uu_connected,
+                        restart_uu=active(lambda: native.restart_uu(self.log.info)),
+                        proxy_snapshot=native.proxy_snapshot,
+                        proxy_disable=active(native.proxy_disable),
+                        proxy_restore=native.proxy_restore, repair=active(repair),
+                        reboot_ready=lambda: get_autostart() and autologon_ready(),
+                        reboot=active(native.schedule_reboot), cancel_reboot=native.cancel_reboot)
+                    self._lifeline = RecoveryController(
+                        data_directory() / "recovery.json", ops,
+                        log=lambda message: self.log.info("[三层恢复] %s", message))
+                self._lifeline.tick(allow_reboot=bool(
+                    self.get_config().get("lifeline_reboot_enabled", False)))
+                self._last_system_probe = (self._lifeline.last_network is True, "三层恢复独立公网校验")
+                healthy = self._lifeline.last_network is True and self._lifeline.last_uu is True
+                self.set_state("online" if healthy else "reconnecting",
+                               self._lifeline.detail)
+            except Exception as exc:
+                self.log.warning("[三层恢复] 本轮未完成：%s", type(exc).__name__)
+                self.set_state("error", "三层恢复本轮失败（%s），下轮继续" % type(exc).__name__)
+            finally:
+                self._repair_busy.clear()
+                self._lifeline_busy.clear()
+        threading.Thread(target=run, daemon=True, name="campus-lifeline").start()
+
+    def _on_update_download(self) -> None:
+        if self._update_install_busy.is_set():
+            return
+        info = getattr(self, "_update_info", None)
+        if info is None or not is_newer(info.tag, __version__):
+            self.on_check_update_now()
+            return
+        if not getattr(sys, "frozen", False):
+            self.notify("源码运行", "应用内安装适用于 EXE 版本，请先构建或下载正式安装包。")
+            return
+        self._update_install_busy.set()
+        window = tk.Toplevel(self.root)
+        window.title("下载并安装 " + info.tag)
+        label = ttk.Label(window, text="正在获取校验文件…", padding=18)
+        label.pack()
+        bar = ttk.Progressbar(window, length=340, mode="determinate")
+        bar.pack(padx=18, pady=10)
+        cancelled = threading.Event()
+        def close():
+            cancelled.set()
+            window.destroy()
+        window.protocol("WM_DELETE_WINDOW", close)
+
+        def progress(received, total):
+            if cancelled.is_set() or self.stop_event.is_set():
+                raise RuntimeError("下载已取消")
+            def render():
+                if window.winfo_exists():
+                    label.config(text="已下载 %.1f MB，完成后自动重启助手" % (received / 1048576))
+                    bar.config(value=(received * 100 / total if total else 0))
+            self._ui_post(render)
+
+        def download():
+            try:
+                import requests
+                from campus_update import download_update
+                from campus_update_install import launch_installer
+                directory = data_directory() / "updates" / info.tag
+                with requests.Session() as session:
+                    try:
+                        staged = download_update(session, info, directory, progress)
+                    except (OSError, ValueError, requests.RequestException):
+                        if cancelled.is_set() or self.stop_event.is_set():
+                            return
+                        with direct_session() as fallback:
+                            staged = download_update(fallback, info, directory, progress)
+                if cancelled.is_set() or self.stop_event.is_set():
+                    return
+                if self._repair_busy.is_set() or self._lifeline_busy.is_set():
+                    raise RuntimeError("网络恢复正在执行，请在恢复完成后再次安装更新")
+                if not save_config(self.get_config()):
+                    raise OSError("更新前保存配置失败")
+                launch_installer(staged, Path(sys.executable), info.tag, directory)
+                self._ui_post(self.on_quit)
+            except Exception as exc:
+                message = str(exc)
+                self.log.warning("[更新] 安装未完成：%s", message)
+                self._ui_post(lambda: messagebox.showerror("更新未完成", message))
+            finally:
+                self._update_install_busy.clear()
+        threading.Thread(target=download, daemon=True, name="campus-download").start()
 
     def _on_update_dismiss(self) -> None:
         """横幅“以后再说”：记下该版本，本次运行及以后启动都不再显示横幅。"""
@@ -3796,6 +3942,12 @@ class TrayApp:
 
     def on_quit(self, icon=None, item=None):
         self.log.info("用户退出托盘助手")
+        controller = getattr(self, "_lifeline", None)
+        if controller is not None:
+            try:
+                controller.cancel_pending()
+            except Exception:
+                self.log.warning("取消重启倒计时失败，请使用 shutdown /a 检查")
         self.stop_event.set()
         self._cancel.set()
         try:
@@ -4070,6 +4222,27 @@ class TrayApp:
 
         # ---- 页 3：恢复 ----
         recover = page("恢复")
+        v_lifeline = tk.BooleanVar(value=bool(self.config.get("lifeline_enabled", False)))
+        v_reboot = tk.BooleanVar(value=bool(self.config.get("lifeline_reboot_enabled", False)))
+        def save_lifeline():
+            if v_reboot.get() and not self.config.get("lifeline_reboot_enabled", False):
+                if not messagebox.askyesno("启用强制重启恢复", "连续故障15分钟后，电脑将在60秒倒计时后强制重启。\n未保存文件可能丢失，每6小时最多一次。是否启用？", parent=win):
+                    v_reboot.set(False)
+                    return
+            cfg = self.get_config()
+            cfg.update(lifeline_enabled=v_lifeline.get(), lifeline_reboot_enabled=v_reboot.get())
+            if save_config(cfg):
+                self.update_config(cfg)
+            else:
+                messagebox.showerror("保存失败", "三层恢复设置未保存", parent=win)
+        ttk.Checkbutton(recover, text="启用三层恢复（UU重启、代理恢复、电脑重启）",
+                        variable=v_lifeline, command=save_lifeline).grid(row=8, column=0, sticky="w", pady=8)
+        ttk.Checkbutton(recover, text="允许故障持续15分钟后强制重启电脑",
+                        variable=v_reboot, command=save_lifeline).grid(row=9, column=0, sticky="w")
+        ttk.Button(recover, text="本机设置重启后自动登录与锁屏…",
+                   command=self._configure_boot_recovery).grid(row=10, column=0, sticky="w", pady=8)
+        ttk.Label(recover, text="自动登录需本地输入Windows账户密码。启用后先做一次受控重启验收。",
+                  wraplength=560).grid(row=11, column=0, sticky="w")
         ttk.Label(recover, text="远程保障与切回策略",
                   font=("Microsoft YaHei", 10, "bold")).grid(
                       row=0, column=0, sticky="w", pady=(0, 6))
@@ -4404,6 +4577,18 @@ def _startup_check(report: Path) -> int:
     """验证打包后的仪表盘，不读取用户配置或凭据，不启动监测。"""
     root = None
     try:
+        if getattr(sys, "frozen", False):
+            import io
+            from PIL import Image, ImageDraw, ImageFont
+            from campus_captcha import recognize_digits
+            sample = Image.new("RGB", (130, 50), "white")
+            font = ImageFont.truetype(str(Path(os.environ.get("WINDIR", "C:/Windows"))
+                                          / "Fonts" / "arial.ttf"), 38)
+            ImageDraw.Draw(sample).text((10, 2), "1234", font=font, fill="black")
+            buffer = io.BytesIO()
+            sample.save(buffer, format="PNG")
+            if recognize_digits(buffer.getvalue()) != "1234":
+                raise RuntimeError("Packaged OCR self-check failed")
         root = tk.Tk()
         root.withdraw()
         app = TrayApp(logging.getLogger("campus.startup_check"), config=DEFAULT_CONFIG)
@@ -4437,7 +4622,13 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument(BACKGROUND_FLAG, action="store_true", help="在托盘后台启动")
     parser.add_argument("--startup-check", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--update-receipt", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--configure-autologon", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.configure_autologon:
+        from campus_boot import setup_dialog
+        setup_dialog()
+        return 0
     if args.startup_check is not None:
         return _startup_check(args.startup_check)
 
@@ -4449,13 +4640,34 @@ def main(argv=None) -> int:
                 detail = ("已有一份校园网助手在运行。\n\n"
                           "要打开正在运行的助手，请点击任务栏时钟旁的 ^，找到校园网助手图标。\n"
                           "要升级，请在该图标上右键选择「退出」，先退出旧版，再双击新版。\n"
-                          "升级后，可在新版里重新开启「开机自启」。")
+                          "新版会迁移原配置与开机自启设置。")
             else:
                 detail = "无法启用单实例保护，监测未启动。请查看日志后重试。"
             _show_startup_error(detail)
         return 1
+    old_command = get_autostart_command()
+    candidates = [SCRIPT_DIR / "tray_config.json"]
+    previous = previous_install_directory(old_command)
+    if previous is not None:
+        candidates.append(previous / "tray_config.json")
+    migrate_config(Path(CONFIG_FILE), candidates)
+    try:
+        from campus_resilience_windows import recover_pending_proxy
+        recover_pending_proxy()
+    except Exception as exc:
+        log.error("上次代理配置恢复未完成：%s", type(exc).__name__)
+        _show_startup_error("上次代理配置恢复未完成，请查看日志或手动恢复系统代理。")
+    if previous is not None and not autostart_matches_current():
+        if not set_autostart(True):
+            log.warning("旧版开机自启迁移失败")
     root = tk.Tk()
     root.withdraw()
+    boot_config = load_config()
+    if (args.background and boot_config.get("lifeline_enabled", False)
+            and boot_config.get("lock_after_autologon", True)):
+        from campus_boot import autologon_ready, lock_after_boot
+        if autologon_ready():
+            lock_after_boot()
     loaded = load_credentials()
     if loaded.error_code == E_CRED_BACKEND:
         log.error("凭据后端不可用：%s", loaded.detail)
@@ -4493,6 +4705,9 @@ def main(argv=None) -> int:
     app.start()
     if not args.background:
         app.on_dashboard()
+    if args.update_receipt is not None:
+        from campus_install import atomic_json
+        atomic_json(args.update_receipt, {"version": __version__})
     root.mainloop()
     log.info("托盘助手已退出")
     return 0

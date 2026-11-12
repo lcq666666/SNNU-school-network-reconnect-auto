@@ -54,7 +54,7 @@ __all__ = [
 # 版本与取值范围
 # --------------------------------------------------------------------------- #
 #: 应用版本（唯一来源；``pyproject.toml`` 与打包版本资源均应与之一致，F22）。
-__version__ = "0.6.6"
+__version__ = "0.6.7"
 
 SCHEMA_VERSION = 1
 
@@ -720,6 +720,10 @@ def validate_config(raw: Any) -> ConfigLoadResult:
         "remote_probe_interval",
         # V0.4-3：确认在线后清退重启 UU 远程（默认关闭，方案 §3.3）。
         "remote_restart_enabled", "remote_restart_cooldown",
+        "snapshot_max_age", "snapshot_timeout", "snapshot_interval",
+        "v06_auto_prompted", "clash_heal_enabled", "uu_escalation_enabled",
+        "update_check_enabled", "update_notified_tag", "update_dismissed_tag",
+        "lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon",
     }
     unknown_keys = tuple(sorted(k for k in raw if k not in known))
     for key in unknown_keys:

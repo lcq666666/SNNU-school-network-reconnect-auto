@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
-"""V0.6.2 自动更新提醒 · 纯逻辑。
+"""Release discovery, version comparison and SHA256-verified EXE downloads.
 
-只回答三个问题：最新 Release 是什么、它是不是比当前版本新、
-这一次该不该提醒。**不下载 exe、不静默安装、不自动重启**；
-网络请求由调用方注入 ``session``（测试用假 session，生产用
-:func:`campus_reconnect.direct_session`），本模块不自建真实会话。
-检查失败（没网、GitHub 超时、响应异常）一律返回 ``(None, 原因)``，
-不抛异常——调用方只写日志，不弹窗。
+Sessions are injected by the caller. Installation and rollback are handled by
+campus_update_install after the user clicks the local update button.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import os
+from pathlib import Path
+import re
 
 UPDATE_REPO = "lcq666666/SNNU-school-network-reconnect-auto"
 UPDATE_API_URL = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -86,7 +86,7 @@ def should_notify(info, current_version, notified_tag) -> bool:
     return info.tag != (notified_tag or "")
 
 
-def check_latest(session, repo: str = UPDATE_REPO
+def _check_api_latest(session, repo: str = UPDATE_REPO
                  ) -> "tuple[UpdateInfo | None, str]":
     """查询 GitHub 最新 Release；成功返回 ``(UpdateInfo, "")``。
 
@@ -127,3 +127,81 @@ def check_latest(session, repo: str = UPDATE_REPO
                   else "https://github.com/%s/releases" % repo),
         published_at=published if isinstance(published, str) else "",
     ), ""
+
+
+def check_latest(session, repo: str = UPDATE_REPO):
+    info, reason = _check_api_latest(session, repo)
+    if info is not None:
+        return info, reason
+    # Public API rate limiting must not disable updates on a shared campus exit.
+    try:
+        url = "https://github.com/%s/releases/latest/download/build_info.json" % repo
+        response = session.get(url, timeout=UPDATE_TIMEOUT_S)
+        if response.status_code != 200:
+            return None, reason
+        data = response.json()
+        version = data.get("version") if isinstance(data, dict) else None
+        if parse_version(version) is None:
+            return None, reason
+        tag = "v" + version.lstrip("vV")
+        return UpdateInfo(tag, tag, "https://github.com/%s/releases/tag/%s" % (repo, tag)), ""
+    except Exception:
+        return None, reason
+
+
+def download_update(session, info, directory, progress=None) -> Path:
+    """Download the tagged executable and verify its release SHA256 sidecar."""
+    if parse_version(info.tag) is None or not re.fullmatch(r"v?\d+(?:\.\d+){0,2}", info.tag):
+        raise ValueError("更新版本号无效")
+    base = "https://github.com/%s/releases/download/%s/" % (UPDATE_REPO, info.tag)
+    checksum = session.get(base + "CampusReconnect.exe.sha256", timeout=(5, 20))
+    try:
+        if checksum.status_code != 200:
+            raise ValueError("无法获取更新 SHA256 校验文件")
+        match = re.fullmatch(
+            r"\s*([a-fA-F0-9]{64})\s+\*?CampusReconnect\.exe\s*(?:size=(\d+)\s*)?",
+            checksum.text)
+        if match is None:
+            raise ValueError("更新 SHA256 文件格式无效")
+        expected = match.group(1).lower()
+        expected_size = int(match.group(2)) if match.group(2) else 0
+    finally:
+        checksum.close()
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / "CampusReconnect.download"
+    target = directory / "CampusReconnect.exe"
+    response = session.get(base + "CampusReconnect.exe", timeout=(5, 30), stream=True)
+    try:
+        if response.status_code != 200:
+            raise ValueError("更新下载失败 HTTP %s" % response.status_code)
+        total = int(response.headers.get("Content-Length", "0"))
+        digest = hashlib.sha256()
+        received = 0
+        with temporary.open("wb") as stream:
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > 512 * 1024 * 1024:
+                    raise ValueError("更新文件超过大小上限")
+                digest.update(chunk)
+                stream.write(chunk)
+                if progress:
+                    progress(received, total)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if digest.hexdigest() != expected:
+            raise ValueError("更新 SHA256 校验失败")
+        if total and received != total:
+            raise ValueError("更新下载长度不完整")
+        if expected_size and received != expected_size:
+            raise ValueError("更新文件与发布大小不符")
+        with temporary.open("rb") as stream:
+            if stream.read(2) != b"MZ":
+                raise ValueError("更新文件不是 Windows 可执行文件")
+        os.replace(temporary, target)
+        return target
+    finally:
+        response.close()
+        temporary.unlink(missing_ok=True)
