@@ -643,7 +643,8 @@ def test_ui80_dashboard_and_settings_windows_build_and_render(monkeypatch):
     monkeypatch.setattr(tray, "load_config", lambda: dict(tray.DEFAULT_CONFIG))
     monkeypatch.setattr(tray, "get_autostart", lambda: False)
     try:
-        root = tk.Tk()
+        from tests.fakes import desktop_test_root
+        root = desktop_test_root()
     except tk.TclError as exc:                     # 无显示环境：如实跳过
         pytest.skip("本环境无法创建 Tk 根窗口：%s" % exc)
     root.withdraw()
@@ -664,11 +665,12 @@ def test_ui80_dashboard_and_settings_windows_build_and_render(monkeypatch):
             # V0.6 CustomTkinter 仪表盘：同一断言走 CTk 控件
             app._render_dashboard_ctk(app.ui_state(now=5.0))
             refs = app._dash_ctk_widgets
-            assert refs["light"].cget("text_color") == \
-                app.ui_state(now=5.0).overall_color
-            assert refs["ethernet"]["角色"].cget("text") == "PRIMARY"
-            assert refs["wifi"]["Portal"].cget("text") == "需要认证"
-            assert "Internet Verify" in refs["steps"]["internet"].cget("text")
+            from campus_desktop_ui import TONES
+            from campus_ui_state import OVERALL_TONE
+            assert refs["light"].cget("text_color") == TONES[OVERALL_TONE[app.ui_state(now=5.0).overall]]
+            assert refs["ethernet"]["Internet"].cget("text") == "未验证"
+            assert refs["wifi"]["状态"].cget("text") == "已连接（需要认证）"
+            assert refs["steps"]["internet"].cget("text") in ("完成", "待执行", "失败", "进行中")
         else:
             app._render_dashboard(app.ui_state(now=5.0))
             assert app._dash_light.cget("bg") == app.ui_state(now=5.0).overall_color

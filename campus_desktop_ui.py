@@ -1,0 +1,359 @@
+"""Shared desktop presentation. No host inspection or recovery actions on render."""
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    ctk = None
+
+BG = "#F6F6F8"
+SIDE = "#EEEEF2"
+SURFACE = "#FFFFFF"
+BORDER = "#DFDFE7"
+TEXT = "#25252D"
+MUTED = "#666673"
+ACCENT = "#6554C0"
+FONT = "Microsoft YaHei UI"
+TONES = {"ok": "#237A50", "bad": "#B43838", "warn": "#956414",
+         "busy": ACCENT, "unknown": MUTED, "idle": MUTED}
+STEP_NAMES = {"detect": "检测网络", "wifi_ready": "连接无线", "portal": "校园认证",
+              "internet": "验证上网", "route": "切换出口", "uu": "恢复 UU"}
+
+
+def font(size=14, bold=False):
+    # Share immutable font instances within this interpreter, never across Tk roots.
+    root = tk._default_root
+    if root is None:
+        return ctk.CTkFont(family=FONT, size=size, weight="bold" if bold else "normal")
+    if not hasattr(root, "_campus_fonts"):
+        root._campus_fonts = {}
+    key = (size, bold)
+    if key not in root._campus_fonts:
+        root._campus_fonts[key] = ctk.CTkFont(family=FONT, size=size,
+                                            weight="bold" if bold else "normal")
+    return root._campus_fonts[key]
+
+
+def configure_theme(root):
+    if ctk is not None:
+        ctk.set_appearance_mode("light")
+    # Legacy settings use the same family, palette and readable native point sizes.
+    scale = (ctk.ScalingTracker.get_window_dpi_scaling(root) if ctk is not None
+             else root.winfo_fpixels("1i") / 96)
+    native_font = (FONT, -round(14 * scale))
+    root.option_add("*Font", native_font)
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure(".", font=native_font, background=BG, foreground=TEXT)
+    style.configure("TButton", padding=(round(12 * scale), round(7 * scale)), background=SURFACE)
+    style.map("TButton", background=[("active", SIDE)])
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", padding=(16, 9), background=SIDE)
+    style.map("TNotebook.Tab", background=[("selected", SURFACE)],
+              foreground=[("selected", ACCENT)])
+    style.configure("TEntry", fieldbackground=SURFACE)
+    style.configure("TCombobox", fieldbackground=SURFACE)
+
+
+def fit_window(win, width, height, *, minimum=(760, 460)):
+    """CTk accepts logical pixels; keep both dialogs and shell inside the screen."""
+    scale = win._get_window_scaling()
+    max_w = max(320, int((win.winfo_screenwidth() - 80) / scale))
+    max_h = max(300, int((win.winfo_screenheight() - 100) / scale))
+    win.geometry(f"{min(width, max_w)}x{min(height, max_h)}")
+    win.minsize(min(minimum[0], max_w), min(minimum[1], max_h))
+
+
+def label(parent, text, *, size=14, bold=False, muted=False, **kwargs):
+    # Fixed logical line lengths avoid a Tk geometry feedback loop at fractional DPI.
+    return ctk.CTkLabel(parent, text=text, font=font(size, bold),
+                       text_color=MUTED if muted else TEXT, anchor="w", **kwargs)
+
+
+def button(parent, text, command, *, primary=False, **kwargs):
+    return ctk.CTkButton(parent, text=text, command=command, font=font(), height=38,
+                         corner_radius=5, fg_color=ACCENT if primary else SURFACE,
+                         hover_color="#5545AA" if primary else SIDE,
+                         text_color=SURFACE if primary else TEXT,
+                         border_width=0 if primary else 1, border_color=BORDER, **kwargs)
+
+
+def panel(parent):
+    return ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=7,
+                        border_width=1, border_color=BORDER)
+
+
+def translated_event(line):
+    names = {"RECOVERY_COMPLETE": "网络恢复", "NETWORK_DOWN": "网络中断",
+             "NETWORK_UP": "网络连通", "NETWORK_DEGRADED": "网络降级",
+             "UU_RESTART_STARTED": "开始恢复 UU", "GAMEVIEWER_RESTARTED": "UU 已重启",
+             "UU_RESTART_FAILED": "UU 重启失败", "UU_SKIPPED": "跳过 UU 重启",
+             "RECONNECT_OK": "重连成功", "RECONNECT_FAILED": "重连失败",
+             "MONITOR_PAUSED": "监测已暂停", "MONITOR_RESUMED": "监测已恢复",
+             "AXIS_STATE": "链路状态", "FAILOVER_STATE": "恢复状态",
+             "ACTIVE_PATH": "当前出口", "RECOVERY_EVENT": "恢复事件",
+             "RECOVERY_STAGE": "恢复阶段", "VERIFY_GATE": "验证入口",
+             "VERIFY_CROSS": "交叉验证", "INTERNET_VERIFIED": "上网验证通过",
+             "INTERNET_UNVERIFIED": "上网未验证", "VERIFY_UNRELIABLE": "验证不可信",
+             "STANDBY_VERIFIED": "备用链路验证通过", "ROUTE_SWITCH_DONE": "出口切换完成",
+             "ROUTE_SWITCH": "准备切换出口", "SNAPSHOT_UNTRUSTED": "网卡信息不可信",
+             "ethernet": "以太网", "wifi": "无线网络"}
+    for key in sorted(names, key=len, reverse=True):
+        line = line.replace(key, names[key])
+    return line
+
+
+def path_summary(card):
+    if card is None:
+        return "待确认", "unknown"
+    if card.verified is True:
+        return "已验证", "ok"
+    if card.tone in ("bad", "warn"):
+        return card.state_label, card.tone
+    result = card.field("Internet")
+    return (result if result not in ("", "—", "已验证") else "未验证"), card.internet_tone
+
+
+def build_dashboard(app):
+    configure_theme(app.root)
+    win = ctk.CTkToplevel(app.root)
+    app.dashboard_win = win
+    win.title("校园网自动重连助手")
+    win.configure(fg_color=BG)
+    fit_window(win, 980, 700)
+    win.protocol("WM_DELETE_WINDOW", app._close_dashboard)
+    win.grid_rowconfigure(0, weight=1)
+    win.grid_columnconfigure(1, weight=1)
+    side = ctk.CTkFrame(win, width=178, fg_color=SIDE, corner_radius=0)
+    side.grid(row=0, column=0, sticky="nsew")
+    side.grid_propagate(False)
+    side.grid_columnconfigure(0, weight=1)
+    side.grid_rowconfigure(9, weight=1)
+    label(side, "校园网助手", size=19, bold=True).grid(row=0, padx=20, pady=(28, 2), sticky="w")
+    from campus_core import __version__
+    label(side, f"版本 {__version__}", size=12, muted=True).grid(row=1, padx=20, pady=(0, 28), sticky="w")
+    content = ctk.CTkFrame(win, fg_color=BG, corner_radius=0)
+    content.grid(row=0, column=1, sticky="nsew")
+    refs = {"pages": {}, "navigation": {}, "buttons": []}
+
+    def navigate(key):
+        for name, page in refs["pages"].items():
+            if name == key:
+                page.pack(fill="both", expand=True)
+            else:
+                page.pack_forget()
+            refs["navigation"][name].configure(
+                fg_color=SURFACE if name == key else "transparent",
+                text_color=ACCENT if name == key else TEXT)
+        refs["selected_page"] = key
+
+    def page(key, title, subtitle):
+        body = ctk.CTkScrollableFrame(content, fg_color=BG, corner_radius=0)
+        refs["pages"][key] = body
+        label(body, title, size=24, bold=True).pack(fill="x", padx=24, pady=(24, 4))
+        label(body, subtitle, muted=True, wraplength=440, justify="left").pack(
+            fill="x", padx=24, pady=(0, 20))
+        return body
+
+    for index, (key, title) in enumerate((("overview", "概览"), ("network", "连接状态"),
+                                         ("recovery", "在线守护"), ("activity", "活动记录"),
+                                         ("settings", "设置")), start=2):
+        nav = ctk.CTkButton(side, text=title, command=lambda k=key: navigate(k),
+                            font=font(), anchor="w", height=42, corner_radius=5,
+                            fg_color="transparent", hover_color="#E3E1EC", text_color=TEXT)
+        nav.grid(row=index, column=0, sticky="ew", padx=12, pady=3)
+        refs["navigation"][key] = nav
+    button(side, "打开日志", app.on_open_log, width=140).grid(row=10, padx=16, pady=8)
+    label(side, "关闭窗口后仍在托盘运行", size=11, muted=True).grid(row=11, padx=12, pady=(0, 18))
+
+    overview = page("overview", "概览", "查看网络连接和远程恢复状态。")
+    banner = panel(overview)
+    refs.update(update_banner=banner, update_banner_visible=False)
+    refs["update_banner_label"] = label(banner, "", wraplength=330)
+    refs["update_banner_label"].pack(side="left", padx=16, pady=12)
+    button(banner, "下载更新", app._on_update_download, primary=True, width=100).pack(side="right", padx=12)
+    button(banner, "以后再说", app._on_update_dismiss, width=90).pack(side="right")
+    hero = panel(overview)
+    hero.pack(fill="x", padx=24, pady=(0, 16))
+    refs["gauges_frame"] = hero  # Anchor for the existing in-app update banner.
+    status_line = ctk.CTkFrame(hero, fg_color="transparent")
+    status_line.pack(fill="x", padx=20, pady=(18, 4))
+    refs["light"] = label(status_line, "●", size=22)
+    refs["light"].pack(side="left", padx=(0, 10))
+    refs["overall"] = label(status_line, "正在读取状态", size=22, bold=True)
+    refs["overall"].pack(side="left")
+    refs["headline"] = label(hero, "", muted=True, wraplength=440, justify="left")
+    refs["headline"].pack(fill="x", padx=20, pady=(0, 4))
+    refs["monitor"] = label(hero, "", size=12, muted=True, wraplength=440)
+    refs["monitor"].pack(fill="x", padx=20, pady=(0, 18))
+    cards = ctk.CTkFrame(overview, fg_color="transparent")
+    cards.pack(fill="x", padx=24)
+    for column in range(3):
+        cards.grid_columnconfigure(column, weight=1, uniform="status")
+    refs["status_cards"] = {}
+    for column, (role, title) in enumerate((("ethernet", "以太网"), ("wifi", "SNNU Wi-Fi"), ("uu", "UU 远程恢复"))):
+        card = panel(cards)
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0 if column == 2 else 5))
+        label(card, title, bold=True).pack(fill="x", padx=14, pady=(14, 8))
+        value = label(card, "待确认", size=17, bold=True, wraplength=128, justify="left")
+        value.pack(fill="x", padx=14)
+        fact = label(card, "", muted=True, size=12, wraplength=128, justify="left")
+        fact.pack(fill="x", padx=14, pady=(6, 14))
+        refs["status_cards"][role] = {"value": value, "fact": fact}
+    actions = ctk.CTkFrame(overview, fg_color="transparent")
+    actions.pack(fill="x", padx=24, pady=20)
+    for title, cmd, primary in (("立即检查", app.on_check_connection, True),
+                                 ("尝试恢复", app.on_reconnect, False),
+                                 ("开启在线守护", app.on_toggle_online_guard, False)):
+        b = button(actions, title, cmd, primary=primary, width=130)
+        b.pack(side="left", padx=(0, 10))
+        refs["buttons"].append(b)
+    note = panel(overview)
+    note.pack(fill="x", padx=24, pady=(0, 24))
+    label(note, "关于 UU 在线状态", bold=True).pack(fill="x", padx=18, pady=(14, 4))
+    label(note, "这里显示助手的恢复状态；是否能从另一台设备远程连接，仍需在 UU 客户端确认。",
+          muted=True, wraplength=440, justify="left").pack(fill="x", padx=18, pady=(0, 14))
+
+    network = page("network", "连接状态", "助手会在后台检查并恢复连接，无需手动配置联网软件。")
+    p = panel(network)
+    p.pack(fill="x", padx=24, pady=(0, 16))
+    label(p, "联网保护", bold=True).pack(fill="x", padx=18, pady=(14, 4))
+    refs["setup_status"] = label(p, "正在检查", muted=True, wraplength=440, justify="left")
+    refs["setup_status"].pack(fill="x", padx=18)
+    button(p, "重新检查", app.on_check_connection, primary=True).pack(anchor="w", padx=18, pady=14)
+    for role, title in (("ethernet", "以太网"), ("wifi", "SNNU Wi-Fi")):
+        p = panel(network)
+        p.pack(fill="x", padx=24, pady=(0, 16))
+        label(p, title, size=17, bold=True).pack(fill="x", padx=18, pady=(14, 8))
+        rows = {}
+        for name in ("状态", "Internet", "最近验证"):
+            row = ctk.CTkFrame(p, fg_color="transparent")
+            row.pack(fill="x", padx=18, pady=1)
+            caption = {"Portal": "校园认证", "Internet": "上网验证", "ifIndex": "接口编号"}.get(name, name)
+            label(row, caption, muted=True, width=86).pack(side="left")
+            rows[name] = label(row, "—", wraplength=320, justify="left")
+            rows[name].pack(side="left", fill="x", expand=True)
+        button(p, "验证这条链路", lambda r=role: app.on_verify_now(r)).pack(anchor="w", padx=18, pady=14)
+        refs[role] = rows
+    refs["manual"] = label(network, "尚未手动验证", muted=True, wraplength=440, justify="left")
+    refs["manual"].pack(fill="x", padx=24, pady=(0, 20))
+
+    recovery = page("recovery", "在线守护", "自动保持网络连接，恢复 UU，必要时恢复联网软件。")
+    p = panel(recovery)
+    p.pack(fill="x", padx=24, pady=(0, 16))
+    refs["uu"] = label(p, "", wraplength=440, justify="left")
+    refs["uu"].pack(fill="x", padx=18, pady=16)
+    refs["protection"] = label(p, "", muted=True, wraplength=440, justify="left")
+    refs["protection"].pack(fill="x", padx=18, pady=(0, 16))
+    refs["steps"] = {}
+    for i, (key, title) in enumerate((("detect", "检查连接"), ("internet", "保持网络在线"),
+                                      ("uu", "保持 UU 在线")), start=1):
+        row = panel(recovery)
+        row.pack(fill="x", padx=24, pady=(0, 6))
+        label(row, f"{i}   {title}", bold=True).pack(side="left", padx=18, pady=10)
+        step = label(row, "待执行", muted=True)
+        step.pack(side="right", padx=18)
+        refs["steps"][key] = step
+    refs["progress"] = ctk.CTkProgressBar(recovery, height=4, progress_color=ACCENT, fg_color=BORDER)
+    refs["progress"].pack(fill="x", padx=24, pady=(12, 18))
+    actions = ctk.CTkFrame(recovery, fg_color="transparent")
+    actions.pack(fill="x", padx=24, pady=(0, 20))
+    button(actions, "重启 UU 远程", app.on_restart_uu_remote).pack(side="left", padx=(0, 10))
+    refs["recovery_guard_button"] = button(actions, "开启在线守护", app.on_toggle_online_guard)
+    refs["recovery_guard_button"].pack(side="left")
+
+    activity = page("activity", "活动记录", "最近的网络中断、恢复和 UU 处理记录，最新的在前。")
+    p = panel(activity)
+    p.pack(fill="x", padx=24)
+    refs["timeline"] = label(p, "尚无网络故障事件记录", wraplength=440, justify="left")
+    refs["timeline"].pack(fill="x", padx=18, pady=18)
+    button(activity, "查看完整日志", app.on_open_log).pack(anchor="w", padx=24, pady=18)
+
+    settings = page("settings", "设置", "配置保存在本机，更新程序时沿用现有设置。")
+    for title, description, action, cmd in (
+        ("保持在线", "自动联网、恢复 UU；联网软件异常时自动处理并保留原设置。", "开启在线守护", app.on_toggle_online_guard),
+        ("开机运行", "电脑登录后自动开始守护。", "设置开机运行", app.on_toggle_autostart),
+        ("校园网账号", "填写校园网账号和密码，供断网后自动登录使用。", "设置账号", app.on_update_credentials),
+        ("软件更新", "检查新版本，在程序内下载并更新。", "检查更新", app.on_check_update_now)):
+        p = panel(settings)
+        p.pack(fill="x", padx=24, pady=(0, 14))
+        label(p, title, bold=True).pack(fill="x", padx=18, pady=(14, 4))
+        label(p, description, muted=True, wraplength=440).pack(fill="x", padx=18)
+        control = button(p, action, cmd)
+        control.pack(anchor="w", padx=18, pady=14)
+        if title == "保持在线":
+            refs["guard_button"] = control
+        if title == "开机运行":
+            refs["autostart_button"] = control
+    advanced = panel(settings)
+    def toggle_advanced():
+        if advanced.winfo_manager():
+            advanced.pack_forget()
+            advanced_toggle.configure(text="显示高级选项")
+        else:
+            advanced.pack(fill="x", padx=24, pady=(0, 20))
+            advanced_toggle.configure(text="收起高级选项")
+    advanced_toggle = button(settings, "显示高级选项", toggle_advanced)
+    advanced_toggle.pack(anchor="w", padx=24, pady=(4, 16))
+    label(advanced, "供进一步调整或技术排查使用，日常使用无需修改。", muted=True,
+          wraplength=440).pack(fill="x", padx=18, pady=14)
+    button(advanced, "详细设置", app.on_settings).pack(anchor="w", padx=18, pady=(0, 10))
+    button(advanced, "高级网络诊断", app._open_proxy_compat).pack(anchor="w", padx=18, pady=(0, 14))
+    refs["navigate"] = navigate
+    app._dash_ctk_widgets = refs
+    app._dash_widgets = None
+    navigate("overview")
+    app._refresh_dashboard()
+
+
+def render_dashboard(app, state):
+    refs = app._dash_ctk_widgets
+    from campus_ui_state import OVERALL_TONE, STEP_STATUS_LABEL, STEP_TONE
+    color = TONES[OVERALL_TONE.get(state.overall, "unknown")]
+    refs["light"].configure(text_color=color)
+    refs["overall"].configure(text=state.overall_label)
+    refs["headline"].configure(text=state.headline or "等待首次检测结果")
+    app._render_update_banner(refs)
+    for role in ("ethernet", "wifi"):
+        card = state.card(role)
+        slot = refs["status_cards"][role]
+        caption, tone = path_summary(card)
+        slot["value"].configure(text=caption, text_color=TONES.get(tone, MUTED))
+        slot["fact"].configure(text=(f"地址 {card.field('源地址')}\n最近验证 {card.field('最近验证')}"
+                                     if card else "尚无检测数据"))
+        for name, widget in refs[role].items():
+            text = card.field(name) if card else "—"
+            if name == "角色":
+                text = {"PRIMARY": "主用链路", "STANDBY": "备用链路"}.get(text, text)
+            widget.configure(text=text)
+    uu = state.uu
+    slot = refs["status_cards"]["uu"]
+    slot["value"].configure(text=uu.label if uu.enabled else "未启用",
+                             text_color=TONES.get(uu.tone, MUTED) if uu.enabled else MUTED)
+    slot["fact"].configure(text=uu.detail or ("恢复结果待确认" if uu.enabled else "可在设置中开启自动恢复"))
+    for step in state.pipeline:
+        if step.key in refs["steps"]:
+            refs["steps"][step.key].configure(text=STEP_STATUS_LABEL.get(step.status, "待确认"),
+                                              text_color=TONES[STEP_TONE.get(step.status, "unknown")])
+    displayed = [s for s in state.pipeline if s.key in refs["steps"]]
+    refs["progress"].set(sum(s.status == "done" for s in displayed) / max(1, len(displayed)))
+    refs["uu"].configure(text=f"UU 远程自动恢复：{uu.label}" + (f"（{uu.detail}）" if uu.detail else ""))
+    cfg = app.get_config()
+    guard_text = "关闭在线守护" if cfg.get("lifeline_enabled") else "开启在线守护"
+    refs["guard_button"].configure(text=guard_text)
+    refs["recovery_guard_button"].configure(text=guard_text)
+    refs["buttons"][-1].configure(text=guard_text)
+    startup = getattr(app, "_autostart_enabled", None)
+    refs["autostart_button"].configure(text="关闭开机运行" if startup else "开启开机运行")
+    refs["setup_status"].configure(text=getattr(app, "_automatic_setup_message", "等待后台检查"))
+    refs["protection"].configure(text="\n".join(
+        f"{title}：{'已启用' if cfg.get(key) else '未启用'}" for key, title in (
+            ("lifeline_enabled", "在线守护"), ("lifeline_reboot_enabled", "电脑重启恢复"))))
+    refs["monitor"].configure(text="  ·  ".join(v for v in (state.monitor_label, state.mode_label) if v) or "等待监测")
+    lines = app._dashboard_timeline_lines(limit=10)
+    refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines else "尚无网络故障事件记录")
+    manual = [line for role in ("ethernet", "wifi") if state.card(role) for line in state.card(role).manual]
+    refs["manual"].configure(text="\n".join(manual) if manual else "尚未手动验证，可点击上方按钮查看逐站结果。")

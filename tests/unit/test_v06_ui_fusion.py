@@ -1,4 +1,4 @@
-"""V0.6.1 A+D+E 融合仪表盘测试：大状态 + 三环仪表 + 历史时间线。
+"""Desktop presentation regression: real status, navigation and activity.
 
 零真实网络、零真实注册表、零真实凭据、零真实浏览器、零真实 sleep。
 纯函数部分不碰 Tk；渲染部分复用 V0.6 的 xvfb 真窗口模式，无显示时跳过。
@@ -10,7 +10,7 @@ import pytest
 
 import campus_reconnect_tray as tray
 from campus_timeline import NetworkTimeline
-from campus_ui_state import CARD_ROWS, PathCard, StepView, UiState, UuView
+from campus_ui_state import PathCard, StepView, UiState, UuView
 
 LOG = logging.getLogger("campus")
 
@@ -46,71 +46,30 @@ def _state(overall="HEALTHY", headline="双链路正常", **over):
     return UiState(**kwargs)
 
 
-# ---------- 1. 仪表映射（纯函数） ----------
-
-def test_gauge_healthy_card_is_high():
-    assert tray.gauge_from_card(_card("ethernet", verified=True,
-                                      tone="ok")) == (0.95, "已验证")
-
-
-def test_gauge_offline_card_is_low():
-    assert tray.gauge_from_card(_card("ethernet", verified=False,
-                                      tone="bad", label="未连接")) == (
-        0.15, "未连接")
-
-
-def test_gauge_degraded_card_is_mid():
-    assert tray.gauge_from_card(_card("ethernet", verified=False,
-                                      tone="warn",
-                                      label="已连接（需要认证）")) == (
-        0.5, "已连接（需要认证）")
-
-
-def test_gauge_no_data_does_not_guess():
-    assert tray.gauge_from_card(None) is None
-    assert tray.gauge_from_card(_card("ethernet", verified=None,
-                                      tone="unknown", label="未知")) is None
-
-
-def test_gauge_uu_disabled_does_not_guess():
-    assert tray.gauge_from_uu(None) is None
-    assert tray.gauge_from_uu(UuView(enabled=False)) is None
-
-
-def test_gauge_uu_states():
-    assert tray.gauge_from_uu(
-        UuView(enabled=True, last_ok=True)) == (0.95, "就绪")
-    assert tray.gauge_from_uu(
-        UuView(enabled=True, last_ok=False)) == (0.2, "异常")
-    assert tray.gauge_from_uu(
-        UuView(enabled=True, last_ok=None)) == (0.5, "待确认")
-
-
-# ---------- 2. 真窗口渲染（xvfb；无显示跳过） ----------
+# Desktop rendering accepts immutable offline state fixtures.
 
 def _open_app():
     import tkinter as tk
-
+    from tests.fakes import desktop_test_root
     if tray.ctk is None:
         pytest.skip("本机无 CustomTkinter")
     try:
-        root = tk.Tk()
-    except tk.TclError:
+        root = desktop_test_root()
+    except tk.TclError as error:
+        if tray.sys.platform.startswith("win"):
+            pytest.fail(str(error))
         pytest.skip("无显示环境")
-    root.withdraw()
     app = tray.TrayApp(LOG, config=dict(tray.DEFAULT_CONFIG))
     app.root = root
     app.config = dict(tray.DEFAULT_CONFIG)
     app._open_dashboard()
+    app.dashboard_win.after_cancel(app._dash_refresh_id)
+    app._dash_refresh_id = None
     refs = getattr(app, "_dash_ctk_widgets", None)
     assert refs is not None, "融合仪表盘应走 CTk 分支"
+    app.dashboard_win.deiconify()
+    root.update_idletasks()
     return app, root, refs
-
-
-def _canvas_texts(canvas):
-    return [canvas.itemcget(item, "text")
-            for item in canvas.find_all()
-            if canvas.type(item) == "text"]
 
 
 def test_fusion_healthy_big_status_and_gauges():
@@ -119,11 +78,11 @@ def test_fusion_healthy_big_status_and_gauges():
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert refs["overall"].cget("text") == "网络正常"
-        assert refs["light"].cget("text_color") == "#3fb950"
-        assert "已验证" in _canvas_texts(refs["gauges"]["ethernet"]["canvas"])
-        assert "已验证" in _canvas_texts(refs["gauges"]["wifi"]["canvas"])
-        assert "就绪" in _canvas_texts(refs["gauges"]["uu"]["canvas"])
-        assert "192.168.1.101" in refs["gauges"]["ethernet"]["fact"].cget("text")
+        assert refs["light"].cget("text_color") == "#237A50"
+        assert refs["status_cards"]["ethernet"]["value"].cget("text") == "已验证"
+        assert refs["status_cards"]["wifi"]["value"].cget("text") == "已验证"
+        assert refs["status_cards"]["uu"]["value"].cget("text") == "就绪"
+        assert "192.168.1.101" in refs["status_cards"]["ethernet"]["fact"].cget("text")
         assert refs["headline"].cget("text") == "双链路正常"
     finally:
         app._close_dashboard()
@@ -143,45 +102,40 @@ def test_fusion_offline_big_status_and_gauge():
         app._render_dashboard_ctk(state)
         root.update_idletasks()
         assert refs["overall"].cget("text") == "离线"
-        assert refs["light"].cget("text_color") == "#f85149"
-        assert "未连接" in _canvas_texts(refs["gauges"]["ethernet"]["canvas"])
+        assert refs["light"].cget("text_color") == "#B43838"
+        assert refs["status_cards"]["ethernet"]["value"].cget("text") == "未连接"
     finally:
         app._close_dashboard()
         root.destroy()
 
 
-def test_fusion_recovering_light_breathes():
+def test_recovering_status_color_is_stable():
     app, root, refs = _open_app()
     try:
         state = _state(overall="RECOVERING", headline="正在恢复")
-        # 打开仪表盘时 _refresh_dashboard 已渲染一次（pulse 已消耗），
-        # 这里只断言连续两次渲染灯色交替，不假设起始奇偶。
         app._render_dashboard_ctk(state)
         first = refs["light"].cget("text_color")
         app._render_dashboard_ctk(state)
         second = refs["light"].cget("text_color")
-        assert {first, second} == {"#facc15", "#58a6ff"}
-        assert first != second
+        assert first == second == "#6554C0"
     finally:
         app._close_dashboard()
         root.destroy()
 
 
-def test_fusion_details_collapsed_by_default_then_expand():
+def test_navigation_separates_network_details_from_overview():
     app, root, refs = _open_app()
     try:
-        assert refs["details_open"] is False
-        assert refs["details_toggle"].cget("text") == "展开详情 ▾"
-        assert not refs["details_frame"].winfo_ismapped()
-        app._toggle_dashboard_details()
         root.update_idletasks()
-        assert refs["details_open"] is True
-        assert refs["details_toggle"].cget("text") == "收起详情 ▴"
-        assert refs["details_frame"].winfo_ismapped()
-        assert list(refs["ethernet"].keys()) == list(CARD_ROWS)
-        assert len(refs["wifi"]) == 10
-        app._toggle_dashboard_details()
-        assert refs["details_open"] is False
+        assert refs["selected_page"] == "overview"
+        assert not bool(refs["pages"]["network"]._parent_frame.winfo_manager())
+        refs["navigation"]["network"].invoke()
+        root.update_idletasks()
+        assert refs["selected_page"] == "network"
+        assert bool(refs["pages"]["network"]._parent_frame.winfo_manager())
+        assert not bool(refs["pages"]["overview"]._parent_frame.winfo_manager())
+        assert list(refs["ethernet"].keys()) == ["状态", "Internet", "最近验证"]
+        assert len(refs["wifi"]) == 3
     finally:
         app._close_dashboard()
         root.destroy()
@@ -193,10 +147,9 @@ def test_fusion_pipeline_progress_and_buttons_unchanged():
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert refs["progress"].get() == pytest.approx(4 / 6)
-        assert "Internet Verify" in refs["steps"]["internet"].cget("text")
+        assert refs["steps"]["internet"].cget("text") == "完成"
         texts = [btn.cget("text") for btn in refs["buttons"]]
-        assert texts == ["立即检测", "立即验证以太网", "立即验证 SNNU Wi-Fi",
-                         "手动重连", "重启 UU Remote", "设置", "打开日志", "关闭"]
+        assert texts == ["立即检查", "尝试恢复", "开启在线守护"]
     finally:
         app._close_dashboard()
         root.destroy()
@@ -239,7 +192,8 @@ def test_fusion_timeline_newest_first_max_five():
                          for event in reversed(timeline.recent(5))]
         assert "RECOVERY_COMPLETE" in lines[0]
         app._render_dashboard_ctk(_state())
-        assert refs["timeline"].cget("text").split("\n")[0] == lines[0]
+        from campus_desktop_ui import translated_event
+        assert refs["timeline"].cget("text").split("\n")[0] == translated_event(lines[0])
     finally:
         app._close_dashboard()
         root.destroy()
@@ -251,8 +205,8 @@ def test_fusion_smoke_open_render_close():
         app._refresh_dashboard()
         root.update_idletasks()
         assert refs["overall"].cget("text")
-        assert refs["gauges"]["uu"]["canvas"].find_all()
-        assert len(refs["history"]) >= 1
+        assert refs["status_cards"]["uu"]["value"].cget("text")
+        assert len(refs["pages"]) == 5
         app._close_dashboard()
         assert app.dashboard_win is None
     finally:

@@ -17,14 +17,17 @@ def set_awake(required):
 
 def recover_pending_proxy():
     from campus_install import atomic_json, data_directory
+    from campus_auto_setup import WindowsClientLifecycle
     path = data_directory() / "recovery.json"
-    if not path.is_file():
-        return
-    state = json.loads(path.read_text(encoding="utf-8"))
-    if state.get("proxy_before") is not None:
-        proxy_restore(state["proxy_before"])
-        state["proxy_before"] = None
-        atomic_json(path, state)
+    try:
+        if path.is_file():
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("proxy_before") is not None:
+                proxy_restore(state["proxy_before"])
+                state["proxy_before"] = None
+                atomic_json(path, state)
+    finally:
+        WindowsClientLifecycle(journal=data_directory() / "client-restart.json").recover()
 
 
 def proxy_snapshot():
@@ -132,6 +135,15 @@ def restart_uu(log):
         if not command or not ops.launch(command):
             raise OSError("未找到可用的 UU 启动命令，请先安装并运行 UU")
     log("UU 启动操作已完成，等待外部连接验证")
+
+
+def uu_available():
+    from campus_remote_app import build_windows_remote_app_ops, discover, launch_command
+    from tools.netdiag import PowerShellRunner
+    status = discover(build_windows_remote_app_ops(PowerShellRunner(timeout=5)))
+    if status.error:
+        return None
+    return bool(status.user_processes or launch_command(status))
 
 
 def schedule_reboot():

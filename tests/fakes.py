@@ -998,3 +998,28 @@ def seed_path_verification(controller: Any, role: str, *, now: float,
                                reason=reason, reliability=PATH_OK),
         now=now)
 
+
+
+_DESKTOP_TEST_ROOT = None
+
+
+def desktop_test_root():
+    """Reuse one UI interpreter, as the real tray reopens its Toplevel windows."""
+    import atexit
+    import tkinter as tk
+    global _DESKTOP_TEST_ROOT
+    if _DESKTOP_TEST_ROOT is None:
+        _DESKTOP_TEST_ROOT = tk.Tk()
+        root = _DESKTOP_TEST_ROOT
+        atexit.register(tk.Tk.destroy, root)
+        def cleanup():
+            for child in list(root.winfo_children()):
+                child.destroy()
+            for task in root.tk.call("after", "info"):
+                root.after_cancel(task)
+            if tk._default_root is root:
+                tk._default_root = None
+        root.destroy = cleanup
+    tk._default_root = _DESKTOP_TEST_ROOT
+    _DESKTOP_TEST_ROOT.withdraw()
+    return _DESKTOP_TEST_ROOT

@@ -4,7 +4,10 @@ from __future__ import annotations
 from datetime import datetime
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+from campus_desktop_ui import (ACCENT, BG, TEXT, button, configure_theme,
+                               ctk, fit_window, font, label, panel)
 import uuid
 
 from campus_proxy_compat import (discover_roots, export_rules, runtime_summary,
@@ -17,35 +20,129 @@ def mutation_allowed(app):
             and not app._lifeline_busy.is_set() and not (clash_busy and clash_busy.is_set()))
 
 
+def assessment(report, *, online=False):
+    """Explain existing inspection output without claiming a connectivity test."""
+    if "上次代理事务未完成" in report:
+        return "需要处理：上次修复尚未完成", "先暂停助手，再恢复最近备份。恢复完成后重新检查。"
+    missing = "系统代理：已开启" in report and "系统绕过：缺少校园地址" in report
+    uncertain = any(s in report for s in ("PAC：已配置", "校园规则不完整", "不可确认", "无法确认",
+                                          "TUN：配置为开启", "活动的代理虚拟网卡", "代理内核进程"))
+    if online:
+        if missing or uncertain:
+            return "网络正常，当前无需修复", "助手最近的网络验证正常。代理仍有兼容项待核对，遇到认证页打不开时再按报告处理；可直接关闭此窗口。"
+        return "网络正常，无需操作", "系统代理未发现需要处理的项目，可以直接关闭此窗口。"
+    if missing:
+        return "建议补充校园网绕过", "系统代理已开启，但绕过列表缺少校园地址。认证页打不开时，可先暂停助手，再点击“修复系统绕过”。"
+    if uncertain:
+        return "有兼容项需要核对", "请展开检查报告，核对 PAC、TUN 或 Clash 规则。此检查未测试当前能否上网；网络正常时无需立即修复。"
+    if "系统绕过：校园地址已配置" in report or "系统代理：未开启" in report:
+        return "未发现需要处理的代理配置", "可直接关闭此窗口。此结果仅说明代理配置检查，是否能上网请回概览点击“立即检测”。"
+    return "检查结果暂未确认", "请查看报告或点击“重新检查”。暂不建议修改代理配置。"
+
+
 def open_dialog(app):
+    if ctk is None:
+        messagebox.showinfo("图形组件不可用", "请安装 CustomTkinter 或下载完整的 Windows EXE，再打开代理兼容检查。",
+                            parent=app.root)
+        return
     existing = getattr(app, "proxy_compat_win", None)
     if existing is not None and existing.winfo_exists():
         existing.lift()
         return
-    win = tk.Toplevel(app.root)
+    configure_theme(app.root)
+    win = ctk.CTkToplevel(app.root)
     app.proxy_compat_win = win
     win.title("校园网代理兼容检查")
-    frame = ttk.Frame(win, padding=14)
-    frame.grid(sticky="nsew")
-    ttk.Label(frame, text="每台电脑独立检查和备份，保留原有代理端口、订阅和模式。",
-              wraplength=650).grid(row=0, column=0, columnspan=3, sticky="w")
+    win.configure(fg_color=BG)
+    fit_window(win, 820, 480, minimum=(700, 470))
+    frame = ctk.CTkScrollableFrame(win, fg_color=BG, corner_radius=0)
+    frame.pack(fill="both", expand=True)
+    label(frame, "代理兼容检查", size=24, bold=True).pack(fill="x", padx=24, pady=(24, 4))
+    label(frame, "只检查这台电脑。需要修复时，先备份，再由你确认。", muted=True,
+          wraplength=520).pack(fill="x", padx=24, pady=(0, 20))
+    summary = panel(frame)
+    summary.pack(fill="x", padx=24, pady=(0, 16))
+    heading = label(summary, "正在检查本机配置…", size=19, bold=True)
+    heading.pack(fill="x", padx=18, pady=(16, 6))
+    guidance = label(summary, "请稍候，检查不会修改代理或断开网络。", muted=True,
+                     wraplength=520, justify="left")
+    guidance.pack(fill="x", padx=18, pady=(0, 16))
     roots = discover_roots()
     selected = tk.StringVar(value=str(roots[0]) if len(roots) == 1 else "仅系统代理")
-    combo = ttk.Combobox(frame, textvariable=selected, state="readonly", width=67,
-                         values=["仅系统代理"] + [str(root) for root in roots])
-    combo.grid(row=1, column=0, columnspan=2, pady=8, sticky="ew")
-    output = tk.Text(frame, width=87, height=17, wrap="word", state="disabled")
-    output.grid(row=2, column=0, columnspan=3, sticky="nsew")
+    details = panel(frame)
+    detail_open = {"value": False}
+    repair_open = {"value": False}
+    output = ctk.CTkTextbox(details, height=230, wrap="word", font=font(13),
+                            fg_color="#FFFFFF", text_color=TEXT, corner_radius=5,
+                            border_width=0, state="disabled")
+    output.pack(fill="both", expand=True, padx=8, pady=8)
+    def toggle_details():
+        detail_open["value"] = not detail_open["value"]
+        if detail_open["value"]:
+            details.pack(fill="x", padx=24, pady=(0, 16),
+                         before=advanced if repair_open["value"] else footer)
+        else:
+            details.pack_forget()
+        detail_button.configure(text="收起检查报告" if detail_open["value"] else "查看检查报告")
+    toolbar = ctk.CTkFrame(frame, fg_color="transparent")
+    toolbar.pack(fill="x", padx=24, pady=(0, 16))
+    detail_button = button(toolbar, "查看检查报告", toggle_details, width=150)
+    detail_button.pack(side="right")
+    advanced = panel(frame)
+    def toggle_repairs():
+        repair_open["value"] = not repair_open["value"]
+        if repair_open["value"]:
+            advanced.pack(fill="x", padx=24, pady=(0, 16), before=footer)
+        else:
+            advanced.pack_forget()
+        repair_button.configure(text="收起修复选项" if repair_open["value"] else "展开修复选项")
+    repair_button = button(toolbar, "展开修复选项", toggle_repairs, width=150)
+    repair_button.pack(side="right", padx=8)
+    label(advanced, "按需修复", size=17, bold=True).pack(fill="x", padx=18, pady=(16, 4))
+    label(advanced, "网络正常时可直接关闭。修改前先暂停助手；持久修复还需退出 Clash Verge。",
+          muted=True, wraplength=520, justify="left").pack(fill="x", padx=18, pady=(0, 12))
+    combo = ctk.CTkOptionMenu(advanced, variable=selected,
+                              values=["仅系统代理"] + [str(root) for root in roots],
+                              font=font(13), dropdown_font=font(13), height=36,
+                              fg_color="#EEEEF2", button_color=ACCENT, text_color=TEXT,
+                              dynamic_resizing=False)
+    combo.pack(fill="x", padx=18, pady=(0, 12))
+    actions = ctk.CTkFrame(advanced, fg_color="transparent")
+    actions.pack(fill="x", padx=18, pady=(0, 16))
+    actions.grid_columnconfigure((0, 1), weight=1)
+    footer = label(frame, "系统代理、PAC 和 TUN 的作用范围不同；报告不会把未确认的规则当作已生效。",
+                   muted=True, size=12, wraplength=520, justify="left")
+    footer.pack(fill="x", padx=24, pady=(0, 20))
+    button(frame, "关闭窗口", win.destroy, width=130).pack(anchor="e", padx=24, pady=(0, 20))
+    app._proxy_ui_refs = {"heading": heading, "guidance": guidance, "output": output,
+                          "details": details, "toggle_details": toggle_details}
     busy = {"value": False}
     compatibility = windows_compatibility()
-    def show(text):
+    def show(text, *, checked=False):
         if not win.winfo_exists():
             return
         output.configure(state="normal")
         output.delete("1.0", "end")
         output.insert("1.0", text)
         output.configure(state="disabled")
-    def dispatch(work, *, mutation=False):
+        if checked:
+            online = False
+            try:
+                online = app.ui_state().overall == "HEALTHY"
+            except AttributeError:
+                pass
+            title, explanation = assessment(text, online=online)
+            heading.configure(text=title)
+            guidance.configure(text=explanation)
+            if title.startswith(("需要处理", "建议补充")) and not repair_open["value"]:
+                toggle_repairs()
+        elif text == "正在处理，请稍候…":
+            heading.configure(text="正在处理…")
+            guidance.configure(text="请等待本次操作完成。")
+        else:
+            heading.configure(text="操作结果")
+            guidance.configure(text=text, wraplength=520)
+    def dispatch(work, *, mutation=False, checked=False):
         if busy["value"]:
             return
         if mutation and not mutation_allowed(app):
@@ -65,11 +162,11 @@ def open_dialog(app):
                 if mutation:
                     app._repair_busy.clear()
                 busy["value"] = False
-            app._ui_post(lambda: show(result))
+            app._ui_post(lambda: show(result, checked=checked))
         threading.Thread(target=worker, name="campus-proxy-compat", daemon=True).start()
     def scan():
         targets = roots[:]
-        dispatch(lambda: compatibility.inspect(targets) + "\n\n" + runtime_summary())
+        dispatch(lambda: compatibility.inspect(targets) + "\n\n" + runtime_summary(), checked=True)
     def pick_root():
         if busy["value"]:
             return
@@ -122,15 +219,16 @@ def open_dialog(app):
                 export_rules(destination)
                 return f"规则已导出到：{destination}\n\n请先阅读 README.txt。YAML 是需合并的片段，不能替换完整配置或直接作为订阅导入。"
             dispatch(work)
-    ttk.Button(frame, text="选择便携版目录…", command=pick_root).grid(row=1, column=2, padx=6)
-    buttons = ttk.Frame(frame)
-    buttons.grid(row=3, column=0, columnspan=3, pady=10, sticky="w")
-    for title, command in (("重新检查", scan), ("修复系统绕过", lambda: repair(False)),
-                            ("修复所选 Clash Verge", lambda: repair(True)),
-                            ("恢复最近备份", restore), ("导出其他客户端规则…", export)):
-        ttk.Button(buttons, text=title, command=command).pack(side="left", padx=3)
-    ttk.Label(frame, text="持久修复后需要重启代理客户端。检查不发送校园账号密码，也不主动断网。",
-              wraplength=680).grid(row=4, column=0, columnspan=3, sticky="w")
+    button(toolbar, "重新检查", scan, primary=True, width=130).pack(side="left")
+    for index, (title, command) in enumerate((
+            ("修复系统绕过", lambda: repair(False)),
+            ("修复所选 Clash Verge", lambda: repair(True)),
+            ("选择便携版目录…", pick_root),
+            ("导出其他客户端规则…", export),
+            ("恢复最近备份", restore),
+            ("关闭窗口", win.destroy))):
+        button(actions, title, command).grid(row=index // 2, column=index % 2,
+                                             sticky="ew", padx=(0, 8), pady=4)
     scan()
 
 
@@ -140,6 +238,19 @@ def offer_onboarding(app, *, background):
     if marker.exists():
         return
     def offer(summary):
+        online = False
+        try:
+            online = app.ui_state().overall == "HEALTHY"
+        except AttributeError:
+            pass
+        title, explanation = assessment(summary, online=online)
+        if title == "未发现需要处理的代理配置" or title.startswith("网络正常"):
+            try:
+                atomic_json(marker, {"version": 1})
+            except OSError:
+                app.log.warning("代理兼容提示状态未保存")
+            return
+        summary = title + "\n" + explanation
         if background:
             app.notify("首次使用：检查校园网代理兼容", "请在设置 → 网络中打开代理兼容检查。每台电脑需要独立检查 PAC/TUN 与持久绕过。")
             # Keep the foreground guide pending until the user has seen it.
@@ -152,8 +263,7 @@ def offer_onboarding(app, *, background):
             app.log.warning("代理兼容提示状态未保存，下次启动将再次提示")
     def inspect():
         try:
-            lines = windows_compatibility().inspect(discover_roots()).splitlines()
-            summary = "\n".join(lines[:3])
+            summary = windows_compatibility().inspect(discover_roots()) + "\n" + runtime_summary()
         except Exception:
             summary = "本机代理配置暂时无法确认，可在兼容检查中重试。"
         app._ui_post(lambda: offer(summary))

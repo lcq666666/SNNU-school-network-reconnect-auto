@@ -248,11 +248,11 @@ def test_compatibility_lock_rejects_second_writer_and_releases(tmp_path):
 
 
 def test_proxy_dialog_is_renderable_without_host_io(tmp_path, monkeypatch):
-    import tkinter as tk
     from types import SimpleNamespace
     import threading
     import campus_proxy_ui as ui
-    root = tk.Tk()
+    from tests.fakes import desktop_test_root
+    root = desktop_test_root()
     root.withdraw()
     compat, folder, _ = fixture(tmp_path)
     class InlineThread:
@@ -271,8 +271,13 @@ def test_proxy_dialog_is_renderable_without_host_io(tmp_path, monkeypatch):
         ui.open_dialog(app)
         root.update_idletasks()
         assert app.proxy_compat_win.winfo_exists()
-        texts = [w for w in app.proxy_compat_win.winfo_children()[0].winfo_children() if isinstance(w, tk.Text)]
-        assert "系统绕过" in texts[0].get("1.0", "end")
+        refs = app._proxy_ui_refs
+        assert "系统绕过" in refs["output"].get("1.0", "end")
+        assert refs["heading"].cget("text")
+        assert not refs["details"].winfo_ismapped()
+        refs["toggle_details"]()
+        root.update_idletasks()
+        assert refs["details"].winfo_ismapped()
     finally:
         root.destroy()
 

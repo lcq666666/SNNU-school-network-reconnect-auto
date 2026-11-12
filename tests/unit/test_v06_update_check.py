@@ -371,7 +371,8 @@ def test_settings_shows_update_section(monkeypatch):
         pytest.skip("本机无 CustomTkinter")
     monkeypatch.setattr(tray, "get_autostart", lambda: False)
     try:
-        root = tk.Tk()
+        from tests.fakes import desktop_test_root
+        root = desktop_test_root()
     except tk.TclError:
         pytest.skip("无显示环境")
     root.withdraw()

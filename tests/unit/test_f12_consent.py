@@ -45,6 +45,8 @@ def test_t23_stale_consent_must_not_override_new_rejection(monkeypatch):
         return True  # 旧弹窗迟到地返回“同意”
 
     monkeypatch.setattr(app, "_ask_proxy_consent", stale_ask)
+    # Consent semantics do not need the independent network verification worker.
+    monkeypatch.setattr(app, "_maybe_verify_online", lambda: None)
     app._after_repair(True, "detail", 1.0)
 
     assert app.config["clash_auto_proxy"] is False, \

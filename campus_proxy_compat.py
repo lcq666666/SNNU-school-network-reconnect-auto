@@ -261,8 +261,8 @@ class Compatibility:
             lines.append("上次代理事务未完成或刷新未确认，请先使用“恢复最近备份”，再进行新修复。")
         return "\n".join(lines)
 
-    def _file_plan(self, root):
-        if self.client_running():
+    def _file_plan(self, root, *, require_stopped=True):
+        if require_stopped and self.client_running():
             raise ValueError("请先从托盘退出 Clash Verge，再执行持久配置修复")
         root = Path(root).resolve()
         verge_path = root / "verge.yaml"
@@ -302,6 +302,10 @@ class Compatibility:
         script = patch_script(script_before.decode("utf-8-sig"))
         return ([(verge_path, yaml.safe_dump(verge, allow_unicode=True, sort_keys=False).encode("utf-8")),
                  (script_path, script.encode("utf-8"))], originals)
+
+    def persistent_ready(self, root):
+        plans, originals = self._file_plan(root, require_stopped=False)
+        return all(content == originals[path] for path, content in plans)
 
     def apply(self, root=None):
         with self._lock():

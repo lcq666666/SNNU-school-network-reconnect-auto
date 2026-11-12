@@ -337,7 +337,8 @@ def test_ctk_dashboard_opens_and_renders():
     if tray.ctk is None:
         pytest.skip("本机无 CustomTkinter")
     try:
-        root = tk.Tk()
+        from tests.fakes import desktop_test_root
+        root = desktop_test_root()
     except tk.TclError:
         pytest.skip("无显示环境")
     try:
@@ -349,7 +350,7 @@ def test_ctk_dashboard_opens_and_renders():
         app._refresh_dashboard()
         root.update_idletasks()
         assert refs["overall"].cget("text")
-        assert len(refs["history"]) >= 1
+        assert len(refs["status_cards"]) == 3
         app._close_dashboard()
         assert app.dashboard_win is None
     finally:

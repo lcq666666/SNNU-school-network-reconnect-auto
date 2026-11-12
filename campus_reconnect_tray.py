@@ -124,39 +124,6 @@ def ui_backend() -> str:
     return "customtkinter" if ctk is not None else "ttk"
 
 
-# ---- V0.6.1 A+D+E 融合仪表盘：仪表数值映射（纯函数，不碰 Tk）----
-#
-# 诚实规则：仪表环上的百分比**不是实测速率**，只是把 UiState 已有的状态结论
-# 映射成弧长（已验证≈95%、降级≈50%、失败≈15%、无数据不画弧、不猜）。
-# 环中央显示状态词（"已验证"/"未连接"/"未验证"）为主，百分比只作辅助，
-# 仪表下方另有一行小字注明"状态映射，非实测速率"。
-def gauge_from_card(card) -> "tuple[float, str] | None":
-    """网卡卡片 →（弧长比例，中央状态词）；无数据返回 ``None``（不猜）。"""
-    if card is None:
-        return None
-    if card.verified is True:
-        return (0.95, "已验证")
-    if card.verified is None:
-        return None
-    # verified is False：按色调分档，中央写卡片自己的状态词
-    if card.tone == "bad":
-        return (0.15, card.state_label or "未通过")
-    if card.tone == "warn":
-        return (0.5, card.state_label or "降级")
-    return None
-
-
-def gauge_from_uu(uu) -> "tuple[float, str] | None":
-    """UU 视图 →（弧长比例，中央状态词）；未开启返回 ``None``（不猜）。"""
-    if uu is None or not uu.enabled:
-        return None
-    if uu.last_ok is True:
-        return (0.95, "就绪")
-    if uu.last_ok is False:
-        return (0.2, "异常")
-    return (0.5, "待确认")
-
-
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).resolve().parent   # PyInstaller 单文件: 用 exe 所在目录
 else:
@@ -228,6 +195,7 @@ DEFAULT_CONFIG = {
     "uu_escalation_enabled": True,  # UU Tier1 满 60s 未恢复则升 Tier2
     # ---- V0.6.2：自动更新提醒（只提醒，不下载、不安装）----
     "lifeline_enabled": False,
+    "automatic_proxy_enabled": True,
     "lifeline_reboot_enabled": False,
     "lock_after_autologon": True,
     "update_check_enabled": True,  # 启动 60 秒后首次检查，之后每 6 小时
@@ -503,7 +471,7 @@ def load_config() -> dict:
     cfg.update(_read_v06_keys(text))
     cfg.update(_read_update_keys(text))
     raw = _raw_config(text)
-    for key in ("lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon"):
+    for key in ("lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon", "automatic_proxy_enabled"):
         cfg[key] = raw.get(key) if isinstance(raw.get(key), bool) else DEFAULT_CONFIG[key]
     if not result.ok:
         logger = logging.getLogger("campus")
@@ -788,6 +756,13 @@ class TrayApp:
         self._lifeline_was_enabled = bool(self.config.get("lifeline_enabled", False))
         self._lifeline_busy = threading.Event()
         self._lifeline_next = 0.0
+        self._automatic_setup_armed = False
+        self._automatic_setup_next = 0.0
+        self._automatic_setup_message = "等待后台检查"
+        self._automatic_setup = None
+        self._proxy_failure_count = 0
+        self._proxy_restart_at = -300.0
+        self._autostart_enabled = None
         self._update_install_busy = threading.Event()
         self.failover = self._build_failover_bridge()
 
@@ -1477,7 +1452,7 @@ class TrayApp:
         kwargs = {}
         if max_age is not None:
             kwargs["max_age"] = float(max_age)
-        return build_ui_state(
+        model = build_ui_state(
             now=moment, ethernet=getattr(snapshot, "ethernet", None),
             wifi=getattr(snapshot, "wifi", None), verification=verification,
             active_path=active_path, standby_path=standby_path,
@@ -1493,6 +1468,32 @@ class TrayApp:
             warnings=warnings, network_epoch=network_epoch,
             ssid=self.config.get("ssid") or "SNNU",
             manual=getattr(self, "manual_verification", None) or {}, **kwargs)
+        lifeline = self._lifeline
+        if (lifeline is not None and self.config.get("lifeline_enabled")
+                and not self.config.get("paused")
+                and 0 <= moment - getattr(self, "_lifeline_observed_at", -100) < 45):
+            from dataclasses import replace
+            from campus_ui_state import StepView, UuView
+            available = getattr(self, "_uu_available", None)
+            healthy = lifeline.last_network is True and lifeline.last_uu is True
+            overall = "HEALTHY" if healthy else "RECOVERING"
+            if lifeline.last_network is None or lifeline.last_uu is None:
+                overall = "UNKNOWN"
+            model = replace(model, overall=overall,
+                            mode_label="在线守护",
+                            headline="网络连接正常，正在持续守护" if healthy else "正在检查并恢复网络或 UU 连接",
+                            pipeline=(StepView("detect", "检查连接", "done" if lifeline.last_network is not None else "active"),
+                                      StepView("internet", "保持网络在线", "done" if lifeline.last_network is True else "active"),
+                                      StepView("uu", "保持 UU 在线", "disabled" if available is False
+                                               else "done" if lifeline.last_uu is True else "active")),
+                            uu=UuView(enabled=available is not False,
+                                      label=("状态待确认" if lifeline.last_uu is None else
+                                             "已建立连接" if lifeline.last_uu else "正在恢复"),
+                                      tone=("unknown" if lifeline.last_uu is None else
+                                            "ok" if lifeline.last_uu else "busy"),
+                                      last_ok=lifeline.last_uu,
+                                      detail="未检测到 UU，当前仅守护网络" if available is False else ""))
+        return model
 
     def ui_state_lines(self) -> List[str]:
         """仪表盘状态的可日志化摘要（诊断用；**不**含凭据/Cookie）。"""
@@ -1681,231 +1682,20 @@ class TrayApp:
         self._refresh_dashboard()
 
     def _open_dashboard_ctk(self):
-        """V0.6.1 A+D+E 融合仪表盘（失败时由调用方回退 ttk）。
-
-        布局（上 → 下）：A 大状态区 → E 三环仪表 → 恢复流水线 →
-        详情折叠（双网卡 10 行卡片，默认收起）→ D 历史时间线 →
-        UU 行 / 监测行 / 手动验证行 → 最近一小时状态图 → 8 个操作按钮。
-        内容区用 CTkScrollableFrame，窗口小也不挤；ttk 回退路径不动。
-        """
+        """Open the shared light desktop shell; state rendering remains read-only."""
         if self.root is None:
             return
-        win = self.dashboard_win
-        if win is not None:
+        if self.dashboard_win is not None:
             try:
-                if win.winfo_exists():
-                    win.deiconify()
-                    win.lift()
-                    win.focus_force()
+                if self.dashboard_win.winfo_exists():
+                    self.dashboard_win.deiconify()
+                    self.dashboard_win.lift()
+                    self.dashboard_win.focus_force()
                     return
-            except Exception:
+            except tk.TclError:
                 pass
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-        from campus_ui_state import CARD_ROWS, PIPELINE_LABELS
-
-        win = ctk.CTkToplevel(self.root)
-        self.dashboard_win = win
-        win.title("%s · 双链路监控" % APP_NAME)
-        win.geometry("%dx%d" % (DASHBOARD_WIDTH, DASHBOARD_HEIGHT))
-        win.minsize(DASHBOARD_MIN_WIDTH, DASHBOARD_MIN_HEIGHT)
-        win.protocol("WM_DELETE_WINDOW", self._close_dashboard)
-        scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
-        scroll.pack(fill="both", expand=True)
-        outer = ctk.CTkFrame(scroll, fg_color="transparent")
-        outer.pack(fill="both", expand=True, padx=12, pady=12)
-
-        # ---- A：顶部大状态区（一眼只看好坏）----
-        hero = ctk.CTkFrame(outer, fg_color="transparent")
-        hero.pack(fill="x")
-        light = ctk.CTkLabel(hero, text="●", font=ctk.CTkFont(size=30),
-                             text_color="#3fb950")
-        light.pack(side="left", padx=(0, 10))
-        overall = ctk.CTkLabel(hero, text="未知",
-                               font=ctk.CTkFont(size=30, weight="bold"))
-        overall.pack(side="left")
-        ctk.CTkLabel(hero, text=APP_NAME, text_color="#94a3b8").pack(
-            side="right")
-        headline = ctk.CTkLabel(outer, text="正在读取状态…",
-                                text_color="#94a3b8",
-                                font=ctk.CTkFont(size=13))
-        headline.pack(fill="x", pady=(2, 10))
-        refs = {"light": light, "overall": overall, "headline": headline}
-
-        # ---- V0.6.2：更新横幅（有新版本且未点过“以后再说”时才显示）----
-        banner = ctk.CTkFrame(outer, corner_radius=12, fg_color="#451a03",
-                              border_color="#d29922", border_width=1)
-        refs["update_banner"] = banner
-        refs["update_banner_visible"] = False
-        banner_label = ctk.CTkLabel(banner, text="",
-                                    text_color="#fcd34d",
-                                    font=ctk.CTkFont(size=13))
-        banner_label.pack(side="left", padx=10, pady=8)
-        refs["update_banner_label"] = banner_label
-        ctk.CTkButton(banner, text="下载更新", width=90,
-                      command=self._on_update_download).pack(
-                          side="right", padx=(4, 10), pady=6)
-        ctk.CTkButton(banner, text="以后再说", width=90,
-                      fg_color="#334155",
-                      command=self._on_update_dismiss).pack(
-                          side="right", padx=4, pady=6)
-
-        # ---- E：三环仪表（Canvas 手绘圆环，不引新依赖）----
-        gauges = ctk.CTkFrame(outer, fg_color="transparent")
-        gauges.pack(fill="x")
-        refs["gauges_frame"] = gauges
-        gauge_refs = {}
-        for role, title in (("ethernet", "以太网"),
-                            ("wifi", "SNNU Wi-Fi"), ("uu", "UU 远程")):
-            frame = ctk.CTkFrame(gauges, corner_radius=12,
-                                 fg_color="#1e293b")
-            frame.pack(side="left", fill="both", expand=True,
-                       padx=(0, 6) if role == "ethernet"
-                       else (6, 0) if role == "uu" else (6, 6))
-            ctk.CTkLabel(frame, text=title,
-                         font=ctk.CTkFont(size=14, weight="bold")).pack(
-                             pady=(8, 0))
-            canvas = tk.Canvas(frame, width=110, height=110, bg="#1e293b",
-                               highlightthickness=0)
-            canvas.pack(pady=(2, 0))
-            fact = ctk.CTkLabel(frame, text="—", text_color="#94a3b8",
-                                wraplength=220, justify="center")
-            fact.pack(padx=8, pady=(0, 8))
-            gauge_refs[role] = {"canvas": canvas, "fact": fact}
-        refs["gauges"] = gauge_refs
-        ctk.CTkLabel(outer, text="仪表百分比是状态映射（已验证≈95%），不是实测速率",
-                     text_color="#64748b").pack(anchor="w", pady=(2, 0))
-
-        # ---- 恢复流水线（仪表与时间线之间）----
-        pipe = ctk.CTkFrame(outer, corner_radius=12, fg_color="#1e293b")
-        pipe.pack(fill="x", pady=(10, 0))
-        ctk.CTkLabel(pipe, text="恢复流水线",
-                     font=ctk.CTkFont(size=13, weight="bold")).pack(
-                         anchor="w", padx=10, pady=(8, 2))
-        steps_frame = ctk.CTkFrame(pipe, fg_color="transparent")
-        steps_frame.pack(fill="x", padx=10)
-        step_widgets = {}
-        for key, label in PIPELINE_LABELS:
-            cell = ctk.CTkFrame(steps_frame, fg_color="transparent")
-            cell.pack(side="left", fill="x", expand=True)
-            w = ctk.CTkLabel(cell, text="%s\n—" % label)
-            w.pack()
-            step_widgets[key] = w
-        progress = ctk.CTkProgressBar(pipe, height=8)
-        progress.pack(fill="x", padx=10, pady=(4, 8))
-        progress.set(0.0)
-        refs["steps"] = step_widgets
-        refs["progress"] = progress
-
-        # ---- 详情折叠：双网卡 10 行卡片，默认收起 ----
-        toggle = ctk.CTkButton(outer, text="展开详情 ▾", width=120,
-                               fg_color="#334155",
-                               command=self._toggle_dashboard_details)
-        toggle.pack(anchor="w", pady=(10, 0))
-        refs["details_toggle"] = toggle
-        refs["details_open"] = False
-        details = ctk.CTkFrame(outer, fg_color="transparent")
-        refs["details_frame"] = details
-        cards = ctk.CTkFrame(details, fg_color="transparent")
-        cards.pack(fill="x")
-        for role in ("ethernet", "wifi"):
-            frame = ctk.CTkFrame(cards, corner_radius=12,
-                                 fg_color="#1e293b")
-            frame.pack(side="left", fill="both", expand=True,
-                       padx=(0, 6) if role == "ethernet" else (6, 0))
-            title = "以太网" if role == "ethernet" else "SNNU Wi-Fi"
-            ctk.CTkLabel(frame, text=title,
-                         font=ctk.CTkFont(size=14, weight="bold")).pack(
-                             anchor="w", padx=10, pady=(8, 2))
-            rows = {}
-            for label in CARD_ROWS:
-                row = ctk.CTkFrame(frame, fg_color="transparent")
-                row.pack(fill="x", padx=10)
-                ctk.CTkLabel(row, text=label, text_color="#94a3b8",
-                             width=70).pack(side="left")
-                var = ctk.CTkLabel(row, text="—")
-                var.pack(side="left")
-                rows[label] = var
-            refs[role] = rows
-
-        # ---- D：历史时间线（真实事件，最新在上，最多 5 条）----
-        tl_frame = ctk.CTkFrame(outer, corner_radius=12, fg_color="#1e293b")
-        tl_frame.pack(fill="x", pady=(10, 0))
-        refs["timeline_frame"] = tl_frame
-        tl_head = ctk.CTkFrame(tl_frame, fg_color="transparent")
-        tl_head.pack(fill="x", padx=10, pady=(8, 2))
-        ctk.CTkLabel(tl_head, text="历史时间线",
-                     font=ctk.CTkFont(size=13, weight="bold")).pack(
-                         side="left")
-        ctk.CTkButton(tl_head, text="查看全部日志", width=110,
-                      fg_color="#334155",
-                      command=self.on_open_log).pack(side="right")
-        timeline = ctk.CTkLabel(tl_frame, text="尚无网络故障事件记录",
-                                text_color="#94a3b8", wraplength=820,
-                                justify="left")
-        timeline.pack(anchor="w", padx=10, pady=(0, 8))
-        refs["timeline"] = timeline
-
-        uu = ctk.CTkLabel(outer, text="UU 远程自动恢复：—")
-        uu.pack(anchor="w", pady=(8, 0))
-        monitor = ctk.CTkLabel(outer, text="监测：—", text_color="#94a3b8")
-        monitor.pack(anchor="w")
-        manual = ctk.CTkLabel(outer, text="—", text_color="#94a3b8",
-                              wraplength=820, justify="left")
-        manual.pack(anchor="w")
-        refs["uu"] = uu
-        refs["monitor"] = monitor
-        refs["manual"] = manual
-        chart = tk.Canvas(outer, height=64, bg="#0f172a",
-                          highlightthickness=0)
-        chart.pack(fill="x", pady=(8, 0))
-        refs["chart"] = chart
-        refs["history"] = []
-        refs["pulse"] = 0
-        buttons = ctk.CTkFrame(outer, fg_color="transparent")
-        buttons.pack(fill="x", pady=(12, 0))
-        btns = []
-        for text, cmd in (
-                ("立即检测", self.on_detect_now),
-                ("立即验证以太网", lambda: self.on_verify_now("ethernet")),
-                ("立即验证 SNNU Wi-Fi", lambda: self.on_verify_now("wifi")),
-                ("手动重连", self.on_reconnect),
-                ("重启 UU Remote", self.on_restart_uu_remote),
-                ("设置", self.on_settings),
-                ("打开日志", self.on_open_log),
-                ("关闭", self._close_dashboard)):
-            btn = ctk.CTkButton(buttons, text=text, command=cmd, width=96)
-            btn.pack(side="left", padx=3)
-            btns.append(btn)
-        refs["buttons"] = btns
-        self._dash_ctk_widgets = refs
-        self._dash_widgets = None
-        self._refresh_dashboard()
-
-    def _draw_gauge(self, canvas, gauge, color) -> None:
-        """在 110×110 Canvas 上画一个环形仪表（无数据时只画底环 + “未验证”）。"""
-        try:
-            canvas.delete("all")
-            canvas.create_arc(8, 8, 102, 102, start=90, extent=-360,
-                              style="arc", outline="#334155", width=10)
-            if gauge is None:
-                canvas.create_text(55, 48, text="未验证", fill="#8b949e",
-                                   font=("Microsoft YaHei", 13, "bold"))
-                canvas.create_text(55, 68, text="无数据，不猜",
-                                   fill="#64748b",
-                                   font=("Microsoft YaHei", 10))
-                return
-            fraction, label = gauge
-            canvas.create_arc(8, 8, 102, 102, start=90,
-                              extent=-max(0.0, min(1.0, fraction)) * 360,
-                              style="arc", outline=color, width=10)
-            canvas.create_text(55, 48, text=label, fill=color,
-                               font=("Microsoft YaHei", 13, "bold"))
-            canvas.create_text(55, 68, text="%.0f%%" % (fraction * 100),
-                               fill="#94a3b8",
-                               font=("Microsoft YaHei", 10))
-        except Exception:
-            pass
+        from campus_desktop_ui import build_dashboard
+        build_dashboard(self)
 
     def _dashboard_timeline_lines(self, limit: int = 5):
         """仪表盘时间线：真实事件（断网/假死/切换/恢复/UU 重启），最新在上。
@@ -1922,130 +1712,10 @@ class TrayApp:
             return []
         return [event.line() for event in reversed(events)]
 
-    def _toggle_dashboard_details(self):
-        """详情折叠开关：默认收起；展开时把详情框插到流水线与时间线之间。"""
-        refs = getattr(self, "_dash_ctk_widgets", None)
-        if refs is None:
-            return
-        open_ = not refs.get("details_open", False)
-        refs["details_open"] = open_
-        frame = refs.get("details_frame")
-        toggle = refs.get("details_toggle")
-        if frame is not None:
-            if open_:
-                anchor = refs.get("timeline_frame")
-                if anchor is not None:
-                    frame.pack(fill="x", pady=(6, 0), before=anchor)
-                else:
-                    frame.pack(fill="x", pady=(6, 0))
-            else:
-                frame.pack_forget()
-        if toggle is not None:
-            toggle.configure(text="收起详情 ▴" if open_ else "展开详情 ▾")
-
     def _render_dashboard_ctk(self, state) -> None:
-        """把 UiState 写进 CustomTkinter 控件（纯赋值，不做网络操作）。"""
-        refs = getattr(self, "_dash_ctk_widgets", None)
-        if refs is None:
-            return
-        refs["light"].configure(text_color=state.overall_color)
-        refs["overall"].configure(text=state.overall_label,
-                                  text_color=state.overall_color)
-        refs["headline"].configure(text=state.headline or "—")
-        # V0.6.2：更新横幅显隐（只在状态变化时改布局）。
-        self._render_update_banner(refs)
-        for role in ("ethernet", "wifi"):
-            card = state.card(role)
-            if card is None:
-                continue
-            for label, var in (refs.get(role) or {}).items():
-                var.configure(text=card.field(label))
-        # E：三环仪表（数值只从 UiState 状态推导，见 gauge_from_*）
-        gauges = refs.get("gauges") or {}
-        for role in ("ethernet", "wifi"):
-            slot = gauges.get(role)
-            if slot is None:
-                continue
-            card = state.card(role)
-            gauge = gauge_from_card(card)
-            color = card.color if card is not None else "#6e7681"
-            self._draw_gauge(slot["canvas"], gauge, color)
-            if card is None:
-                slot["fact"].configure(text="—")
-            else:
-                slot["fact"].configure(
-                    text="源地址 %s · %s" % (card.field("源地址"),
-                                            card.field("最近验证")))
-        uu_slot = gauges.get("uu")
-        if uu_slot is not None:
-            gauge = gauge_from_uu(state.uu)
-            from campus_ui_state import TONE_COLOR
-            color = TONE_COLOR.get(state.uu.tone, "#6e7681")
-            self._draw_gauge(uu_slot["canvas"], gauge, color)
-            uu_slot["fact"].configure(
-                text=state.uu.detail or ("已开启" if state.uu.enabled
-                                        else "默认关闭（设置里打开）"))
-        done = 0
-        for step in state.pipeline:
-            widget = (refs.get("steps") or {}).get(step.key)
-            if widget is not None:
-                widget.configure(text=step.display, text_color=step.color)
-            if step.status == "done":
-                done += 1
-        refs["progress"].set(done / 6.0 if state.pipeline else 0.0)
-        refs["uu"].configure(
-            text="UU 远程自动恢复：%s%s" % (
-                state.uu.label,
-                ("（%s）" % state.uu.detail) if state.uu.detail else ""))
-        notes = [state.monitor_label or "监测状态未知"]
-        if state.network_epoch:
-            notes.append("epoch=%d" % state.network_epoch)
-        if state.mode_label:
-            notes.append("模式：%s" % state.mode_label)
-        refs["monitor"].configure(text=" · ".join(notes))
-        lines = self._dashboard_timeline_lines(limit=5)
-        refs["timeline"].configure(
-            text="\n".join(lines) if lines else "尚无网络故障事件记录")
-        manual = []
-        for role in ("ethernet", "wifi"):
-            card = state.card(role)
-            if card is not None and card.manual:
-                manual.extend(card.manual)
-        refs["manual"].configure(text="\n".join(manual) if manual else "—")
-        history = refs["history"]
-        history.append((time.time(), state.overall))
-        refs["history"] = [h for h in history if h[0] > time.time() - 3600]
-        self._draw_history_chart(refs["chart"], refs["history"])
-        refs["pulse"] = refs.get("pulse", 0) + 1
-        if state.overall in ("RECOVERING", "DEGRADED"):
-            refs["light"].configure(
-                text_color="#facc15" if refs["pulse"] % 2 else state.overall_color)
-
-    def _draw_history_chart(self, canvas, history) -> None:
-        """最近一小时双链路状态图（Canvas 手绘，不引入新依赖）。"""
-        try:
-            canvas.delete("all")
-            width = int(canvas.winfo_width() or 820)
-            height = int(canvas.winfo_height() or 64)
-            colors = {"HEALTHY": "#3fb950", "DEGRADED": "#d29922",
-                      "RECOVERING": "#58a6ff", "OFFLINE": "#f85149",
-                      "PAUSED": "#8b949e", "UNKNOWN": "#6e7681"}
-            if not history:
-                canvas.create_text(width // 2, height // 2,
-                                   text="最近一小时状态图：暂无数据",
-                                   fill="#94a3b8")
-                return
-            now = time.time()
-            for stamp, overall in history:
-                x = width - max(0.0, (now - stamp)) / 3600.0 * width
-                canvas.create_rectangle(x - 2, 6, x + 2, height - 6,
-                                        fill=colors.get(overall, "#6e7681"),
-                                        outline="")
-            canvas.create_text(4, 8, anchor="w",
-                               text="最近 1 小时：绿正常 / 黄降级 / 蓝恢复中 / 红离线",
-                               fill="#94a3b8")
-        except Exception:
-            pass
+        if getattr(self, "_dash_ctk_widgets", None) is not None:
+            from campus_desktop_ui import render_dashboard
+            render_dashboard(self, state)
 
     def _close_dashboard(self):
         win = self.dashboard_win
@@ -2998,6 +2668,7 @@ class TrayApp:
         return self._timers.schedule_detection(now, self._interval())
 
     def _probe_tick(self, next_probe: float) -> float:
+        self._automatic_setup_tick()
         now = time.monotonic()
         awake = bool(self.config.get("lifeline_enabled", False) and not self.config.get("paused"))
         if awake != getattr(self, "_sleep_prevention", False):
@@ -3508,6 +3179,88 @@ class TrayApp:
         if result <= 32:
             self.notify("重启恢复设置未启动", "需要在本机接受 Windows 管理员权限提示。")
 
+    def enable_automatic_setup(self, *, first_install=False):
+        """Arm only in the real entry point; constructors and startup self-tests stay offline."""
+        self._automatic_setup_armed = True
+        if first_install:
+            cfg = self.get_config()
+            cfg.update(lifeline_enabled=True, automatic_proxy_enabled=True, v06_auto_prompted=True)
+            if save_config(cfg):
+                self.update_config(cfg)
+            if not get_autostart() and not set_autostart(True):
+                self.log.warning("首次启动未能设置开机运行")
+
+    def on_toggle_online_guard(self):
+        enabled = not bool(self.get_config().get("lifeline_enabled"))
+        cfg = self.get_config()
+        cfg.update(lifeline_enabled=enabled, automatic_proxy_enabled=enabled,
+                   paused=False, v06_auto_prompted=True)
+        if not save_config(cfg):
+            messagebox.showerror("设置未保存", "请检查当前用户文件夹的写入权限后重试。", parent=self.root)
+            return
+        self.update_config(cfg)
+        self._automatic_setup_next = 0
+        self._lifeline_next = 0
+        self.notify("在线守护已开启" if enabled else "在线守护已关闭",
+                    "将自动检查网络、恢复 UU，并保留联网软件原有设置。" if enabled else "后台自动恢复已停止。")
+
+    def on_check_connection(self):
+        self._automatic_setup_next = 0
+        self.on_detect_now()
+
+    def _automatic_setup_tick(self):
+        if not self._automatic_setup_armed or self._cancelled():
+            return
+        if not self.get_config().get("automatic_proxy_enabled", True):
+            return
+        if self._repair_busy.is_set() or self._lifeline_busy.is_set():
+            return
+        clash_busy = getattr(self, "_clash_check_busy", None)
+        if clash_busy and clash_busy.is_set():
+            return
+        now = time.monotonic()
+        if now < self._automatic_setup_next:
+            return
+        self._automatic_setup_next = now + 300
+        self._repair_busy.set()
+        self._automatic_setup_message = "正在准备联网保护"
+        try:
+            if self._automatic_setup is None:
+                from campus_auto_setup import windows_setup
+                self._automatic_setup = windows_setup(cancelled=lambda: self._cancelled()
+                    or not self.get_config().get("automatic_proxy_enabled", True))
+            result = self._automatic_setup.run()
+            self._automatic_setup_message = result.message
+            self.log.info("[自动准备] %s", result.message)
+        except Exception as exc:
+            self._automatic_setup_message = "联网保护准备未完成，将在后台重试"
+            self.log.warning("[自动准备] 本轮未完成：%s", type(exc).__name__)
+        finally:
+            self._repair_busy.clear()
+
+    def _guard_proxy_health(self):
+        endpoint = self._observed_proxy_endpoint()
+        if endpoint is None or not self.get_config().get("automatic_proxy_enabled", True):
+            return True
+        with direct_session() as session:
+            session.proxies.update({"http": "http://" + endpoint, "https": "http://" + endpoint})
+            result = probe_via_proxy(session, engine.DEFAULT_PROBES)
+        if result.proxy_ok:
+            self._proxy_failure_count = 0
+            return True
+        self._proxy_failure_count += 1
+        now = time.monotonic()
+        if self._proxy_failure_count >= 3 and now - self._proxy_restart_at >= 300:
+            self._proxy_restart_at = now
+            self._proxy_failure_count = 0
+            if self._automatic_setup is None:
+                from campus_auto_setup import windows_setup
+                self._automatic_setup = windows_setup(cancelled=lambda: self._cancelled()
+                    or not self.get_config().get("automatic_proxy_enabled", True))
+            self._automatic_setup_message = "正在恢复联网软件"
+            self._automatic_setup.run(restart_client=True)
+        return False
+
     def _lifeline_tick(self):
         if self._lifeline_busy.is_set() or self._repair_busy.is_set():
             return
@@ -3527,7 +3280,10 @@ class TrayApp:
 
         def network_ok():
             with direct_session() as session:
-                return bool(verify_internet(session)[0])
+                direct_ok = bool(verify_internet(session)[0])
+            if direct_ok and self._automatic_setup_armed:
+                return self._guard_proxy_health()
+            return direct_ok
 
         def repair():
             cfg = self.get_config()
@@ -3549,9 +3305,18 @@ class TrayApp:
                 import campus_resilience_windows as native
                 from campus_boot import autologon_ready
                 if self._lifeline is None:
+                    self._uu_available = native.uu_available() if self._automatic_setup_armed else True
+                    def uu_ok():
+                        if self._uu_available is False:
+                            return True
+                        if self._uu_available is None:
+                            self._uu_available = native.uu_available()
+                            if self._uu_available is None:
+                                return None
+                        return native.uu_connected()
                     ops = RecoveryOps(
-                        network_ok=network_ok, uu_ok=native.uu_connected,
-                        restart_uu=active(lambda: native.restart_uu(self.log.info)),
+                        network_ok=network_ok, uu_ok=uu_ok,
+                        restart_uu=active(lambda: native.restart_uu(self.log.info) if self._uu_available else None),
                         proxy_snapshot=native.proxy_snapshot,
                         proxy_disable=active(native.proxy_disable),
                         proxy_restore=native.proxy_restore, repair=active(repair),
@@ -3562,6 +3327,7 @@ class TrayApp:
                         log=lambda message: self.log.info("[三层恢复] %s", message))
                 self._lifeline.tick(allow_reboot=bool(
                     self.get_config().get("lifeline_reboot_enabled", False)))
+                self._lifeline_observed_at = time.monotonic()
                 self._last_system_probe = (self._lifeline.last_network is True, "三层恢复独立公网校验")
                 healthy = self._lifeline.last_network is True and self._lifeline.last_uu is True
                 self.set_state("online" if healthy else "reconnecting",
@@ -3668,11 +3434,11 @@ class TrayApp:
         if show:
             info = self._update_info
             refs["update_banner_label"].configure(
-                text="发现新版本 %s（当前 v%s）— 只提醒，不自动下载安装"
+                text="可更新至 %s（当前 v%s）"
                      % (info.tag, __version__))
             anchor = refs.get("gauges_frame")
             if anchor is not None:
-                banner.pack(fill="x", pady=(0, 10), before=anchor)
+                banner.pack(fill="x", padx=24 if refs.get("pages") else 0, pady=(0, 10), before=anchor)
             else:
                 banner.pack(fill="x", pady=(0, 10))
         else:
@@ -3932,6 +3698,7 @@ class TrayApp:
                         self.icon.update_menu()
                     return
         if set_autostart(target):
+            self._autostart_enabled = target
             self.notify("开机自启已%s" % ("开启" if target else "关闭"),
                         "登录 Windows 后自动启动托盘助手" if target else "不再自动启动")
         else:
@@ -4078,7 +3845,7 @@ class TrayApp:
                              checked=lambda item: bool(self.config.get("browser_fallback"))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("设置面板", self.on_settings),
-            pystray.MenuItem("校园网代理兼容检查", lambda icon, item: self._ui_post(self._open_proxy_compat)),
+            pystray.MenuItem("高级网络诊断", lambda icon, item: self._ui_post(self._open_proxy_compat)),
             pystray.MenuItem("更新账号/密码", self.on_update_credentials),
             pystray.MenuItem("清除凭据", self.on_clear_credentials),
             pystray.MenuItem("重启监测", self.restart_monitor),
@@ -4134,7 +3901,10 @@ class TrayApp:
         win = tk.Toplevel(self.root)
         self.settings_win = win
         win.title("校园网自动重连助手 · 设置")
-        win.resizable(False, False)
+        from campus_desktop_ui import configure_theme
+        configure_theme(self.root)
+        win.configure(background="#F6F6F8")
+        win.resizable(True, True)
         outer = ttk.Frame(win, padding=10)
         outer.grid(sticky="nsew")
         notebook = ttk.Notebook(outer)
@@ -4555,6 +4325,8 @@ class TrayApp:
 
 def prompt_credentials_dialog(root, initial_user=""):
     """图形界面输入账号密码（exe 版自包含所需）。"""
+    from campus_desktop_ui import configure_theme
+    configure_theme(root)
     result = {"value": None}
     win = tk.Toplevel(root)
     win.title("校园网账号设置")
@@ -4720,8 +4492,12 @@ def main(argv=None) -> int:
                 messagebox.showerror("凭据保存失败", saved.detail)
         else:
             log.warning("未设置账号，自动重连暂不可用（可在凭据管理器中补存后重启）")
+    first_install = packaged and not Path(CONFIG_FILE).exists()
     app = TrayApp(log)
     app.root = root
+    if packaged:
+        app.enable_automatic_setup(first_install=first_install)
+    app._autostart_enabled = get_autostart()
     log.info("托盘助手启动（autostart=%s, clash_auto_proxy=%s, remote_guard=%s）",
              get_autostart(), app.config.get("clash_auto_proxy"),
              app.config.get("remote_guard", True))
@@ -4741,9 +4517,6 @@ def main(argv=None) -> int:
     app.start()
     if not args.background:
         app.on_dashboard()
-    if packaged:
-        from campus_proxy_ui import offer_onboarding
-        offer_onboarding(app, background=args.background)
     if args.update_receipt is not None:
         from campus_install import atomic_json
         atomic_json(args.update_receipt, {"version": __version__})

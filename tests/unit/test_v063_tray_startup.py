@@ -64,6 +64,7 @@ def test_manual_start_queues_dashboard_after_starting_tray(monkeypatch, args, op
     assert tray.set_autostart.call_count == int(packaged)
     app.start.assert_called_once_with()
     assert app.on_dashboard.call_count == int(open_dashboard)
-    assert onboarding.call_count == int(packaged)
+    onboarding.assert_not_called()
+    assert app.enable_automatic_setup.call_count == int(packaged)
     if open_dashboard:
         assert app.method_calls.index(call.on_dashboard()) > app.method_calls.index(call.start())
