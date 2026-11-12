@@ -30,6 +30,15 @@
 
 测试分级：``U-75-1-*`` 单元 / 离线 Mock；``I-75-1-*`` 离线集成闭合回路。
 约束：零真实网络 / 零真实路由写入 / 零真实注册表 / 零真实凭据 / 零真实 sleep。
+
+阶段 A（V0.7.1，2026-11-12）：观测预算自洽
+==========================================
+旧默认 ``(max_age=8, timeout=12, interval=3)`` 与真机实测一次采集 ~21.6s 矛盾：
+每轮必然超时、快照永不发布，叠加「不可信 ⇒ 零网络副作用」形成长期自锁。
+本阶段改为 ``(30, 45, 3)`` 并新增纯函数 :func:`check_snapshot_budget` 把不变量
+固化为可回归的规格。**fail-closed 语义完全不变**：结构不完整 / 代次失效 /
+真过期 / 采集失败 / 采集超时仍然一律 ``trusted=False``。
+证据与残余风险见 ``docs/阶段A_观测预算自洽_2026-11-12.md``。
 """
 from __future__ import annotations
 
@@ -41,26 +50,33 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from campus_network import NetworkHealthSnapshot
 
 __all__ = [
-    "CONTRACT_VERSION", "DEFAULT_MAX_AGE", "DEFAULT_COLLECT_TIMEOUT",
-    "DEFAULT_MIN_INTERVAL", "SNAPSHOT_STATES", "SNAPSHOT_OK",
-    "SNAPSHOT_NO_DATA", "SNAPSHOT_COLLECTING", "SNAPSHOT_COLLECT_ERROR",
-    "SNAPSHOT_COLLECT_TIMEOUT", "SNAPSHOT_STALE", "SNAPSHOT_GENERATION",
-    "SNAPSHOT_INCOMPLETE", "SNAPSHOT_EXTERNAL", "ObservationResult",
-    "snapshot_signature", "is_full_snapshot", "TraySnapshotSource",
-    "RefusingExecutor", "format_observation", "is_auto_executable_snapshot",
+    "CONTRACT_VERSION", "DEFAULT_MEASURED_COLLECT", "DEFAULT_MAX_AGE",
+    "DEFAULT_COLLECT_TIMEOUT", "DEFAULT_MIN_INTERVAL", "SNAPSHOT_STATES",
+    "SNAPSHOT_OK", "SNAPSHOT_NO_DATA", "SNAPSHOT_COLLECTING",
+    "SNAPSHOT_COLLECT_ERROR", "SNAPSHOT_COLLECT_TIMEOUT", "SNAPSHOT_STALE",
+    "SNAPSHOT_GENERATION", "SNAPSHOT_INCOMPLETE", "SNAPSHOT_EXTERNAL",
+    "ObservationResult", "snapshot_signature", "is_full_snapshot",
+    "check_snapshot_budget", "TraySnapshotSource", "RefusingExecutor",
+    "format_observation", "is_auto_executable_snapshot",
 ]
 
 CONTRACT_VERSION = "v03-p75-obs-1"
 
-#: 快照有效期（秒）：超过该年龄的快照不得用于 AUTO 决策。
-# 保守初始值：缩短 AUTO 可消费的缓存窗口；尚无受控真机性能结论。
-DEFAULT_MAX_AGE = 8.0
+#: 实测一次完整三轴 ``evaluate()`` 的中位耗时（秒）。
+# 证据：docs/P8真实环境验收手册_2026-10-15.md §2026-10-16 09:4x 受控实验，
+# 21.1s / 22.0s（中位 21.6s）；无线 LINK_DOWN 已在链路层短路仍需该量级。
+DEFAULT_MEASURED_COLLECT = 21.6
 #: 单次采集的超时容忍（秒）：超时后放弃本轮并**丢弃**迟到的结果。
-# 有限等待预算；实际接口探测性能留待后续受控验收。
-DEFAULT_COLLECT_TIMEOUT = 12.0
+# 必须覆盖一次实测采集并留出抖动余量；旧值 12.0 < 21.6 ⇒ 每轮必然超时、
+# 快照永不发布，P8 受控实验 100% 复现（timeouts=6 / collect=0）。
+DEFAULT_COLLECT_TIMEOUT = 45.0
 #: 两次采集之间的最小间隔（秒）：限流，避免 PowerShell 诊断进程堆积。
-# 最小重采间隔，配合单飞与在途上限限制诊断任务堆积。
 DEFAULT_MIN_INTERVAL = 3.0
+#: 快照有效期（秒）：超过该年龄的快照不得用于 AUTO 决策。
+# 必须覆盖「一次实测采集 + 一次重采间隔」：21.6 + 3 = 24.6 < 30 ⇒ 正常节拍下
+# 无 STALE 空窗。受配置规格 [1, 30] 约束，取上限 30。旧值 8.0 < 24.6 ⇒
+# 任何慢采集都产生周期性不可信，叠加采集失败即长期 fail-closed 自锁。
+DEFAULT_MAX_AGE = 30.0
 
 #: 快照可信度结论取值。
 SNAPSHOT_OK = "OK"                              # 可信
@@ -91,6 +107,46 @@ STATE_TEXT: Dict[str, str] = {
     SNAPSHOT_INCOMPLETE: "快照结构不完整（轻量占位快照）",
     SNAPSHOT_EXTERNAL: "外部注入快照（未经新鲜度校验）",
 }
+
+
+# --------------------------------------------------------------------------- #
+# 纯函数：观测预算自洽性校验（阶段 A）
+# --------------------------------------------------------------------------- #
+def check_snapshot_budget(max_age: float, collect_timeout: float,
+                          min_interval: float, *,
+                          measured_collect: float = DEFAULT_MEASURED_COLLECT
+                          ) -> Tuple[bool, Tuple[str, ...]]:
+    """校验「新鲜度窗口 / 采集预算 / 重采间隔」是否自洽（纯函数，零 I/O）。
+
+    三条不变量任一不满足，观测链路就会出现周期性或永久性的不可信：
+
+    1. ``collect_timeout >= measured_collect`` —— 预算必须覆盖一次真实采集，
+       否则**每轮必然超时**、快照永不发布（旧 12s 缺陷，P8 已量化）；
+    2. ``max_age >= measured_collect + min_interval`` —— 新鲜度窗口必须覆盖
+       「一次实测采集 + 一次重采间隔」，否则每次慢采集都产生 STALE 空窗；
+    3. ``max_age >= min_interval`` —— 窗口不得短于重采节流，否则每轮必有空窗。
+
+    注意：这里比较的是**实测**采集耗时，不是 ``collect_timeout``。规格允许
+    ``max_age <= 30`` 而 ``collect_timeout`` 可达 60，故 ``max_age >= timeout``
+    无法作为不变量；病态的「采集跑满 timeout」由后续阶段的有界降级兜底。
+
+    返回 ``(coherent, reasons)``；``reasons`` 为可直出日志/测试断言的违规说明。
+    """
+    max_age = float(max_age)
+    collect_timeout = float(collect_timeout)
+    min_interval = float(min_interval)
+    cycle = float(measured_collect) + min_interval
+    reasons = []
+    if collect_timeout < measured_collect:
+        reasons.append("采集预算 %.1fs < 实测一次采集 %.1fs：每轮必然超时"
+                       % (collect_timeout, measured_collect))
+    if max_age < cycle:
+        reasons.append("有效期 %.1fs < 采集周期 %.1fs：慢采集必然产生 STALE 空窗"
+                       % (max_age, cycle))
+    if max_age < min_interval:
+        reasons.append("有效期 %.1fs < 重采间隔 %.1fs：每轮必有不可信空窗"
+                       % (max_age, min_interval))
+    return (not reasons, tuple(reasons))
 
 
 @dataclass

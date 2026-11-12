@@ -278,13 +278,24 @@ def test_auto_rejects_same_interface_for_both_roles():
 
 
 @pytest.mark.parametrize("raw, expected", [
-    ({}, (8, 12, 3)),
+    # V0.7.1 阶段 A：默认预算由 (8, 12, 3) 升级为 (30, 45, 3)。
+    ({}, (30, 45, 3)),
     ({"snapshot_max_age": True, "snapshot_timeout": "12",
-      "snapshot_interval": None}, (8, 12, 3)),
+      "snapshot_interval": None}, (30, 45, 3)),
     ({"snapshot_max_age": -1, "snapshot_timeout": 0,
       "snapshot_interval": 0}, (1, 3, 1)),
     ({"snapshot_max_age": 100, "snapshot_timeout": 100,
       "snapshot_interval": 100}, (30, 60, 30)),
+    # 旧版写进配置文件的「未定制默认值」按新默认迁移。
+    ({"snapshot_max_age": 8, "snapshot_timeout": 12,
+      "snapshot_interval": 3}, (30, 45, 3)),
+    ({"snapshot_max_age": 8, "snapshot_timeout": 12,
+      "snapshot_interval": 7}, (30, 45, 7)),
+    # 非精确旧默认组合视为用户显式配置，原样保留（不静默改写）。
+    ({"snapshot_max_age": 9, "snapshot_timeout": 12,
+      "snapshot_interval": 3}, (9, 12, 3)),
+    ({"snapshot_max_age": 8, "snapshot_timeout": 20,
+      "snapshot_interval": 3}, (8, 20, 3)),
 ])
 def test_snapshot_config_defaults_types_and_bounds(raw, expected):
     import json

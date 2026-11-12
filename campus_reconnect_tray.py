@@ -154,9 +154,15 @@ WATCHDOG_RESTART_WINDOW = 1800.0
 #: V0.3 P7.5-1 三轴观测：快照有效期 / 采集超时 / 采集最小间隔（秒）。
 #: 采集走**独立后台线程**（netdiag 的 PowerShell 只读管道），Tk 主线程不参与；
 #: 限流用于避免诊断进程堆积；过期或代次失效的快照一律不得用于 AUTO 决策。
-SNAPSHOT_MAX_AGE = 60.0
-SNAPSHOT_COLLECT_TIMEOUT = 25.0
-SNAPSHOT_MIN_INTERVAL = 10.0
+#: 阶段 A：与 DEFAULT_CONFIG / campus_tray_observer 保持同一组自洽值 (30/45/3)。
+#: 这三个常量只在 config **完全缺少对应键** 时兜底；正常路径由 DEFAULT_CONFIG 提供。
+SNAPSHOT_MAX_AGE = 30.0
+SNAPSHOT_COLLECT_TIMEOUT = 45.0
+SNAPSHOT_MIN_INTERVAL = 3.0
+
+#: 旧版写入 tray_config.json 的「未定制默认预算」(max_age, timeout)。
+#: 该组合在真机上 100% 采集超时（P8 量化诊断），阶段 A 视为需迁移的旧默认值。
+LEGACY_SNAPSHOT_BUDGET = (8, 12)
 
 #: 托盘配置的完整键集合（保存时只写这些键，未知键永不落盘）。
 DEFAULT_CONFIG = {
@@ -186,8 +192,12 @@ DEFAULT_CONFIG = {
     "remote_restart_enabled": False,  # **默认关闭**：不主动调用即零副作用
     "remote_restart_cooldown": 300,   # 两次真实清退最小间隔秒数
     # ---- V0.3 P7.5-1A：三轴观测参数（可配置，范围受限）----
-    "snapshot_max_age": 8,            # 快照有效期（秒）；依据见 campus_tray_observer
-    "snapshot_timeout": 12,           # 单次采集超时（秒）
+    # V0.7.1 阶段 A：旧默认 (8, 12, 3) 与真机实测采集 ~21.6s 矛盾 ⇒ 每轮必然
+    # 超时、SNAPSHOT_UNTRUSTED 长期自锁。改为规格区间内可用的 (30, 45, 3)：
+    # timeout 覆盖实测；max_age 覆盖「实测采集 + 重采间隔」= 24.6s。
+    # 依据：docs/P8真实环境验收手册_2026-10-15.md §2026-10-16 量化诊断 / 方案 A。
+    "snapshot_max_age": 30,           # 快照有效期（秒）；规格上限 30
+    "snapshot_timeout": 45,           # 单次采集超时（秒）；覆盖实测 21.6s
     "snapshot_interval": 3,           # 两次采集最小间隔（秒）
     # ---- V0.6：自动切换确认 / Clash 自愈 / UU 升级 ----
     "v06_auto_prompted": False,    # 是否已弹过一次智能自动确认
@@ -336,6 +346,11 @@ def _read_snapshot_keys(text: str) -> dict:
     与 P6/P7 读取器分开，避免破坏既有整字典断言；
     各参数限幅防止任意放宽安全门槛：
     max_age 1..30s、timeout 3..60s、interval 1..30s。
+
+    阶段 A 增加**旧默认值迁移**：旧版会把 ``(8, 12)`` 写进 tray_config.json，
+    只改 DEFAULT_CONFIG 覆盖不了已有配置文件。该组合在真机上 100% 采集超时，
+    视为「未经用户定制的旧默认值」升级到新默认；任何其他组合同样按原样保留
+    （用户显式配置不被静默改写）。
     """
     raw = _raw_config(text)
     max_age = raw.get("snapshot_max_age")
@@ -347,11 +362,16 @@ def _read_snapshot_keys(text: str) -> dict:
     interval = raw.get("snapshot_interval")
     if not isinstance(interval, int) or isinstance(interval, bool):
         interval = DEFAULT_CONFIG["snapshot_interval"]
-    return {
+    values = {
         "snapshot_max_age": max(1, min(30, int(max_age))),
         "snapshot_timeout": max(3, min(60, int(timeout))),
         "snapshot_interval": max(1, min(30, int(interval))),
     }
+    if (values["snapshot_max_age"], values["snapshot_timeout"]) \
+            == LEGACY_SNAPSHOT_BUDGET:
+        values["snapshot_max_age"] = DEFAULT_CONFIG["snapshot_max_age"]
+        values["snapshot_timeout"] = DEFAULT_CONFIG["snapshot_timeout"]
+    return values
 
 
 def _read_remote_app_keys(text: str) -> dict:
@@ -3939,12 +3959,13 @@ class TrayApp:
             value=bool(self.config.get("remote_restart_enabled", False)))
         v_restart_cd = tk.IntVar(
             value=self._int_or(self.config.get("remote_restart_cooldown"), 300))
-        # V0.3 P7.5-1A：三轴观测参数。
-        v_snap_age = tk.IntVar(value=self._int_or(self.config.get("snapshot_max_age"), 8))
-        v_snap_timeout = tk.IntVar(
-            value=self._int_or(self.config.get("snapshot_timeout"), 12))
-        v_snap_interval = tk.IntVar(
-            value=self._int_or(self.config.get("snapshot_interval"), 3))
+        # V0.3 P7.5-1A：三轴观测参数（阶段 A 起回退值统一取 DEFAULT_CONFIG）。
+        v_snap_age = tk.IntVar(value=self._int_or(
+            self.config.get("snapshot_max_age"), DEFAULT_CONFIG["snapshot_max_age"]))
+        v_snap_timeout = tk.IntVar(value=self._int_or(
+            self.config.get("snapshot_timeout"), DEFAULT_CONFIG["snapshot_timeout"]))
+        v_snap_interval = tk.IntVar(value=self._int_or(
+            self.config.get("snapshot_interval"), DEFAULT_CONFIG["snapshot_interval"]))
         v_ssid = tk.StringVar(value=self.config.get("ssid") or "SNNU")
         yys_value = self.config.get("yys", "mobile")
         if yys_value not in YYS_VALUE_TO_LABEL:
@@ -4144,9 +4165,12 @@ class TrayApp:
                 self.config.get("remote_restart_enabled", False)),
             "remote_restart_cooldown": self._int_or(
                 self.config.get("remote_restart_cooldown"), 300),
-            "snapshot_max_age": self._int_or(self.config.get("snapshot_max_age"), 8),
-            "snapshot_timeout": self._int_or(self.config.get("snapshot_timeout"), 12),
-            "snapshot_interval": self._int_or(self.config.get("snapshot_interval"), 3),
+            "snapshot_max_age": self._int_or(
+                self.config.get("snapshot_max_age"), DEFAULT_CONFIG["snapshot_max_age"]),
+            "snapshot_timeout": self._int_or(
+                self.config.get("snapshot_timeout"), DEFAULT_CONFIG["snapshot_timeout"]),
+            "snapshot_interval": self._int_or(
+                self.config.get("snapshot_interval"), DEFAULT_CONFIG["snapshot_interval"]),
             "update_check_enabled": bool(
                 self.config.get("update_check_enabled", True)),
         }
