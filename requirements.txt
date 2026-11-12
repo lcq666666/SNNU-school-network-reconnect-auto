@@ -1,7 +1,7 @@
 # 校园网自动重连助手 — 运行依赖清单（骨架）
 #
 # 支持矩阵：
-#   - Python >= 3.10（开发与验证使用 3.13.x）
+#   - Python >= 3.10, < 3.13（发布与验证使用 3.12.x）
 #   - 操作系统：Windows 10/11 x64（依赖 winreg / ctypes / tkinter，均为官方 Python 自带）
 #
 # 说明：
@@ -19,4 +19,4 @@ pystray>=0.19,<0.20
 pillow>=10,<12
 customtkinter>=5.2,<7
 # Local CPU-only recognition for numeric Portal CAPTCHA images.
-ddddocr==1.6.1
+ddddocr==1.5.6

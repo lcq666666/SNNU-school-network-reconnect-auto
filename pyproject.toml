@@ -8,7 +8,7 @@ name = "snnu-campus-reconnect"
 version = "0.6.7"
 description = "陕西师范大学校园网自动重连助手（CLI + 托盘），Windows 10/11 x64"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "lcq666666" }]
 # 支持矩阵：Python 3.10+ / Windows 10、11 x64（依赖 winreg / ctypes / tkinter）。
@@ -18,12 +18,11 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
 ]
 
 # ---- 运行依赖（CLI 核心；与 requirements.txt 对齐）----
 dependencies = [
-    "ddddocr==1.6.1",
+    "ddddocr==1.5.6",
     "requests>=2.31,<3",
     "keyring>=24,<26",
 ]

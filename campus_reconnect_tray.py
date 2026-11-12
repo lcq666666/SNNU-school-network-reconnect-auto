@@ -786,6 +786,7 @@ class TrayApp:
         self.last_watchdog = None
 
         self._lifeline = None
+        self._lifeline_was_enabled = bool(self.config.get("lifeline_enabled", False))
         self._lifeline_busy = threading.Event()
         self._lifeline_next = 0.0
         self._update_install_busy = threading.Event()
@@ -827,7 +828,8 @@ class TrayApp:
             mode=cfg.get("failover_mode", "MONITOR"),
             lock_target=cfg.get("failover_lock"),
             clash_keep=bool(cfg.get("clash_keep", True)),
-            authorized=bool(cfg.get("auto_switch_authorized", False)),
+            authorized=(bool(cfg.get("auto_switch_authorized", False))
+                        and not bool(cfg.get("lifeline_enabled", False))),
             executor_factory=self._build_auto_executor,
             policy=policy, timer_table=self._timers,
             remote_guard=getattr(self, "remote", None),
@@ -3005,9 +3007,15 @@ class TrayApp:
         if next_probe and now < next_probe:
             return next_probe
         if self.config.get("lifeline_enabled", False):
+            self._lifeline_was_enabled = True
             self._observe_snapshot()  # Read-only interface data for the dashboard.
             self._lifeline_tick()
             return self._next_probe_time(now)
+        if self._lifeline_busy.is_set():
+            return self._next_probe_time(now)
+        if self._lifeline_was_enabled:
+            self.failover = self._build_failover_bridge()
+            self._lifeline_was_enabled = False
         try:
             online, detail = internet_ok(self.session)
             self._last_system_probe = (online, detail)
@@ -3513,10 +3521,12 @@ class TrayApp:
         def repair():
             cfg = self.get_config()
             cfg.update(reconnect_wifi=True, browser_fallback=False)
+            adapters = self._repair_adapters()
+            adapters.probe_online = lambda session: verify_internet(session, stop_on_failed_gate=True)
             with direct_session() as session:
                 result = repair_service(
                     session, RepairOptions.from_mapping(cfg), time.monotonic,
-                    self._repair_adapters(), get_credentials,
+                    adapters, get_credentials,
                     cancelled=self._cancelled, sleep=self.stop_event.wait, log=self.log)
             return result.ok, result.detail
 
@@ -4656,7 +4666,6 @@ def main(argv=None) -> int:
         recover_pending_proxy()
     except Exception as exc:
         log.error("上次代理配置恢复未完成：%s", type(exc).__name__)
-        _show_startup_error("上次代理配置恢复未完成，请查看日志或手动恢复系统代理。")
     if previous is not None and not autostart_matches_current():
         if not set_autostart(True):
             log.warning("旧版开机自启迁移失败")
@@ -4672,8 +4681,9 @@ def main(argv=None) -> int:
     loaded = load_credentials()
     if loaded.error_code == E_CRED_BACKEND:
         log.error("凭据后端不可用：%s", loaded.detail)
-        messagebox.showerror(APP_NAME, "凭据库不可访问：%s\n可在设置面板稍后重试。" % loaded.detail)
-    elif loaded.error_code == E_CRED_MISSING:
+        if not args.background:
+            messagebox.showerror(APP_NAME, "凭据库不可访问：%s\n可在设置面板稍后重试。" % loaded.detail)
+    elif loaded.error_code == E_CRED_MISSING and not args.background:
         log.warning("尚未保存凭据，弹出账号设置窗口")
         creds = prompt_credentials_dialog(root)
         if creds:

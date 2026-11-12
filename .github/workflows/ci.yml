@@ -31,7 +31,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Install pinned dependencies
         run: |
@@ -55,7 +55,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Install pinned dependencies
         run: |

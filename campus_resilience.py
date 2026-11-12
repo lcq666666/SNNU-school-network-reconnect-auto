@@ -96,8 +96,14 @@ class RecoveryController:
         if stage == "confirming":
             self.state.update(stage="uu_restart", next_action=now + 60)
             self.save()
-            self.log("第一层恢复：重启 UU，等待连接建立")
+            self.log("第一层恢复：尝试常规网络重连，再重启 UU")
+            try:
+                _ok, self.detail = self.ops.repair()
+            except Exception as exc:
+                self.log("常规网络重连未完成（%s），继续 UU 恢复" % type(exc).__name__)
             self.ops.restart_uu()
+            self.state["next_action"] = max(now, self.clock()) + 60
+            self.save()
             return
         if stage == "uu_restart" or stage == "network_repair":
             self.state.update(stage="network_repair", next_action=now + 180)

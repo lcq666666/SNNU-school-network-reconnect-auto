@@ -37,11 +37,11 @@ def test_outage_advances_without_snapshot(tmp_path):
     controller, calls, _ = make_controller(tmp_path)
     controller.tick(1000)
     controller.tick(1031)
-    assert calls == ["uu"]
+    assert calls == ["repair", "uu"]
     controller.tick(1092)
-    assert calls[1:3] == ["proxy-off", "repair"]
-    assert calls[3][0] == "restore"
-    assert calls[4] == "uu"
+    assert calls[2:4] == ["proxy-off", "repair"]
+    assert calls[4][0] == "restore"
+    assert calls[5] == "uu"
 
 
 def test_proxy_restored_when_repair_raises(tmp_path):
@@ -80,7 +80,7 @@ def test_healthy_network_with_uu_missing_recovers_uu(tmp_path):
     controller, calls, status = make_controller(tmp_path, online=True)
     controller.tick(1000)
     controller.tick(1031)
-    assert calls == ["uu"]
+    assert calls == ["repair", "uu"]
     status["uu"] = True
     controller.tick(1040)
     assert controller.state["stage"] == "healthy"
