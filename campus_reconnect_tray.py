@@ -2978,7 +2978,8 @@ class TrayApp:
                         cmd = [c if c != "%s.xml" % ssid else str(xml_path)
                                for c in cmd]
                     done = subprocess.run(cmd, capture_output=True,
-                                          timeout=20)
+                                          timeout=20,
+                                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     return done.returncode, done.stdout.decode(
                         "gbk", errors="replace")
 
