@@ -9,18 +9,206 @@ try:
 except ImportError:
     ctk = None
 
-BG = "#F6F6F8"
-SIDE = "#EEEEF2"
-SURFACE = "#FFFFFF"
-BORDER = "#DFDFE7"
-TEXT = "#25252D"
-MUTED = "#666673"
-ACCENT = "#6554C0"
 FONT = "Microsoft YaHei UI"
-TONES = {"ok": "#237A50", "bad": "#B43838", "warn": "#956414",
-         "busy": ACCENT, "unknown": MUTED, "idle": MUTED}
 STEP_NAMES = {"detect": "检测网络", "wifi_ready": "连接无线", "portal": "校园认证",
               "internet": "验证上网", "route": "切换出口", "uu": "恢复 UU"}
+
+# P1: two palettes behind one key set. LIGHT is the v0.7.0 baseline (pixel-identical),
+# DARK is the low-saturation signal palette defined in .impeccable.md.
+_LIGHT = {
+    "BG": "#F6F6F8",
+    "SIDE": "#EEEEF2",
+    "SURFACE": "#FFFFFF",
+    "BORDER": "#DFDFE7",
+    "TEXT": "#25252D",
+    "MUTED": "#666673",
+    "ACCENT": "#6554C0",
+    "ACCENT_HOVER": "#5545AA",
+    "ACCENT_TEXT": "#FFFFFF",
+    "BUTTON_HOVER": "#EEEEF2",
+    "NAV_HOVER": "#E3E1EC",
+    "TONES": {"ok": "#237A50", "bad": "#B43838", "warn": "#956414",
+              "busy": "#6554C0", "unknown": "#666673", "idle": "#666673"},
+}
+_DARK = {
+    "BG": "#0F1519",
+    "SIDE": "#141B20",
+    "SURFACE": "#1A2329",
+    "BORDER": "#2B363D",
+    "TEXT": "#EDE8DE",
+    "MUTED": "#96A2A8",
+    "ACCENT": "#4E9E84",
+    "ACCENT_HOVER": "#3C816C",
+    "ACCENT_TEXT": "#0B1216",
+    "BUTTON_HOVER": "#223038",
+    "NAV_HOVER": "#223038",
+    "TONES": {"ok": "#79CFAE", "bad": "#E58474", "warn": "#E0BE6B",
+              "busy": "#8FB8C8", "unknown": "#96A2A8", "idle": "#96A2A8"},
+}
+THEMES = {"light": _LIGHT, "dark": _DARK}
+_current_theme = "light"
+
+# Kept as module constants: campus_proxy_ui imports them directly and offline tests
+# assert the v0.7.0 state colours. They always describe the light baseline.
+BG = _LIGHT["BG"]
+SIDE = _LIGHT["SIDE"]
+SURFACE = _LIGHT["SURFACE"]
+BORDER = _LIGHT["BORDER"]
+TEXT = _LIGHT["TEXT"]
+MUTED = _LIGHT["MUTED"]
+ACCENT = _LIGHT["ACCENT"]
+TONES = dict(_LIGHT["TONES"])
+
+
+def theme_mode():
+    """Active palette name. Presentation-only; never read by the network state machine."""
+    return _current_theme
+
+
+def tokens(mode=None):
+    """Return the active palette (or an explicit one) without mutating app state."""
+    return THEMES[mode or _current_theme]
+
+
+def set_theme(mode):
+    """Switch active palette. Returns the palette; does not touch config, timers or state."""
+    global _current_theme
+    if mode not in THEMES:
+        raise ValueError(f"unknown theme: {mode}")
+    _current_theme = mode
+    if ctk is not None:
+        ctk.set_appearance_mode(mode)
+    return tokens()
+
+
+def bind_theme(widget, role, **info):
+    """Tag a widget so apply_theme() can repaint it after a palette switch."""
+    widget._campus_theme = (role, info)
+    return widget
+
+
+def _paint(widget, palette):
+    mark = getattr(widget, "_campus_theme", None)
+    if not mark:
+        return
+    role, info = mark
+    try:
+        if not widget.winfo_exists():
+            return
+    except (tk.TclError, AttributeError):
+        return
+    try:
+        if role == "label":
+            widget.configure(text_color=palette["MUTED"] if info.get("muted") else palette["TEXT"])
+        elif role == "tone":
+            widget.configure(text_color=palette["TONES"].get(info.get("tone"), palette["MUTED"]))
+        elif role == "button":
+            primary = info.get("primary", False)
+            widget.configure(
+                fg_color=palette["ACCENT"] if primary else palette["SURFACE"],
+                hover_color=palette["ACCENT_HOVER"] if primary else palette["BUTTON_HOVER"],
+                text_color=palette["ACCENT_TEXT"] if primary else palette["TEXT"],
+                border_color=palette["BORDER"])
+        elif role == "nav":
+            active = info.get("selected", False)
+            widget.configure(
+                fg_color=palette["SURFACE"] if active else "transparent",
+                text_color=palette["ACCENT"] if active else palette["TEXT"],
+                hover_color=palette["NAV_HOVER"])
+        elif role == "mode":
+            active = info.get("mode") == theme_mode()
+            widget.configure(
+                fg_color=palette["ACCENT"] if active else palette["SURFACE"],
+                hover_color=palette["ACCENT_HOVER"] if active else palette["BUTTON_HOVER"],
+                text_color=palette["ACCENT_TEXT"] if active else palette["TEXT"],
+                border_color=palette["BORDER"])
+        elif role == "panel":
+            widget.configure(fg_color=palette["SURFACE"], border_color=palette["BORDER"])
+        elif role == "side":
+            widget.configure(fg_color=palette["SIDE"])
+        elif role in ("surface", "window"):
+            widget.configure(fg_color=palette["BG"])
+        elif role == "tk_window":
+            widget.configure(background=palette["BG"])
+        elif role == "progress":
+            widget.configure(progress_color=palette["ACCENT"], fg_color=palette["BORDER"])
+        elif role == "textbox":
+            widget.configure(fg_color=palette["SURFACE"], text_color=palette["TEXT"])
+        elif role == "option":
+            widget.configure(fg_color=palette["SIDE"], button_color=palette["ACCENT"],
+                             text_color=palette["TEXT"])
+    except (tk.TclError, AttributeError, TypeError, ValueError):
+        return
+
+
+def _walk(root):
+    try:
+        children = root.winfo_children()
+    except (tk.TclError, AttributeError):
+        return
+    for child in children:
+        yield child
+        yield from _walk(child)
+
+
+def apply_theme(*roots):
+    """Repaint every tagged widget in the given window trees (plus the default root)."""
+    palette = tokens()
+    seen = set()
+    candidates = list(roots)
+    if tk._default_root is not None:
+        candidates.append(tk._default_root)
+    for root in candidates:
+        if root is None:
+            continue
+        for widget in _walk(root):
+            key = id(widget)
+            if key in seen:
+                continue
+            seen.add(key)
+            _paint(widget, palette)
+
+
+def switch_theme(mode):
+    """Switch palette and repaint live windows without retaining any window reference.
+
+    Keeping this at module scope avoids a Tk widget reference cycle: a button command
+    defined inside build_dashboard would capture the Toplevel, and GC would then destroy
+    Tcl objects from a non-main thread.
+    """
+    set_theme(mode)
+    root = tk._default_root
+    if root is not None:
+        configure_theme(root)
+        apply_theme(root)
+
+
+def theme_switcher(parent, palette):
+    """Build the light/dark switch; retains no Toplevel reference."""
+    frame = ctk.CTkFrame(parent, fg_color="transparent")
+    frame.grid(row=7, column=0, sticky="ew", padx=12, pady=(20, 0))
+    frame.grid_columnconfigure((0, 1), weight=1)
+    label(frame, "外观", size=11, muted=True).grid(
+        row=0, column=0, columnspan=2, sticky="w", padx=8)
+    for column, (mode, caption) in enumerate((("light", "浅色"), ("dark", "深色"))):
+        active = mode == theme_mode()
+        widget = ctk.CTkButton(
+            frame, text=caption, command=lambda m=mode: switch_theme(m),
+            font=font(12), height=28, corner_radius=5,
+            fg_color=palette["ACCENT"] if active else palette["SURFACE"],
+            hover_color=(palette["ACCENT_HOVER"] if active else palette["BUTTON_HOVER"]),
+            text_color=palette["ACCENT_TEXT"] if active else palette["TEXT"],
+            border_width=0 if active else 1, border_color=palette["BORDER"])
+        bind_theme(widget, "mode", mode=mode)
+        widget.grid(row=1, column=column, sticky="ew",
+                    padx=(0 if column == 0 else 3, 3 if column == 0 else 0), pady=4)
+
+
+def _tone(widget, tone):
+    """Assign a state colour and remember its semantic key for later repaints."""
+    palette = tokens()
+    widget.configure(text_color=palette["TONES"].get(tone, palette["MUTED"]))
+    bind_theme(widget, "tone", tone=tone)
 
 
 def font(size=14, bold=False):
@@ -38,8 +226,9 @@ def font(size=14, bold=False):
 
 
 def configure_theme(root):
+    palette = tokens()
     if ctk is not None:
-        ctk.set_appearance_mode("light")
+        ctk.set_appearance_mode(theme_mode())
     # Legacy settings use the same family, palette and readable native point sizes.
     scale = (ctk.ScalingTracker.get_window_dpi_scaling(root) if ctk is not None
              else root.winfo_fpixels("1i") / 96)
@@ -47,15 +236,16 @@ def configure_theme(root):
     root.option_add("*Font", native_font)
     style = ttk.Style(root)
     style.theme_use("clam")
-    style.configure(".", font=native_font, background=BG, foreground=TEXT)
-    style.configure("TButton", padding=(round(12 * scale), round(7 * scale)), background=SURFACE)
-    style.map("TButton", background=[("active", SIDE)])
-    style.configure("TNotebook", background=BG, borderwidth=0)
-    style.configure("TNotebook.Tab", padding=(16, 9), background=SIDE)
-    style.map("TNotebook.Tab", background=[("selected", SURFACE)],
-              foreground=[("selected", ACCENT)])
-    style.configure("TEntry", fieldbackground=SURFACE)
-    style.configure("TCombobox", fieldbackground=SURFACE)
+    style.configure(".", font=native_font, background=palette["BG"], foreground=palette["TEXT"])
+    style.configure("TButton", padding=(round(12 * scale), round(7 * scale)),
+                    background=palette["SURFACE"])
+    style.map("TButton", background=[("active", palette["SIDE"])])
+    style.configure("TNotebook", background=palette["BG"], borderwidth=0)
+    style.configure("TNotebook.Tab", padding=(16, 9), background=palette["SIDE"])
+    style.map("TNotebook.Tab", background=[("selected", palette["SURFACE"])],
+              foreground=[("selected", palette["ACCENT"])])
+    style.configure("TEntry", fieldbackground=palette["SURFACE"])
+    style.configure("TCombobox", fieldbackground=palette["SURFACE"])
 
 
 def fit_window(win, width, height, *, minimum=(760, 460)):
@@ -69,21 +259,32 @@ def fit_window(win, width, height, *, minimum=(760, 460)):
 
 def label(parent, text, *, size=14, bold=False, muted=False, **kwargs):
     # Fixed logical line lengths avoid a Tk geometry feedback loop at fractional DPI.
-    return ctk.CTkLabel(parent, text=text, font=font(size, bold),
-                       text_color=MUTED if muted else TEXT, anchor="w", **kwargs)
+    palette = tokens()
+    return bind_theme(
+        ctk.CTkLabel(parent, text=text, font=font(size, bold),
+                     text_color=palette["MUTED"] if muted else palette["TEXT"],
+                     anchor="w", **kwargs),
+        "label", muted=muted)
 
 
 def button(parent, text, command, *, primary=False, **kwargs):
-    return ctk.CTkButton(parent, text=text, command=command, font=font(), height=38,
-                         corner_radius=5, fg_color=ACCENT if primary else SURFACE,
-                         hover_color="#5545AA" if primary else SIDE,
-                         text_color=SURFACE if primary else TEXT,
-                         border_width=0 if primary else 1, border_color=BORDER, **kwargs)
+    palette = tokens()
+    return bind_theme(
+        ctk.CTkButton(parent, text=text, command=command, font=font(), height=38,
+                      corner_radius=5, fg_color=palette["ACCENT"] if primary else palette["SURFACE"],
+                      hover_color=(palette["ACCENT_HOVER"] if primary
+                                   else palette["BUTTON_HOVER"]),
+                      text_color=palette["ACCENT_TEXT"] if primary else palette["TEXT"],
+                      border_width=0 if primary else 1, border_color=palette["BORDER"], **kwargs),
+        "button", primary=primary)
 
 
 def panel(parent):
-    return ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=7,
-                        border_width=1, border_color=BORDER)
+    palette = tokens()
+    return bind_theme(
+        ctk.CTkFrame(parent, fg_color=palette["SURFACE"], corner_radius=7,
+                     border_width=1, border_color=palette["BORDER"]),
+        "panel")
 
 
 def translated_event(line):
@@ -119,39 +320,48 @@ def path_summary(card):
 
 def build_dashboard(app):
     configure_theme(app.root)
+    palette = tokens()
     win = ctk.CTkToplevel(app.root)
     app.dashboard_win = win
     win.title("校园网自动重连助手")
-    win.configure(fg_color=BG)
+    win.configure(fg_color=palette["BG"])
+    bind_theme(win, "window")
     fit_window(win, 980, 700)
     win.protocol("WM_DELETE_WINDOW", app._close_dashboard)
     win.grid_rowconfigure(0, weight=1)
     win.grid_columnconfigure(1, weight=1)
-    side = ctk.CTkFrame(win, width=178, fg_color=SIDE, corner_radius=0)
+    side = ctk.CTkFrame(win, width=178, fg_color=palette["SIDE"], corner_radius=0)
     side.grid(row=0, column=0, sticky="nsew")
     side.grid_propagate(False)
     side.grid_columnconfigure(0, weight=1)
     side.grid_rowconfigure(9, weight=1)
+    bind_theme(side, "side")
     label(side, "校园网助手", size=19, bold=True).grid(row=0, padx=20, pady=(28, 2), sticky="w")
     from campus_core import __version__
-    label(side, f"版本 {__version__}", size=12, muted=True).grid(row=1, padx=20, pady=(0, 28), sticky="w")
-    content = ctk.CTkFrame(win, fg_color=BG, corner_radius=0)
+    label(side, f"版本 {__version__}", size=12, muted=True).grid(
+        row=1, padx=20, pady=(0, 28), sticky="w")
+    content = ctk.CTkFrame(win, fg_color=palette["BG"], corner_radius=0)
     content.grid(row=0, column=1, sticky="nsew")
+    bind_theme(content, "surface")
     refs = {"pages": {}, "navigation": {}, "buttons": []}
 
     def navigate(key):
+        active_palette = tokens()
         for name, page in refs["pages"].items():
             if name == key:
                 page.pack(fill="both", expand=True)
             else:
                 page.pack_forget()
-            refs["navigation"][name].configure(
-                fg_color=SURFACE if name == key else "transparent",
-                text_color=ACCENT if name == key else TEXT)
+            nav = refs["navigation"][name]
+            selected = name == key
+            nav.configure(fg_color=active_palette["SURFACE"] if selected else "transparent",
+                          text_color=active_palette["ACCENT"] if selected else active_palette["TEXT"])
+            bind_theme(nav, "nav", selected=selected)
         refs["selected_page"] = key
 
     def page(key, title, subtitle):
-        body = ctk.CTkScrollableFrame(content, fg_color=BG, corner_radius=0)
+        body = ctk.CTkScrollableFrame(content, fg_color=tokens()["BG"], corner_radius=0)
+        bind_theme(body, "surface")
         refs["pages"][key] = body
         label(body, title, size=24, bold=True).pack(fill="x", padx=24, pady=(24, 4))
         label(body, subtitle, muted=True, wraplength=440, justify="left").pack(
@@ -163,9 +373,15 @@ def build_dashboard(app):
                                          ("settings", "设置")), start=2):
         nav = ctk.CTkButton(side, text=title, command=lambda k=key: navigate(k),
                             font=font(), anchor="w", height=42, corner_radius=5,
-                            fg_color="transparent", hover_color="#E3E1EC", text_color=TEXT)
+                            fg_color="transparent", hover_color=palette["NAV_HOVER"],
+                            text_color=palette["TEXT"])
+        bind_theme(nav, "nav", selected=False)
         nav.grid(row=index, column=0, sticky="ew", padx=12, pady=3)
         refs["navigation"][key] = nav
+
+    theme_switcher(side, palette)
+    refs["set_theme"] = switch_theme
+
     button(side, "打开日志", app.on_open_log, width=140).grid(row=10, padx=16, pady=8)
     label(side, "关闭窗口后仍在托盘运行", size=11, muted=True).grid(row=11, padx=12, pady=(0, 18))
 
@@ -174,7 +390,8 @@ def build_dashboard(app):
     refs.update(update_banner=banner, update_banner_visible=False)
     refs["update_banner_label"] = label(banner, "", wraplength=330)
     refs["update_banner_label"].pack(side="left", padx=16, pady=12)
-    button(banner, "下载更新", app._on_update_download, primary=True, width=100).pack(side="right", padx=12)
+    button(banner, "下载更新", app._on_update_download, primary=True, width=100).pack(
+        side="right", padx=12)
     button(banner, "以后再说", app._on_update_dismiss, width=90).pack(side="right")
     hero = panel(overview)
     hero.pack(fill="x", padx=24, pady=(0, 16))
@@ -194,9 +411,11 @@ def build_dashboard(app):
     for column in range(3):
         cards.grid_columnconfigure(column, weight=1, uniform="status")
     refs["status_cards"] = {}
-    for column, (role, title) in enumerate((("ethernet", "以太网"), ("wifi", "SNNU Wi-Fi"), ("uu", "UU 远程恢复"))):
+    for column, (role, title) in enumerate((("ethernet", "以太网"), ("wifi", "SNNU Wi-Fi"),
+                                            ("uu", "UU 远程恢复"))):
         card = panel(cards)
-        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0 if column == 2 else 5))
+        card.grid(row=0, column=column, sticky="nsew",
+                  padx=(0 if column == 0 else 5, 0 if column == 2 else 5))
         label(card, title, bold=True).pack(fill="x", padx=14, pady=(14, 8))
         value = label(card, "待确认", size=17, bold=True, wraplength=128, justify="left")
         value.pack(fill="x", padx=14)
@@ -232,11 +451,13 @@ def build_dashboard(app):
         for name in ("状态", "Internet", "最近验证"):
             row = ctk.CTkFrame(p, fg_color="transparent")
             row.pack(fill="x", padx=18, pady=1)
-            caption = {"Portal": "校园认证", "Internet": "上网验证", "ifIndex": "接口编号"}.get(name, name)
+            caption = {"Portal": "校园认证", "Internet": "上网验证", "ifIndex": "接口编号"}.get(
+                name, name)
             label(row, caption, muted=True, width=86).pack(side="left")
             rows[name] = label(row, "—", wraplength=320, justify="left")
             rows[name].pack(side="left", fill="x", expand=True)
-        button(p, "验证这条链路", lambda r=role: app.on_verify_now(r)).pack(anchor="w", padx=18, pady=14)
+        button(p, "验证这条链路", lambda r=role: app.on_verify_now(r)).pack(
+            anchor="w", padx=18, pady=14)
         refs[role] = rows
     refs["manual"] = label(network, "尚未手动验证", muted=True, wraplength=440, justify="left")
     refs["manual"].pack(fill="x", padx=24, pady=(0, 20))
@@ -257,7 +478,10 @@ def build_dashboard(app):
         step = label(row, "待执行", muted=True)
         step.pack(side="right", padx=18)
         refs["steps"][key] = step
-    refs["progress"] = ctk.CTkProgressBar(recovery, height=4, progress_color=ACCENT, fg_color=BORDER)
+    refs["progress"] = bind_theme(
+        ctk.CTkProgressBar(recovery, height=4, progress_color=palette["ACCENT"],
+                           fg_color=palette["BORDER"]),
+        "progress")
     refs["progress"].pack(fill="x", padx=24, pady=(12, 18))
     actions = ctk.CTkFrame(recovery, fg_color="transparent")
     actions.pack(fill="x", padx=24, pady=(0, 20))
@@ -274,9 +498,11 @@ def build_dashboard(app):
 
     settings = page("settings", "设置", "配置保存在本机，更新程序时沿用现有设置。")
     for title, description, action, cmd in (
-        ("保持在线", "自动联网、恢复 UU；联网软件异常时自动处理并保留原设置。", "开启在线守护", app.on_toggle_online_guard),
+        ("保持在线", "自动联网、恢复 UU；联网软件异常时自动处理并保留原设置。", "开启在线守护",
+         app.on_toggle_online_guard),
         ("开机运行", "电脑登录后自动开始守护。", "设置开机运行", app.on_toggle_autostart),
-        ("校园网账号", "填写校园网账号和密码，供断网后自动登录使用。", "设置账号", app.on_update_credentials),
+        ("校园网账号", "填写校园网账号和密码，供断网后自动登录使用。", "设置账号",
+         app.on_update_credentials),
         ("软件更新", "检查新版本，在程序内下载并更新。", "检查更新", app.on_check_update_now)):
         p = panel(settings)
         p.pack(fill="x", padx=24, pady=(0, 14))
@@ -312,8 +538,7 @@ def build_dashboard(app):
 def render_dashboard(app, state):
     refs = app._dash_ctk_widgets
     from campus_ui_state import OVERALL_TONE, STEP_STATUS_LABEL, STEP_TONE
-    color = TONES[OVERALL_TONE.get(state.overall, "unknown")]
-    refs["light"].configure(text_color=color)
+    _tone(refs["light"], OVERALL_TONE.get(state.overall, "unknown"))
     refs["overall"].configure(text=state.overall_label)
     refs["headline"].configure(text=state.headline or "等待首次检测结果")
     app._render_update_banner(refs)
@@ -321,7 +546,8 @@ def render_dashboard(app, state):
         card = state.card(role)
         slot = refs["status_cards"][role]
         caption, tone = path_summary(card)
-        slot["value"].configure(text=caption, text_color=TONES.get(tone, MUTED))
+        _tone(slot["value"], tone)
+        slot["value"].configure(text=caption)
         slot["fact"].configure(text=(f"地址 {card.field('源地址')}\n最近验证 {card.field('最近验证')}"
                                      if card else "尚无检测数据"))
         for name, widget in refs[role].items():
@@ -331,13 +557,13 @@ def render_dashboard(app, state):
             widget.configure(text=text)
     uu = state.uu
     slot = refs["status_cards"]["uu"]
-    slot["value"].configure(text=uu.label if uu.enabled else "未启用",
-                             text_color=TONES.get(uu.tone, MUTED) if uu.enabled else MUTED)
+    _tone(slot["value"], uu.tone if uu.enabled else "unknown")
+    slot["value"].configure(text=uu.label if uu.enabled else "未启用")
     slot["fact"].configure(text=uu.detail or ("恢复结果待确认" if uu.enabled else "可在设置中开启自动恢复"))
     for step in state.pipeline:
         if step.key in refs["steps"]:
-            refs["steps"][step.key].configure(text=STEP_STATUS_LABEL.get(step.status, "待确认"),
-                                              text_color=TONES[STEP_TONE.get(step.status, "unknown")])
+            refs["steps"][step.key].configure(text=STEP_STATUS_LABEL.get(step.status, "待确认"))
+            _tone(refs["steps"][step.key], STEP_TONE.get(step.status, "unknown"))
     displayed = [s for s in state.pipeline if s.key in refs["steps"]]
     refs["progress"].set(sum(s.status == "done" for s in displayed) / max(1, len(displayed)))
     refs["uu"].configure(text=f"UU 远程自动恢复：{uu.label}" + (f"（{uu.detail}）" if uu.detail else ""))
@@ -352,8 +578,12 @@ def render_dashboard(app, state):
     refs["protection"].configure(text="\n".join(
         f"{title}：{'已启用' if cfg.get(key) else '未启用'}" for key, title in (
             ("lifeline_enabled", "在线守护"), ("lifeline_reboot_enabled", "电脑重启恢复"))))
-    refs["monitor"].configure(text="  ·  ".join(v for v in (state.monitor_label, state.mode_label) if v) or "等待监测")
+    refs["monitor"].configure(text="  ·  ".join(v for v in (state.monitor_label, state.mode_label) if v)
+                              or "等待监测")
     lines = app._dashboard_timeline_lines(limit=10)
-    refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines else "尚无网络故障事件记录")
-    manual = [line for role in ("ethernet", "wifi") if state.card(role) for line in state.card(role).manual]
-    refs["manual"].configure(text="\n".join(manual) if manual else "尚未手动验证，可点击上方按钮查看逐站结果。")
+    refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines
+                              else "尚无网络故障事件记录")
+    manual = [line for role in ("ethernet", "wifi") if state.card(role)
+              for line in state.card(role).manual]
+    refs["manual"].configure(text="\n".join(manual) if manual
+                             else "尚未手动验证，可点击上方按钮查看逐站结果。")

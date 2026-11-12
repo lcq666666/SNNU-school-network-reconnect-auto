@@ -3901,9 +3901,10 @@ class TrayApp:
         win = tk.Toplevel(self.root)
         self.settings_win = win
         win.title("校园网自动重连助手 · 设置")
-        from campus_desktop_ui import configure_theme
+        from campus_desktop_ui import bind_theme, configure_theme, tokens
         configure_theme(self.root)
-        win.configure(background="#F6F6F8")
+        win.configure(background=tokens()["BG"])
+        bind_theme(win, "tk_window")
         win.resizable(True, True)
         outer = ttk.Frame(win, padding=10)
         outer.grid(sticky="nsew")

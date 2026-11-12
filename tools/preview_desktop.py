@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 import campus_reconnect_tray as tray  # noqa: E402
 import campus_proxy_ui as proxy  # noqa: E402
-from campus_desktop_ui import ctk  # noqa: E402
+from campus_desktop_ui import ctk, set_theme  # noqa: E402
 from campus_ui_state import PathCard, StepView, UiState, UuView  # noqa: E402
 
 
@@ -24,6 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scale", type=float, default=1)
+    parser.add_argument("--theme", choices=("light", "dark"), default="light")
     parser.add_argument("--width", type=int, default=980)
     parser.add_argument("--height", type=int, default=700)
     args = parser.parse_args()
@@ -33,6 +34,7 @@ def main():
     ctk.ScalingTracker.activate_high_dpi_awareness()
     root = tk.Tk()
     root.withdraw()
+    set_theme(args.theme)
     dpi = ctk.ScalingTracker.get_window_dpi_scaling(root)
     ctk.set_widget_scaling(args.scale / dpi)
     ctk.set_window_scaling(args.scale / dpi)

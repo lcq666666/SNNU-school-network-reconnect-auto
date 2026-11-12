@@ -6,8 +6,8 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from campus_desktop_ui import (ACCENT, BG, TEXT, button, configure_theme,
-                               ctk, fit_window, font, label, panel)
+from campus_desktop_ui import (bind_theme, button, configure_theme,
+                               ctk, fit_window, font, label, panel, tokens)
 import uuid
 
 from campus_proxy_compat import (discover_roots, export_rules, runtime_summary,
@@ -50,12 +50,15 @@ def open_dialog(app):
         existing.lift()
         return
     configure_theme(app.root)
+    palette = tokens()
     win = ctk.CTkToplevel(app.root)
     app.proxy_compat_win = win
     win.title("校园网代理兼容检查")
-    win.configure(fg_color=BG)
+    win.configure(fg_color=palette["BG"])
+    bind_theme(win, "window")
     fit_window(win, 820, 480, minimum=(700, 470))
-    frame = ctk.CTkScrollableFrame(win, fg_color=BG, corner_radius=0)
+    frame = ctk.CTkScrollableFrame(win, fg_color=palette["BG"], corner_radius=0)
+    bind_theme(frame, "surface")
     frame.pack(fill="both", expand=True)
     label(frame, "代理兼容检查", size=24, bold=True).pack(fill="x", padx=24, pady=(24, 4))
     label(frame, "只检查这台电脑。需要修复时，先备份，再由你确认。", muted=True,
@@ -73,8 +76,9 @@ def open_dialog(app):
     detail_open = {"value": False}
     repair_open = {"value": False}
     output = ctk.CTkTextbox(details, height=230, wrap="word", font=font(13),
-                            fg_color="#FFFFFF", text_color=TEXT, corner_radius=5,
-                            border_width=0, state="disabled")
+                            fg_color=palette["SURFACE"], text_color=palette["TEXT"],
+                            corner_radius=5, border_width=0, state="disabled")
+    bind_theme(output, "textbox")
     output.pack(fill="both", expand=True, padx=8, pady=8)
     def toggle_details():
         detail_open["value"] = not detail_open["value"]
@@ -104,8 +108,9 @@ def open_dialog(app):
     combo = ctk.CTkOptionMenu(advanced, variable=selected,
                               values=["仅系统代理"] + [str(root) for root in roots],
                               font=font(13), dropdown_font=font(13), height=36,
-                              fg_color="#EEEEF2", button_color=ACCENT, text_color=TEXT,
-                              dynamic_resizing=False)
+                              fg_color=palette["SIDE"], button_color=palette["ACCENT"],
+                              text_color=palette["TEXT"], dynamic_resizing=False)
+    bind_theme(combo, "option")
     combo.pack(fill="x", padx=18, pady=(0, 12))
     actions = ctk.CTkFrame(advanced, fg_color="transparent")
     actions.pack(fill="x", padx=18, pady=(0, 16))
