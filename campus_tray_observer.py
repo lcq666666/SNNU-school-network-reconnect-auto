@@ -39,9 +39,30 @@
 固化为可回归的规格。**fail-closed 语义完全不变**：结构不完整 / 代次失效 /
 真过期 / 采集失败 / 采集超时仍然一律 ``trusted=False``。
 证据与残余风险见 ``docs/阶段A_观测预算自洽_2026-11-12.md``。
+
+阶段 B（V0.7.1，2026-11-12）：有界降级观测
+==========================================
+阶段 A 只解决「慢采集必然超时」。真实断网时 ``netdiag`` 的
+``adapters`` / ``default_routes`` 会抛 ``RuntimeError``，没有新快照发布，
+旧快照在 ``max_age`` 后过期 ⇒ 仍回到「零网络副作用」自锁（15:50 / 16:20
+两次 10 分钟断连的另一半根因）。
+
+本阶段把「一刀切不可信」细分为三个**观测模式**：
+
+* ``FULL``：本轮快照可信（``trusted=True``），语义与阶段 A 完全相同；
+* ``DEGRADED``：本轮采集/新鲜度出问题，但存在**最近一次可信快照
+  （last-known-good, LKG）**，且代次/接口身份未变、宽限未耗尽；
+* ``REFUSED``：结构不完整 / 配置代次变化 / 接口身份变化 / 从未成功采集 /
+  宽限耗尽 —— 严格 fail-closed。
+
+**本阶段不改变 ``trusted`` 语义**：``DEGRADED`` 依旧 ``trusted=False``，
+``RefusingExecutor`` 依旧零副作用，既有消费方零行为变化。分级信息
+（``mode`` / ``stale_for`` / ``grace_left`` / ``lkg_snapshot``）只是为阶段 C
+的白名单执行器准备的依据；宽限窗口有界（默认 60s），不会形成永久自锁。
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -55,12 +76,15 @@ __all__ = [
     "SNAPSHOT_OK", "SNAPSHOT_NO_DATA", "SNAPSHOT_COLLECTING",
     "SNAPSHOT_COLLECT_ERROR", "SNAPSHOT_COLLECT_TIMEOUT", "SNAPSHOT_STALE",
     "SNAPSHOT_GENERATION", "SNAPSHOT_INCOMPLETE", "SNAPSHOT_EXTERNAL",
+    "MODE_FULL", "MODE_DEGRADED", "MODE_REFUSED", "OBSERVATION_MODES",
+    "DEFAULT_DEGRADED_GRACE", "MAX_DEGRADED_GRACE", "DEGRADABLE_REASONS",
     "ObservationResult", "snapshot_signature", "is_full_snapshot",
-    "check_snapshot_budget", "TraySnapshotSource", "RefusingExecutor",
-    "format_observation", "is_auto_executable_snapshot",
+    "check_snapshot_budget", "check_degraded_window", "TraySnapshotSource",
+    "RefusingExecutor", "format_observation", "is_auto_executable_snapshot",
 ]
 
-CONTRACT_VERSION = "v03-p75-obs-1"
+#: 阶段 B 新增 mode / stale_for / grace_left / lkg_snapshot 字段，契约升版。
+CONTRACT_VERSION = "v03-p75-obs-2"
 
 #: 实测一次完整三轴 ``evaluate()`` 的中位耗时（秒）。
 # 证据：docs/P8真实环境验收手册_2026-10-15.md §2026-10-16 09:4x 受控实验，
@@ -78,6 +102,27 @@ DEFAULT_MIN_INTERVAL = 3.0
 # 任何慢采集都产生周期性不可信，叠加采集失败即长期 fail-closed 自锁。
 DEFAULT_MAX_AGE = 30.0
 
+# --------------------------------------------------------------------------- #
+# 阶段 B：三级观测模式与有界降级窗口
+# --------------------------------------------------------------------------- #
+#: 本轮快照可信，可完整授权 AUTO 决策（``trusted=True``）。
+MODE_FULL = "FULL"
+#: 本轮采集/新鲜度异常，但可凭 last-known-good 快照做**受限**判定。
+# 本阶段仍 ``trusted=False``、零网络副作用；阶段 C 才接白名单执行器。
+MODE_DEGRADED = "DEGRADED"
+#: 严格 fail-closed：无任何可用依据。
+MODE_REFUSED = "REFUSED"
+
+OBSERVATION_MODES: Tuple[str, ...] = (MODE_FULL, MODE_DEGRADED, MODE_REFUSED)
+
+#: ``max_age`` 到期后，LKG 快照仍可被标记为 ``DEGRADED`` 的宽限（秒）。
+# 用户 2026-11-12 确认取 60s：总窗口 30 + 60 = 90s，能完整覆盖一次
+# ``collect_timeout=45`` 的病态采集 + 一次重采间隔（48s）并留抖动余量；
+# 同时严格有界，绝不会像旧实现那样永久自锁。
+DEFAULT_DEGRADED_GRACE = 60.0
+#: 宽限硬上限（秒）：防止调用方把「有界」配成事实上的永久宽限。
+MAX_DEGRADED_GRACE = 300.0
+
 #: 快照可信度结论取值。
 SNAPSHOT_OK = "OK"                              # 可信
 SNAPSHOT_NO_DATA = "NO_DATA"                    # 从未采集成功
@@ -94,6 +139,15 @@ SNAPSHOT_STATES: Tuple[str, ...] = (
     SNAPSHOT_COLLECT_ERROR, SNAPSHOT_COLLECT_TIMEOUT, SNAPSHOT_STALE,
     SNAPSHOT_GENERATION, SNAPSHOT_INCOMPLETE, SNAPSHOT_EXTERNAL,
 )
+
+#: 允许进入 ``DEGRADED`` 的**软失败**结论（采集链路抖动，网络身份未变）。
+# 注意：``SNAPSHOT_GENERATION`` 不在此列 —— 只有确认「仅内部任务代次变化、
+# 外部配置代次与接口签名均未变」时才按软失败处理（见 ``_is_soft_failure``）。
+# ``NO_DATA`` / ``INCOMPLETE`` / ``EXTERNAL`` 一律硬拒绝。
+DEGRADABLE_REASONS: frozenset = frozenset({
+    SNAPSHOT_STALE, SNAPSHOT_COLLECT_ERROR, SNAPSHOT_COLLECT_TIMEOUT,
+    SNAPSHOT_COLLECTING,
+})
 
 #: 各结论的人类可读说明（托盘告警与日志用）。
 STATE_TEXT: Dict[str, str] = {
@@ -149,6 +203,40 @@ def check_snapshot_budget(max_age: float, collect_timeout: float,
     return (not reasons, tuple(reasons))
 
 
+def check_degraded_window(max_age: float, degraded_grace: float, *,
+                          collect_timeout: float = DEFAULT_COLLECT_TIMEOUT,
+                          min_interval: float = DEFAULT_MIN_INTERVAL
+                          ) -> Tuple[bool, Tuple[str, ...]]:
+    """校验「有界降级窗口」是否自洽（阶段 B，纯函数，零 I/O）。
+
+    三条不变量任一不满足，降级要么形同虚设、要么重新变成永久自锁：
+
+    1. ``grace`` 必须是有限正数 —— 否则「有界」不成立，且无法退出；
+    2. ``grace <= MAX_DEGRADED_GRACE`` —— 防止把宽限配成事实上的永久宽限；
+    3. ``max_age + grace >= collect_timeout + min_interval`` —— 总可复用窗口
+       必须覆盖「一次跑满 timeout 的病态采集 + 一次重采间隔」，否则宽限会在
+       病态采集期间提前耗尽，起不到缓解自锁的作用。
+
+    默认 ``(30, 60, 45, 3)``：总窗口 90s ≥ 48s，满足全部不变量。
+    返回 ``(coherent, reasons)``。
+    """
+    max_age = float(max_age)
+    grace = float(degraded_grace)
+    collect_timeout = float(collect_timeout)
+    min_interval = float(min_interval)
+    reasons = []
+    if not math.isfinite(grace) or grace <= 0:
+        reasons.append("宽限 %r 非正或非有限值：降级必须有限且可退出" % grace)
+    elif grace > MAX_DEGRADED_GRACE:
+        reasons.append("宽限 %.1fs 超过硬上限 %.1fs：不再是「有界」降级"
+                       % (grace, MAX_DEGRADED_GRACE))
+    cycle = collect_timeout + min_interval
+    if math.isfinite(grace) and max_age + grace < cycle:
+        reasons.append("总窗口 %.1fs < 病态采集周期 %.1fs：宽限会在采集期间提前耗尽"
+                       % (max_age + grace, cycle))
+    return (not reasons, tuple(reasons))
+
+
 @dataclass
 class ObservationResult:
     """一次观测的结果（快照 + 可信度 + 证据）。"""
@@ -166,6 +254,38 @@ class ObservationResult:
     age: Optional[float] = None
     #: 两轴是否都已解析（完整三轴；不完整的快照即使可信也不建议用于切换）。
     complete: bool = False
+    #: 阶段 B：观测模式。空串 = 未指定，由 ``__post_init__`` 按 ``trusted`` 推导，
+    # 保证既有 ``ObservationResult(trusted=True)`` 等关键字构造语义完全不变。
+    mode: str = ""
+    #: 阶段 B：LKG 超过 ``max_age`` 的时长（秒）；FULL / REFUSED 恒为 0。
+    stale_for: float = 0.0
+    #: 阶段 B：有界宽限剩余（秒）；REFUSED 恒为 0。
+    grace_left: float = 0.0
+    #: 阶段 B：最近一次「可授权 AUTO 执行」的完整快照（DEGRADED 的依据）。
+    lkg_snapshot: Optional[NetworkHealthSnapshot] = None
+
+    def __post_init__(self) -> None:
+        if not self.mode:
+            self.mode = MODE_FULL if self.trusted else MODE_REFUSED
+        self.stale_for = max(0.0, float(self.stale_for))
+        self.grace_left = max(0.0, float(self.grace_left))
+
+    @property
+    def is_degraded(self) -> bool:
+        """本轮是否处于有界降级（**不代表** ``trusted``，阶段 B 恒为 False）。"""
+        return self.mode == MODE_DEGRADED
+
+    @property
+    def usable_snapshot(self) -> Optional[NetworkHealthSnapshot]:
+        """阶段 C 的统一消费入口：FULL 用本轮快照，DEGRADED 用 LKG，其余为 None。
+
+        ``REFUSED`` 恒返回 ``None`` —— 严格 fail-closed 的单一取值点。
+        """
+        if self.mode == MODE_FULL and self.trusted:
+            return self.snapshot
+        if self.mode == MODE_DEGRADED:
+            return self.lkg_snapshot
+        return None
 
     @property
     def reason_text(self) -> str:
@@ -179,7 +299,10 @@ class ObservationResult:
                 "detail": self.detail, "complete": self.complete,
                 "age": self.age,
                 "collected_at": self.collected_at,
-                "reason_text": self.reason_text}
+                "reason_text": self.reason_text,
+                "mode": self.mode, "stale_for": self.stale_for,
+                "grace_left": self.grace_left,
+                "has_lkg": self.lkg_snapshot is not None}
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +430,7 @@ class TraySnapshotSource:
                  max_age: float = DEFAULT_MAX_AGE,
                  collect_timeout: float = DEFAULT_COLLECT_TIMEOUT,
                  min_interval: float = DEFAULT_MIN_INTERVAL,
+                 degraded_grace: float = DEFAULT_DEGRADED_GRACE,
                  max_inflight: int = 3,
                  spawn: Optional[Callable[[Callable[[], None]], Any]] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
@@ -316,6 +440,9 @@ class TraySnapshotSource:
         self.max_age = float(max(0.0, max_age))
         self.collect_timeout = float(max(0.1, collect_timeout))
         self.min_interval = float(max(0.0, min_interval))
+        # 阶段 B：宽限必须严格有界，构造时即钳到硬上限，防止配置成永久降级。
+        self.degraded_grace = float(min(MAX_DEGRADED_GRACE,
+                                        max(0.0, degraded_grace)))
         self._max_inflight = int(max(1, max_inflight))
         self._spawn = spawn or _default_spawn
         self._log = log
@@ -325,6 +452,16 @@ class TraySnapshotSource:
         self._snapshot_at: Optional[float] = None
         self._snapshot_generation: Optional[Tuple[Any, int]] = None
         self._signature: Tuple[Any, ...] = ()
+        #: 阶段 B：last-known-good —— 最近一次「结构完整且可定位接口」的快照。
+        # 只由采集线程 ``_run`` 写入，``observe()`` 纯读；记录的是**曾经能
+        # 授权 AUTO 执行**的数据，不是任意发布过的快照。
+        self._lkg_snapshot: Optional[NetworkHealthSnapshot] = None
+        self._lkg_at: Optional[float] = None
+        #: LKG 发布时的**外部代次**（配置 / SSID / 模式）；内部任务代次因超时
+        # 自增不应作废 LKG —— 那只是采集任务失败，网络身份并未改变。
+        self._lkg_external: Any = None
+        #: LKG 的接口身份签名；DHCP / 出口接口变化后旧 LKG 不可复用。
+        self._lkg_signature: Tuple[Any, ...] = ()
         self._error: str = ""
         self._collecting = False
         self._collect_started_at: Optional[float] = None
@@ -370,7 +507,13 @@ class TraySnapshotSource:
         with self._lock:
             self.generation += 1
             bumped = self.generation
-        self._note("三轴观测代次失效（%s）：作废在途采集结果，新代次=%d"
+            # 阶段 B：配置 / SSID / 模式变化后，旧 LKG 的依据已失效，必须清空，
+            # 否则降级会把「变化前的网络身份」当作当前依据（安全硬要求）。
+            self._lkg_snapshot = None
+            self._lkg_at = None
+            self._lkg_external = None
+            self._lkg_signature = ()
+        self._note("三轴观测代次失效（%s）：作废在途采集结果与 LKG，新代次=%d"
                    % (reason or "未说明原因", bumped))
         return bumped
 
@@ -501,7 +644,12 @@ class TraySnapshotSource:
                 self.generation += 1
                 self._task_seq += 1
                 self._active_task_id = self._task_seq
-                self._note("检测到网络身份变化 %r → %r：作废旧代次"
+                # 阶段 B：旧接口身份下的 LKG 不可复用（硬拒绝依据之一）。
+                self._lkg_snapshot = None
+                self._lkg_at = None
+                self._lkg_external = None
+                self._lkg_signature = ()
+                self._note("检测到网络身份变化 %r → %r：作废旧代次与 LKG"
                            % (self._signature, signature))
             self._signature = signature
             self._snapshot = snapshot
@@ -509,20 +657,24 @@ class TraySnapshotSource:
             self._snapshot_generation = self.current_generation()
             self._error = ""
             self.collect_count += 1
+            # 阶段 B：只有「完整三轴 + 可定位目标接口」的快照才有资格成为 LKG，
+            # 与 is_auto_executable_snapshot 的 AUTO 授权判据保持同一套真值。
+            if is_full_snapshot(snapshot) and is_auto_executable_snapshot(snapshot)[0]:
+                self._lkg_snapshot = snapshot
+                self._lkg_at = self._snapshot_at
+                self._lkg_external = self._snapshot_generation[0]
+                self._lkg_signature = signature
 
     # ---- 读取（非阻塞） ---- #
-    def observe(self, now: Optional[float] = None) -> ObservationResult:
-        """取当前可信快照与可信度结论（**永不阻塞、永不 I/O**）。"""
-        stamp = self._clock() if now is None else float(now)
-        with self._lock:
-            snapshot = self._snapshot
-            collected_at = self._snapshot_at
-            snap_generation = self._snapshot_generation
-            error = self._error
-            collecting = self._collecting
-            current = self.current_generation()
-        age = None if collected_at is None else max(0.0, stamp - collected_at)
+    @staticmethod
+    def _classify(*, snapshot, collected_at, snap_generation, error,
+                  collecting, current, age, max_age) -> ObservationResult:
+        """阶段 A 的原始可信度判定（纯函数）。
 
+        阶段 B **不改其中任何一条结论**：五维（存在性 / 新鲜度 / 代次 /
+        采集错误 / 结构完整性）判定原样保留，只在 :meth:`observe` 之后
+        对 ``trusted=False`` 做 ``DEGRADED`` / ``REFUSED`` 细分。
+        """
         # 注意：``contract_version`` 是首字段，一律用**关键字**构造，避免错位。
         if snapshot is None:
             if collecting:
@@ -542,10 +694,10 @@ class TraySnapshotSource:
                 detail="快照代次 %r 已失效（当前 %r）" % (snap_generation, current),
                 generation=snap_generation, collected_at=collected_at, age=age,
                 complete=_is_complete(snapshot))
-        if age is not None and age > self.max_age:
+        if age is not None and age > max_age:
             return ObservationResult(
                 snapshot=snapshot, trusted=False, reason=SNAPSHOT_STALE,
-                detail="已 %.0fs（>%.0fs）" % (age, self.max_age),
+                detail="已 %.0fs（>%.0fs）" % (age, max_age),
                 generation=snap_generation, collected_at=collected_at, age=age,
                 complete=_is_complete(snapshot))
         if error:
@@ -565,6 +717,96 @@ class TraySnapshotSource:
                                  generation=snap_generation,
                                  collected_at=collected_at, age=age,
                                  complete=_is_complete(snapshot))
+
+    @staticmethod
+    def _is_soft_failure(reason: str, *, lkg_external: Any,
+                         current_external: Any,
+                         lkg_signature: Tuple[Any, ...],
+                         signature: Tuple[Any, ...]) -> bool:
+        """本轮不可信是否属于「采集链路软失败」（可凭 LKG 有界降级）。
+
+        ``SNAPSHOT_GENERATION`` 只在**外部配置代次与接口签名均未变**时算软
+        失败 —— 采集超时会自增内部任务代次，那只是任务失败，网络身份没变；
+        而 SSID / 配置变化或 DHCP / 出口接口变化则是真失效，必须硬拒绝。
+        """
+        if reason in DEGRADABLE_REASONS:
+            return True
+        if reason == SNAPSHOT_GENERATION:
+            return (lkg_external == current_external
+                    and lkg_signature == signature)
+        return False
+
+    def _grade_untrusted(self, result: ObservationResult, *, stamp: float,
+                         current: Tuple[Any, int], lkg: Any,
+                         lkg_at: Optional[float], lkg_external: Any,
+                         lkg_signature: Tuple[Any, ...],
+                         signature: Tuple[Any, ...]) -> ObservationResult:
+        """把 ``trusted=False`` 细分为 ``DEGRADED`` / ``REFUSED``（纯逻辑）。
+
+        进入 ``DEGRADED`` 的**全部**条件（任一不满足即 ``REFUSED``）：
+
+        1. 本轮结论是软失败（见 :meth:`_is_soft_failure`）；
+        2. 存在 LKG，且结构完整、可定位目标接口；
+        3. LKG 的外部配置代次与接口签名均与当前一致；
+        4. LKG 年龄 ``<= max_age + degraded_grace``（严格有界）。
+
+        **安全边界**：``result.trusted`` 始终保持 ``False``，``detail`` /
+        ``reason`` / ``reason_text`` 均不改写，既有消费方零行为变化。
+        降级依据只通过新增字段暴露，供阶段 C 的白名单执行器消费。
+        """
+        if not self._is_soft_failure(
+                result.reason, lkg_external=lkg_external,
+                current_external=current[0], lkg_signature=lkg_signature,
+                signature=signature):
+            return result
+        if lkg is None or lkg_at is None:
+            return result                        # 从未有过可信快照
+        if not is_full_snapshot(lkg) or not is_auto_executable_snapshot(lkg)[0]:
+            return result                        # LKG 不足以定位接口
+        if lkg_external != current[0] or lkg_signature != signature:
+            return result                        # 配置 / 网络身份已变
+        lkg_age = max(0.0, stamp - lkg_at)
+        window = self.max_age + self.degraded_grace
+        if lkg_age > window:
+            return result                        # 宽限耗尽 ⇒ 严格 fail-closed
+        result.mode = MODE_DEGRADED
+        result.lkg_snapshot = lkg
+        result.stale_for = max(0.0, lkg_age - self.max_age)
+        result.grace_left = max(0.0, window - lkg_age)
+        return result
+
+    def observe(self, now: Optional[float] = None) -> ObservationResult:
+        """取当前快照与三级观测结论（**永不阻塞、永不 I/O**）。
+
+        ``FULL`` 时 ``mode`` 由 :meth:`ObservationResult.__post_init__` 推导；
+        ``DEGRADED`` / ``REFUSED`` 由 :meth:`_grade_untrusted` 给出。三者的
+        ``trusted`` 语义与阶段 A 完全一致。
+        """
+        stamp = self._clock() if now is None else float(now)
+        with self._lock:
+            snapshot = self._snapshot
+            collected_at = self._snapshot_at
+            snap_generation = self._snapshot_generation
+            error = self._error
+            collecting = self._collecting
+            current = self.current_generation()
+            lkg = self._lkg_snapshot
+            lkg_at = self._lkg_at
+            lkg_external = self._lkg_external
+            lkg_signature = self._lkg_signature
+            signature = self._signature
+        age = None if collected_at is None else max(0.0, stamp - collected_at)
+        result = self._classify(
+            snapshot=snapshot, collected_at=collected_at,
+            snap_generation=snap_generation, error=error,
+            collecting=collecting, current=current, age=age,
+            max_age=self.max_age)
+        if result.trusted:
+            return result
+        return self._grade_untrusted(
+            result, stamp=stamp, current=current, lkg=lkg, lkg_at=lkg_at,
+            lkg_external=lkg_external, lkg_signature=lkg_signature,
+            signature=signature)
 
     def snapshot(self) -> Optional[NetworkHealthSnapshot]:
         """最近一次发布的快照（**不判可信度**；展示用）。"""
@@ -629,9 +871,14 @@ def format_observation(observation: ObservationResult) -> str:
         return "三轴观测：%s" % observation.reason_text
     ethernet = getattr(observation.snapshot, "ethernet", None)
     wifi = getattr(observation.snapshot, "wifi", None)
+    mode_line = "  观测模式  : %s" % observation.mode
+    if observation.is_degraded:
+        mode_line += "（LKG 已过期 %.0fs，剩余宽限 %.0fs）" % (
+            observation.stale_for, observation.grace_left)
     lines = [
         "三轴观测：%s" % observation.reason_text,
         "  可信      : %s" % ("是" if observation.trusted else "否"),
+        mode_line,
         "  完整三轴  : %s" % ("是" if observation.complete else "否"),
         "  年龄      : %s"
         % ("-" if observation.age is None else "%.0fs" % observation.age),
