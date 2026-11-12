@@ -111,9 +111,9 @@ def test_theme_switch_repaints_controls_without_touching_app_state(monkeypatch):
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert set(refs["pages"]) == {"overview", "network", "recovery", "activity", "settings"}
-        assert refs["light"].cget("text_color") == "#237A50"
+        assert refs["light"].cget("text_color") == ui.CONSOLE["TONES"]["ok"]
         hero = refs["gauges_frame"]
-        assert hero.cget("fg_color") == "#FFFFFF"
+        assert hero.cget("fg_color") == ui.CONSOLE["SURFACE"]
         refs["navigate"]("network")
         root.update_idletasks()
 
@@ -127,9 +127,10 @@ def test_theme_switch_repaints_controls_without_touching_app_state(monkeypatch):
         root.update_idletasks()
         dark = ui.THEMES["dark"]
         assert ui.theme_mode() == "dark"
-        assert hero.cget("fg_color") == dark["SURFACE"]
-        assert refs["light"].cget("text_color") == dark["TONES"]["ok"]
-        assert refs["overall"].cget("text_color") == dark["TEXT"]
+        # The overview stays a dark console in both themes; other pages follow the theme.
+        assert hero.cget("fg_color") == ui.CONSOLE["SURFACE"]
+        assert refs["light"].cget("text_color") == ui.CONSOLE["TONES"]["ok"]
+        assert refs["overall"].cget("text_color") == ui.CONSOLE["TEXT"]
         assert refs["navigation"]["network"].cget("fg_color") == dark["SURFACE"]
         assert refs["navigation"]["overview"].cget("fg_color") == "transparent"
         mode_buttons = _widgets_with_role(root, "mode")
@@ -142,8 +143,8 @@ def test_theme_switch_repaints_controls_without_touching_app_state(monkeypatch):
 
         refs["set_theme"]("light")
         root.update_idletasks()
-        assert refs["light"].cget("text_color") == "#237A50"
-        assert hero.cget("fg_color") == "#FFFFFF"
+        assert refs["light"].cget("text_color") == ui.CONSOLE["TONES"]["ok"]
+        assert hero.cget("fg_color") == ui.CONSOLE["SURFACE"]
         assert refs["navigation"]["network"].cget("fg_color") == "#FFFFFF"
     finally:
         app._close_dashboard()

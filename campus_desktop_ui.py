@@ -59,6 +59,28 @@ MUTED = _LIGHT["MUTED"]
 ACCENT = _LIGHT["ACCENT"]
 TONES = dict(_LIGHT["TONES"])
 
+# P2: the overview is a fixed dark signal console in both themes (A+B direction).
+# It shares the palette key set so every factory and _paint branch can consume it.
+CONSOLE = {
+    "BG": "#0B1216",
+    "SIDE": "#0F191E",
+    "SURFACE": "#122027",
+    "BORDER": "#263A42",
+    "TEXT": "#E7ECE8",
+    "MUTED": "#90A4A7",
+    "ACCENT": "#79CFAE",
+    "ACCENT_HOVER": "#5DB493",
+    "ACCENT_TEXT": "#0B1216",
+    "BUTTON_HOVER": "#1D3037",
+    "NAV_HOVER": "#1D3037",
+    "TONES": {"ok": "#79CFAE", "bad": "#E58474", "warn": "#E0BE6B",
+              "busy": "#8FB8C8", "unknown": "#90A4A7", "idle": "#90A4A7"},
+}
+# Verbatim state identifiers from campus_ui_state, never invented status words.
+SIGNAL_WORDS = {"HEALTHY": "ONLINE", "DEGRADED": "DEGRADED",
+                "RECOVERING": "RECOVERING", "OFFLINE": "OFFLINE",
+                "PAUSED": "PAUSED", "UNKNOWN": "UNKNOWN"}
+
 
 def theme_mode():
     """Active palette name. Presentation-only; never read by the network state machine."""
@@ -97,46 +119,52 @@ def _paint(widget, palette):
             return
     except (tk.TclError, AttributeError):
         return
+    colors = CONSOLE if info.get("console") else palette
     try:
         if role == "label":
-            widget.configure(text_color=palette["MUTED"] if info.get("muted") else palette["TEXT"])
+            widget.configure(text_color=colors["MUTED"] if info.get("muted") else colors["TEXT"])
         elif role == "tone":
-            widget.configure(text_color=palette["TONES"].get(info.get("tone"), palette["MUTED"]))
+            widget.configure(text_color=colors["TONES"].get(info.get("tone"), colors["MUTED"]))
         elif role == "button":
             primary = info.get("primary", False)
             widget.configure(
-                fg_color=palette["ACCENT"] if primary else palette["SURFACE"],
-                hover_color=palette["ACCENT_HOVER"] if primary else palette["BUTTON_HOVER"],
-                text_color=palette["ACCENT_TEXT"] if primary else palette["TEXT"],
-                border_color=palette["BORDER"])
+                fg_color=colors["ACCENT"] if primary else colors["SURFACE"],
+                hover_color=colors["ACCENT_HOVER"] if primary else colors["BUTTON_HOVER"],
+                text_color=colors["ACCENT_TEXT"] if primary else colors["TEXT"],
+                border_color=colors["BORDER"])
         elif role == "nav":
             active = info.get("selected", False)
             widget.configure(
-                fg_color=palette["SURFACE"] if active else "transparent",
-                text_color=palette["ACCENT"] if active else palette["TEXT"],
-                hover_color=palette["NAV_HOVER"])
+                fg_color=colors["SURFACE"] if active else "transparent",
+                text_color=colors["ACCENT"] if active else colors["TEXT"],
+                hover_color=colors["NAV_HOVER"])
         elif role == "mode":
             active = info.get("mode") == theme_mode()
             widget.configure(
-                fg_color=palette["ACCENT"] if active else palette["SURFACE"],
-                hover_color=palette["ACCENT_HOVER"] if active else palette["BUTTON_HOVER"],
-                text_color=palette["ACCENT_TEXT"] if active else palette["TEXT"],
-                border_color=palette["BORDER"])
+                fg_color=colors["ACCENT"] if active else colors["SURFACE"],
+                hover_color=colors["ACCENT_HOVER"] if active else colors["BUTTON_HOVER"],
+                text_color=colors["ACCENT_TEXT"] if active else colors["TEXT"],
+                border_color=colors["BORDER"])
         elif role == "panel":
-            widget.configure(fg_color=palette["SURFACE"], border_color=palette["BORDER"])
+            widget.configure(fg_color=colors["SURFACE"], border_color=colors["BORDER"])
         elif role == "side":
-            widget.configure(fg_color=palette["SIDE"])
+            widget.configure(fg_color=colors["SIDE"])
         elif role in ("surface", "window"):
-            widget.configure(fg_color=palette["BG"])
+            widget.configure(fg_color=colors["BG"])
         elif role == "tk_window":
-            widget.configure(background=palette["BG"])
+            widget.configure(background=colors["BG"])
         elif role == "progress":
-            widget.configure(progress_color=palette["ACCENT"], fg_color=palette["BORDER"])
+            widget.configure(progress_color=colors["ACCENT"], fg_color=colors["BORDER"])
         elif role == "textbox":
-            widget.configure(fg_color=palette["SURFACE"], text_color=palette["TEXT"])
+            widget.configure(fg_color=colors["SURFACE"], text_color=colors["TEXT"])
         elif role == "option":
-            widget.configure(fg_color=palette["SIDE"], button_color=palette["ACCENT"],
-                             text_color=palette["TEXT"])
+            widget.configure(fg_color=colors["SIDE"], button_color=colors["ACCENT"],
+                             text_color=colors["TEXT"])
+        elif role == "strip":
+            widget.configure(fg_color=colors["TONES"].get(info.get("tone"), colors["MUTED"]))
+        elif role == "topology":
+            widget.configure(bg=colors["SURFACE"])
+            draw_topology(widget, colors, getattr(widget, "_campus_topology", {}))
     except (tk.TclError, AttributeError, TypeError, ValueError):
         return
 
@@ -204,11 +232,11 @@ def theme_switcher(parent, palette):
                     padx=(0 if column == 0 else 3, 3 if column == 0 else 0), pady=4)
 
 
-def _tone(widget, tone):
+def _tone(widget, tone, *, console=False):
     """Assign a state colour and remember its semantic key for later repaints."""
-    palette = tokens()
-    widget.configure(text_color=palette["TONES"].get(tone, palette["MUTED"]))
-    bind_theme(widget, "tone", tone=tone)
+    colors = CONSOLE if console else tokens()
+    widget.configure(text_color=colors["TONES"].get(tone, colors["MUTED"]))
+    bind_theme(widget, "tone", tone=tone, console=console)
 
 
 def font(size=14, bold=False):
@@ -257,18 +285,18 @@ def fit_window(win, width, height, *, minimum=(760, 460)):
     win.minsize(min(minimum[0], max_w), min(minimum[1], max_h))
 
 
-def label(parent, text, *, size=14, bold=False, muted=False, **kwargs):
+def label(parent, text, *, size=14, bold=False, muted=False, console=False, **kwargs):
     # Fixed logical line lengths avoid a Tk geometry feedback loop at fractional DPI.
-    palette = tokens()
+    palette = CONSOLE if console else tokens()
     return bind_theme(
         ctk.CTkLabel(parent, text=text, font=font(size, bold),
                      text_color=palette["MUTED"] if muted else palette["TEXT"],
                      anchor="w", **kwargs),
-        "label", muted=muted)
+        "label", muted=muted, console=console)
 
 
-def button(parent, text, command, *, primary=False, **kwargs):
-    palette = tokens()
+def button(parent, text, command, *, primary=False, console=False, **kwargs):
+    palette = CONSOLE if console else tokens()
     return bind_theme(
         ctk.CTkButton(parent, text=text, command=command, font=font(), height=38,
                       corner_radius=5, fg_color=palette["ACCENT"] if primary else palette["SURFACE"],
@@ -276,15 +304,16 @@ def button(parent, text, command, *, primary=False, **kwargs):
                                    else palette["BUTTON_HOVER"]),
                       text_color=palette["ACCENT_TEXT"] if primary else palette["TEXT"],
                       border_width=0 if primary else 1, border_color=palette["BORDER"], **kwargs),
-        "button", primary=primary)
+        "button", primary=primary, console=console)
 
 
-def panel(parent):
-    palette = tokens()
+def panel(parent, *, console=False, flat=False):
+    palette = CONSOLE if console else tokens()
     return bind_theme(
-        ctk.CTkFrame(parent, fg_color=palette["SURFACE"], corner_radius=7,
-                     border_width=1, border_color=palette["BORDER"]),
-        "panel")
+        ctk.CTkFrame(parent, fg_color=palette["SURFACE"],
+                     corner_radius=0 if flat else 7,
+                     border_width=0 if flat else 1, border_color=palette["BORDER"]),
+        "panel", console=console)
 
 
 def translated_event(line):
@@ -316,6 +345,183 @@ def path_summary(card):
         return card.state_label, card.tone
     result = card.field("Internet")
     return (result if result not in ("", "—", "已验证") else "未验证"), card.internet_tone
+
+
+def draw_topology(canvas, colors, data):
+    """Redraw the link graph from real UiState values. No timers, no invented values.
+
+    One text line per node keeps labels clear; detailed states live in the data strips
+    below the graph, so the graph itself never repeats or crowds them.
+    """
+    canvas.delete("all")
+    width = max(360, canvas.winfo_width())
+    scale = width / 460.0
+    try:
+        ui_scale = ctk.ScalingTracker.get_widget_scaling(canvas)
+    except (AttributeError, tk.TclError):
+        ui_scale = 1.0
+    small = (FONT, max(8, round(9 * min(1.5, max(1.0, ui_scale)))))
+    muted, text = colors["MUTED"], colors["TEXT"]
+    line = colors["BORDER"]
+
+    def tone(role):
+        return colors["TONES"].get(data.get(role, {}).get("tone", "unknown"), muted)
+
+    def suffix(role):
+        prefix = data.get(role, {}).get("role") or ""
+        return f"（{prefix}）" if prefix else ""
+
+    def node(x, y, radius, color, caption):
+        canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                           fill=colors["SURFACE"], outline=color, width=2)
+        canvas.create_text(x, y - radius - 15, text=caption, fill=text, font=small)
+
+    left_x, mid_x, right_x = 46 * scale, 200 * scale, 400 * scale
+    top_y, mid_y, bottom_y = 38, 66, 94
+    node(left_x, mid_y, 12, colors["ACCENT"], "本机")
+    node(mid_x, top_y, 8, tone("ethernet"), "以太网" + suffix("ethernet"))
+    node(mid_x, bottom_y, 8, tone("wifi"), "SNNU Wi-Fi" + suffix("wifi"))
+    node(right_x, mid_y, 10, tone("uu"), "UU 远程")
+
+    canvas.create_line(left_x + 12, mid_y, 110 * scale, mid_y, 110 * scale, top_y,
+                       mid_x - 8, top_y, fill=tone("ethernet"), width=2)
+    canvas.create_line(left_x + 12, mid_y, 110 * scale, mid_y, 110 * scale, bottom_y,
+                       mid_x - 8, bottom_y, fill=tone("wifi"), width=2, dash=(4, 3))
+    canvas.create_line(mid_x + 8, top_y, 300 * scale, top_y, 300 * scale, mid_y,
+                       right_x - 10, mid_y, fill=line, width=1, dash=(2, 4))
+    canvas.create_line(mid_x + 8, bottom_y, 300 * scale, bottom_y, 300 * scale, mid_y,
+                       right_x - 10, mid_y, fill=line, width=1, dash=(2, 4))
+    canvas.create_text(left_x, 120, text="直连探测", fill=muted, font=small)
+    canvas.create_text(right_x, 120, text="恢复链路", fill=muted, font=small)
+
+
+def _on_topology_resize(event):
+    canvas = event.widget
+    draw_topology(canvas, CONSOLE, getattr(canvas, "_campus_topology", {}))
+
+
+def build_console(app, body, refs):
+    """Build the overview signal console. Module scope keeps build_dashboard small."""
+    banner = panel(body, console=True)
+    refs.update(update_banner=banner, update_banner_visible=False)
+    refs["update_banner_label"] = label(banner, "", console=True, wraplength=330)
+    refs["update_banner_label"].pack(side="left", padx=16, pady=12)
+    button(banner, "下载更新", app._on_update_download, primary=True, console=True,
+           width=100).pack(side="right", padx=12)
+    button(banner, "以后再说", app._on_update_dismiss, console=True, width=90).pack(
+        side="right")
+
+    hero = panel(body, console=True, flat=True)
+    hero.pack(fill="x", padx=24, pady=(0, 16))
+    refs["gauges_frame"] = hero  # Anchor for the existing in-app update banner.
+    label(hero, "链路状态  /  SIGNAL", size=11, muted=True, console=True).pack(
+        fill="x", padx=20, pady=(18, 2))
+    status_line = ctk.CTkFrame(hero, fg_color="transparent")
+    status_line.pack(fill="x", padx=20, pady=(0, 4))
+    refs["light"] = label(status_line, "●", size=26, console=True)
+    refs["light"].pack(side="left", padx=(0, 10))
+    refs["overall"] = label(status_line, "正在读取状态", size=34, bold=True, console=True)
+    refs["overall"].pack(side="left")
+    refs["signal_word"] = label(status_line, "UNKNOWN", size=12, bold=True, console=True)
+    refs["signal_word"].pack(side="left", padx=(14, 0))
+    refs["headline"] = label(hero, "", muted=True, wraplength=520, console=True)
+    refs["headline"].pack(fill="x", padx=20, pady=(0, 4))
+    refs["monitor"] = label(hero, "", size=12, muted=True, wraplength=520, console=True)
+    refs["monitor"].pack(fill="x", padx=20, pady=(0, 10))
+
+    topo = tk.Canvas(hero, height=136, highlightthickness=0, bd=0, bg=CONSOLE["SURFACE"])
+    topo.pack(fill="x", padx=20, pady=(0, 18))
+    topo._campus_topology = {}
+    bind_theme(topo, "topology", console=True)
+    topo.bind("<Configure>", _on_topology_resize)
+    refs["topology"] = topo
+    draw_topology(topo, CONSOLE, {})
+
+    cards = ctk.CTkFrame(body, fg_color="transparent")
+    cards.pack(fill="x", padx=24)
+    for column in range(3):
+        cards.grid_columnconfigure(column, weight=1, uniform="status")
+    refs["status_cards"] = {}
+    for column, (role, title) in enumerate((("ethernet", "以太网"), ("wifi", "SNNU Wi-Fi"),
+                                            ("uu", "UU 远程恢复"))):
+        card = panel(cards, console=True, flat=True)
+        card.grid(row=0, column=column, sticky="nsew",
+                  padx=(0 if column == 0 else 5, 0 if column == 2 else 5))
+        strip = ctk.CTkFrame(card, height=3, fg_color=CONSOLE["MUTED"], corner_radius=0)
+        strip.pack(fill="x")
+        bind_theme(strip, "strip", tone="unknown", console=True)
+        label(card, title, bold=True, console=True).pack(fill="x", padx=14, pady=(12, 8))
+        value = label(card, "待确认", size=18, bold=True, wraplength=128,
+                      justify="left", console=True)
+        value.pack(fill="x", padx=14)
+        fact = label(card, "", muted=True, size=12, wraplength=128, justify="left",
+                     console=True)
+        fact.pack(fill="x", padx=14, pady=(6, 14))
+        refs["status_cards"][role] = {"value": value, "fact": fact, "strip": strip}
+
+    actions = ctk.CTkFrame(body, fg_color="transparent")
+    actions.pack(fill="x", padx=24, pady=20)
+    for title, cmd, primary in (("立即检查", app.on_check_connection, True),
+                                 ("尝试恢复", app.on_reconnect, False),
+                                 ("开启在线守护", app.on_toggle_online_guard, False)):
+        b = button(actions, title, cmd, primary=primary, console=True, width=130)
+        b.pack(side="left", padx=(0, 10))
+        refs["buttons"].append(b)
+    note = panel(body, console=True, flat=True)
+    note.pack(fill="x", padx=24, pady=(0, 24))
+    label(note, "关于 UU 在线状态", bold=True, console=True).pack(
+        fill="x", padx=18, pady=(14, 4))
+    label(note, "这里显示助手的恢复状态；是否能从另一台设备远程连接，仍需在 UU 客户端确认。",
+          muted=True, wraplength=520, justify="left", console=True).pack(
+        fill="x", padx=18, pady=(0, 14))
+
+
+def render_console(refs, state, app):
+    """Map the read-only UiState onto console widgets. Never invents a value."""
+    from campus_ui_state import OVERALL_TONE
+    tone = OVERALL_TONE.get(state.overall, "unknown")
+    _tone(refs["light"], tone, console=True)
+    _tone(refs["signal_word"], tone, console=True)
+    refs["signal_word"].configure(text=SIGNAL_WORDS.get(state.overall, "UNKNOWN"))
+    refs["overall"].configure(text=state.overall_label)
+    refs["headline"].configure(text=state.headline or "等待首次检测结果")
+    monitor = "  ·  ".join(v for v in (state.monitor_label, state.mode_label) if v)
+    refs["monitor"].configure(text=f"●  {monitor or '等待监测'}")
+    app._render_update_banner(refs)
+    data = {}
+    for role in ("ethernet", "wifi"):
+        card = state.card(role)
+        slot = refs["status_cards"][role]
+        caption, card_tone = path_summary(card)
+        _tone(slot["value"], card_tone, console=True)
+        slot["value"].configure(text=caption)
+        slot["fact"].configure(text=(f"地址 {card.field('源地址')}\n最近验证 {card.field('最近验证')}"
+                                     if card else "尚无检测数据"))
+        bind_theme(slot["strip"], "strip", tone=card_tone, console=True)
+        slot["strip"].configure(fg_color=CONSOLE["TONES"].get(card_tone, CONSOLE["MUTED"]))
+        prefix = ""
+        if state.active_path == role:
+            prefix = "主用"
+        elif state.standby_path == role:
+            prefix = "备用"
+        elif card and card.assignment == "PRIMARY":
+            prefix = "主用"
+        elif card and card.assignment == "STANDBY":
+            prefix = "备用"
+        data[role] = {"tone": card_tone, "label": caption, "role": prefix}
+    uu = state.uu
+    slot = refs["status_cards"]["uu"]
+    uu_tone = uu.tone if uu.enabled else "unknown"
+    _tone(slot["value"], uu_tone, console=True)
+    slot["value"].configure(text=uu.label if uu.enabled else "未启用")
+    slot["fact"].configure(text=uu.detail or ("恢复结果待确认" if uu.enabled
+                                              else "可在设置中开启自动恢复"))
+    bind_theme(slot["strip"], "strip", tone=uu_tone, console=True)
+    slot["strip"].configure(fg_color=CONSOLE["TONES"].get(uu_tone, CONSOLE["MUTED"]))
+    data["uu"] = {"tone": uu_tone, "label": uu.label if uu.enabled else "未启用"}
+    topo = refs["topology"]
+    topo._campus_topology = data
+    draw_topology(topo, CONSOLE, data)
 
 
 def build_dashboard(app):
@@ -359,13 +565,15 @@ def build_dashboard(app):
             bind_theme(nav, "nav", selected=selected)
         refs["selected_page"] = key
 
-    def page(key, title, subtitle):
-        body = ctk.CTkScrollableFrame(content, fg_color=tokens()["BG"], corner_radius=0)
-        bind_theme(body, "surface")
+    def page(key, title, subtitle, *, console=False):
+        colors = CONSOLE if console else tokens()
+        body = ctk.CTkScrollableFrame(content, fg_color=colors["BG"], corner_radius=0)
+        bind_theme(body, "surface", console=console)
         refs["pages"][key] = body
-        label(body, title, size=24, bold=True).pack(fill="x", padx=24, pady=(24, 4))
-        label(body, subtitle, muted=True, wraplength=440, justify="left").pack(
-            fill="x", padx=24, pady=(0, 20))
+        label(body, title, size=24, bold=True, console=console).pack(
+            fill="x", padx=24, pady=(24, 4))
+        label(body, subtitle, muted=True, wraplength=440, justify="left",
+              console=console).pack(fill="x", padx=24, pady=(0, 20))
         return body
 
     for index, (key, title) in enumerate((("overview", "概览"), ("network", "连接状态"),
@@ -385,56 +593,8 @@ def build_dashboard(app):
     button(side, "打开日志", app.on_open_log, width=140).grid(row=10, padx=16, pady=8)
     label(side, "关闭窗口后仍在托盘运行", size=11, muted=True).grid(row=11, padx=12, pady=(0, 18))
 
-    overview = page("overview", "概览", "查看网络连接和远程恢复状态。")
-    banner = panel(overview)
-    refs.update(update_banner=banner, update_banner_visible=False)
-    refs["update_banner_label"] = label(banner, "", wraplength=330)
-    refs["update_banner_label"].pack(side="left", padx=16, pady=12)
-    button(banner, "下载更新", app._on_update_download, primary=True, width=100).pack(
-        side="right", padx=12)
-    button(banner, "以后再说", app._on_update_dismiss, width=90).pack(side="right")
-    hero = panel(overview)
-    hero.pack(fill="x", padx=24, pady=(0, 16))
-    refs["gauges_frame"] = hero  # Anchor for the existing in-app update banner.
-    status_line = ctk.CTkFrame(hero, fg_color="transparent")
-    status_line.pack(fill="x", padx=20, pady=(18, 4))
-    refs["light"] = label(status_line, "●", size=22)
-    refs["light"].pack(side="left", padx=(0, 10))
-    refs["overall"] = label(status_line, "正在读取状态", size=22, bold=True)
-    refs["overall"].pack(side="left")
-    refs["headline"] = label(hero, "", muted=True, wraplength=440, justify="left")
-    refs["headline"].pack(fill="x", padx=20, pady=(0, 4))
-    refs["monitor"] = label(hero, "", size=12, muted=True, wraplength=440)
-    refs["monitor"].pack(fill="x", padx=20, pady=(0, 18))
-    cards = ctk.CTkFrame(overview, fg_color="transparent")
-    cards.pack(fill="x", padx=24)
-    for column in range(3):
-        cards.grid_columnconfigure(column, weight=1, uniform="status")
-    refs["status_cards"] = {}
-    for column, (role, title) in enumerate((("ethernet", "以太网"), ("wifi", "SNNU Wi-Fi"),
-                                            ("uu", "UU 远程恢复"))):
-        card = panel(cards)
-        card.grid(row=0, column=column, sticky="nsew",
-                  padx=(0 if column == 0 else 5, 0 if column == 2 else 5))
-        label(card, title, bold=True).pack(fill="x", padx=14, pady=(14, 8))
-        value = label(card, "待确认", size=17, bold=True, wraplength=128, justify="left")
-        value.pack(fill="x", padx=14)
-        fact = label(card, "", muted=True, size=12, wraplength=128, justify="left")
-        fact.pack(fill="x", padx=14, pady=(6, 14))
-        refs["status_cards"][role] = {"value": value, "fact": fact}
-    actions = ctk.CTkFrame(overview, fg_color="transparent")
-    actions.pack(fill="x", padx=24, pady=20)
-    for title, cmd, primary in (("立即检查", app.on_check_connection, True),
-                                 ("尝试恢复", app.on_reconnect, False),
-                                 ("开启在线守护", app.on_toggle_online_guard, False)):
-        b = button(actions, title, cmd, primary=primary, width=130)
-        b.pack(side="left", padx=(0, 10))
-        refs["buttons"].append(b)
-    note = panel(overview)
-    note.pack(fill="x", padx=24, pady=(0, 24))
-    label(note, "关于 UU 在线状态", bold=True).pack(fill="x", padx=18, pady=(14, 4))
-    label(note, "这里显示助手的恢复状态；是否能从另一台设备远程连接，仍需在 UU 客户端确认。",
-          muted=True, wraplength=440, justify="left").pack(fill="x", padx=18, pady=(0, 14))
+    overview = page("overview", "概览", "查看网络连接和远程恢复状态。", console=True)
+    build_console(app, overview, refs)
 
     network = page("network", "连接状态", "助手会在后台检查并恢复连接，无需手动配置联网软件。")
     p = panel(network)
@@ -537,29 +697,16 @@ def build_dashboard(app):
 
 def render_dashboard(app, state):
     refs = app._dash_ctk_widgets
-    from campus_ui_state import OVERALL_TONE, STEP_STATUS_LABEL, STEP_TONE
-    _tone(refs["light"], OVERALL_TONE.get(state.overall, "unknown"))
-    refs["overall"].configure(text=state.overall_label)
-    refs["headline"].configure(text=state.headline or "等待首次检测结果")
-    app._render_update_banner(refs)
+    from campus_ui_state import STEP_STATUS_LABEL, STEP_TONE
+    render_console(refs, state, app)
+    uu = state.uu
     for role in ("ethernet", "wifi"):
         card = state.card(role)
-        slot = refs["status_cards"][role]
-        caption, tone = path_summary(card)
-        _tone(slot["value"], tone)
-        slot["value"].configure(text=caption)
-        slot["fact"].configure(text=(f"地址 {card.field('源地址')}\n最近验证 {card.field('最近验证')}"
-                                     if card else "尚无检测数据"))
         for name, widget in refs[role].items():
             text = card.field(name) if card else "—"
             if name == "角色":
                 text = {"PRIMARY": "主用链路", "STANDBY": "备用链路"}.get(text, text)
             widget.configure(text=text)
-    uu = state.uu
-    slot = refs["status_cards"]["uu"]
-    _tone(slot["value"], uu.tone if uu.enabled else "unknown")
-    slot["value"].configure(text=uu.label if uu.enabled else "未启用")
-    slot["fact"].configure(text=uu.detail or ("恢复结果待确认" if uu.enabled else "可在设置中开启自动恢复"))
     for step in state.pipeline:
         if step.key in refs["steps"]:
             refs["steps"][step.key].configure(text=STEP_STATUS_LABEL.get(step.status, "待确认"))
@@ -578,8 +725,6 @@ def render_dashboard(app, state):
     refs["protection"].configure(text="\n".join(
         f"{title}：{'已启用' if cfg.get(key) else '未启用'}" for key, title in (
             ("lifeline_enabled", "在线守护"), ("lifeline_reboot_enabled", "电脑重启恢复"))))
-    refs["monitor"].configure(text="  ·  ".join(v for v in (state.monitor_label, state.mode_label) if v)
-                              or "等待监测")
     lines = app._dashboard_timeline_lines(limit=10)
     refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines
                               else "尚无网络故障事件记录")

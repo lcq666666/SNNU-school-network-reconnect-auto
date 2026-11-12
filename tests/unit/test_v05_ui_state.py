@@ -665,9 +665,10 @@ def test_ui80_dashboard_and_settings_windows_build_and_render(monkeypatch):
             # V0.6 CustomTkinter 仪表盘：同一断言走 CTk 控件
             app._render_dashboard_ctk(app.ui_state(now=5.0))
             refs = app._dash_ctk_widgets
-            from campus_desktop_ui import TONES
+            from campus_desktop_ui import CONSOLE
             from campus_ui_state import OVERALL_TONE
-            assert refs["light"].cget("text_color") == TONES[OVERALL_TONE[app.ui_state(now=5.0).overall]]
+            assert refs["light"].cget("text_color") == CONSOLE["TONES"][
+                OVERALL_TONE[app.ui_state(now=5.0).overall]]
             assert refs["ethernet"]["Internet"].cget("text") == "未验证"
             assert refs["wifi"]["状态"].cget("text") == "已连接（需要认证）"
             assert refs["steps"]["internet"].cget("text") in ("完成", "待执行", "失败", "进行中")
