@@ -15,6 +15,7 @@ import pytest
 
 from campus_core import __version__
 from tools import build_info
+from tools.pyinstaller_assets import filter_optional_assets
 
 tomllib = pytest.importorskip("tomllib")
 
@@ -125,6 +126,31 @@ def test_t34_spec_embeds_version_file(project_root):
     text = (project_root / "CampusReconnect.spec").read_text(encoding="utf-8")
     assert "build_info.write_version_file" in text
     assert "version=_version_file" in text
+
+
+def test_t34_packaging_keeps_only_used_ocr_models_and_no_video_backend():
+    datas = [
+        (r"site-packages\ddddocr\common_old.onnx", "ddddocr"),
+        (r"site-packages\ddddocr\common.onnx", "ddddocr"),
+        (r"site-packages\ddddocr\common_det.onnx", "ddddocr"),
+    ]
+    binaries = [
+        (r"site-packages\cv2\cv2.pyd", "cv2"),
+        (r"site-packages\cv2\opencv_videoio_ffmpeg500_64.dll", "cv2"),
+    ]
+    filtered_data, filtered_binaries = filter_optional_assets(datas, binaries)
+    assert [item[0].rsplit("\\", 1)[-1] for item in filtered_data] == [
+        "common_old.onnx"]
+    assert [item[0].rsplit("\\", 1)[-1] for item in filtered_binaries] == [
+        "cv2.pyd"]
+
+    analyzed_data, analyzed_binaries = filter_optional_assets(
+        [("ddddocr/common.onnx", "site-packages/ddddocr/common.onnx", "DATA")],
+        [("cv2/opencv_videoio_ffmpeg500_64.dll",
+          "site-packages/cv2/opencv_videoio_ffmpeg500_64.dll", "BINARY")],
+    )
+    assert analyzed_data == []
+    assert analyzed_binaries == []
 
 
 # --------------------------------------------------------------------------- #

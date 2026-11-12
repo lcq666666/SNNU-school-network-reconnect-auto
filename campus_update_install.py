@@ -17,6 +17,7 @@ $target = [IO.Path]::GetFullPath($taskConfig.target)
 $staged = [IO.Path]::GetFullPath($taskConfig.staged)
 $backup = $target + '.previous'
 $incoming = $target + '.incoming'
+$startupReport = $taskConfig.receipt + '.preflight'
 $replaced = $false
 $started = $null
 try {
@@ -31,6 +32,15 @@ try {
     if ($digest -ne $taskConfig.sha256) {
         throw 'Staged update SHA256 mismatch'
     }
+    Remove-Item -LiteralPath $startupReport -Force -ErrorAction SilentlyContinue
+    $check = Start-Process -FilePath $staged `
+        -ArgumentList @('--load-check', ('"' + $startupReport + '"')) `
+        -Wait -PassThru -WindowStyle Hidden
+    if ($check.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $startupReport) `
+        -or (Get-Content -LiteralPath $startupReport -Raw).Trim() -ne 'ok') {
+        throw 'Staged update startup check failed'
+    }
+    Remove-Item -LiteralPath $startupReport -Force -ErrorAction SilentlyContinue
     $old = Get-Process -Id $taskConfig.pid -ErrorAction SilentlyContinue
     if ($old) { Wait-Process -Id $old.Id -Timeout 60 -ErrorAction SilentlyContinue }
     Copy-Item -LiteralPath $staged -Destination $incoming -Force
@@ -88,8 +98,28 @@ try {
 '''
 
 
+def preflight_staged_executable(staged: Path, directory: Path) -> None:
+    """Verify the frozen executable loads before the current app exits."""
+    directory.mkdir(parents=True, exist_ok=True)
+    report = directory / "update-preflight.txt"
+    report.unlink(missing_ok=True)
+    try:
+        result = subprocess.run(
+            [str(staged), "--load-check", str(report)],
+            check=False, timeout=30,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("更新文件启动自检失败：%s" % type(exc).__name__) from exc
+    detail = report.read_text(encoding="utf-8").strip() if report.is_file() else ""
+    report.unlink(missing_ok=True)
+    if result.returncode != 0 or detail != "ok":
+        raise RuntimeError("更新文件启动自检失败（退出码 %s）" % result.returncode)
+
+
 def launch_installer(staged: Path, target: Path, version: str, directory: Path):
     directory.mkdir(parents=True, exist_ok=True)
+    preflight_staged_executable(staged, directory)
     receipt = directory / "update-receipt.json"
     receipt.unlink(missing_ok=True)
     error = directory / "install-error.txt"

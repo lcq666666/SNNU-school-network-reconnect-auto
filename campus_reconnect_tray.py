@@ -3999,7 +3999,7 @@ class TrayApp:
             pystray.MenuItem(self._uu_text, None, enabled=False),
             pystray.MenuItem(self._remote_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("打开主界面", self.on_dashboard),
+            pystray.MenuItem("打开主界面", self.on_dashboard, default=True),
             pystray.MenuItem("立即检测", self.on_detect_now),
             pystray.MenuItem("立即验证以太网",
                              lambda icon, item: self.on_verify_now("ethernet")),
@@ -4615,9 +4615,19 @@ def _startup_check(report: Path) -> int:
             root.destroy()
 
 
+def _load_check(report: Path) -> int:
+    """Confirm the frozen executable loaded its Python modules without opening UI."""
+    try:
+        report.write_text("ok\n", encoding="utf-8")
+        return 0
+    except OSError:
+        return 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument(BACKGROUND_FLAG, action="store_true", help="在托盘后台启动")
+    parser.add_argument("--load-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--startup-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--update-receipt", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--configure-autologon", action="store_true", help=argparse.SUPPRESS)
@@ -4626,6 +4636,8 @@ def main(argv=None) -> int:
         from campus_boot import setup_dialog
         setup_dialog()
         return 0
+    if args.load_check is not None:
+        return _load_check(args.load_check)
     if args.startup_check is not None:
         return _startup_check(args.startup_check)
 

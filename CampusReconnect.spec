@@ -20,6 +20,7 @@ if _SPEC_DIR not in sys.path:
     sys.path.insert(0, _SPEC_DIR)
 
 from tools import build_info  # noqa: E402
+from tools.pyinstaller_assets import filter_optional_assets  # noqa: E402
 
 _version_file = build_info.write_version_file(
     os.path.join(_SPEC_DIR, "build", "version_info.txt"))
@@ -35,6 +36,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all('ddddocr')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas, binaries = filter_optional_assets(datas, binaries)
 
 
 a = Analysis(
@@ -50,6 +52,7 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+a.datas, a.binaries = filter_optional_assets(a.datas, a.binaries)
 pyz = PYZ(a.pure)
 
 exe = EXE(

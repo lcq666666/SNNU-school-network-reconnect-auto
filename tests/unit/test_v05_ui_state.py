@@ -519,6 +519,18 @@ def test_ui62_menu_exposes_dashboard_verification_and_manual_restart(monkeypatch
     assert app._uu_text().startswith("UU 远程：")
 
 
+def test_ui64_tray_default_click_opens_dashboard(monkeypatch):
+    app = _make_app(monkeypatch)
+    app.root = object()
+    menu = app.build_menu()
+    default_items = [item for item in menu if getattr(item, "default", False)]
+    assert [item.text for item in default_items] == ["打开主界面"]
+
+    menu(app.icon)
+
+    assert app._ui_actions.get_nowait() == app._open_dashboard
+
+
 def test_ui63_manual_verification_runs_in_background_and_shows_sites(monkeypatch):
     app = _make_app(monkeypatch)
     verifier = ScriptedVerifier(ok=True)
