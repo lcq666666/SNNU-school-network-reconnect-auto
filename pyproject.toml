@@ -23,7 +23,7 @@ classifiers = [
 
 # ---- 运行依赖（CLI 核心；与 requirements.txt 对齐）----
 dependencies = [
-    "ddddocr==1.5.6",
+    "ddddocr==1.6.1",
     "requests>=2.31,<3",
     "keyring>=24,<26",
 ]

@@ -26,10 +26,8 @@ def autologon_ready():
 
 
 def lock_after_boot():
-    kernel = ctypes.WinDLL("kernel32")
-    kernel.GetTickCount64.restype = ctypes.c_ulonglong
-    if kernel.GetTickCount64() < 180_000:
-        ctypes.WinDLL("user32").LockWorkStation()
+    # A slow Windows boot must still lock the automatically opened user session.
+    return bool(ctypes.WinDLL("user32").LockWorkStation())
 
 
 def prepare_autologon(session):

@@ -4663,11 +4663,12 @@ def main(argv=None) -> int:
     root = tk.Tk()
     root.withdraw()
     boot_config = load_config()
-    if (args.background and boot_config.get("lifeline_enabled", False)
+    if (args.background and args.update_receipt is None and boot_config.get("lifeline_enabled", False)
             and boot_config.get("lock_after_autologon", True)):
         from campus_boot import autologon_ready, lock_after_boot
         if autologon_ready():
-            lock_after_boot()
+            if not lock_after_boot():
+                log.warning("自动登录后的锁屏调用未确认，请在本机核对锁屏状态")
     loaded = load_credentials()
     if loaded.error_code == E_CRED_BACKEND:
         log.error("凭据后端不可用：%s", loaded.detail)
