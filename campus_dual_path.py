@@ -54,6 +54,7 @@ __all__ = [
     "DEFAULT_VERIFICATION_RETRY_INTERVAL", "CONNECTED_STATES",
     "VerifiedActionGate", "DualPathTick", "DualPathStatus",
     "DualPathRecoveryController", "path_request_from_snapshot",
+    "path_request_failure_reason",
 ]
 
 CONTRACT_VERSION = "v05-4-dual-path-1"
@@ -126,6 +127,29 @@ def _egress_if_index(snapshot: Any) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
+def path_request_failure_reason(snapshot: Any, role: str) -> Optional[str]:
+    """Explain why an interface-scoped verification request cannot be built.
+
+    This is deliberately diagnostic only.  Returning a reason never relaxes the
+    request contract: callers still receive ``None`` and must fail closed.
+    """
+    if role not in (PATH_ETHERNET, PATH_WIFI):
+        return "未知网络路径"
+    health = getattr(snapshot, "ethernet", None) if role == PATH_ETHERNET else getattr(snapshot, "wifi", None)
+    label = "以太网" if role == PATH_ETHERNET else "Wi-Fi"
+    if health is None:
+        return "%s轴未采集" % label
+    missing = []
+    index = getattr(health, "if_index", None)
+    if type(index) is not int or not 0 < index <= 0xFFFFFFFF:
+        missing.append("ifIndex")
+    if not str(getattr(health, "source_ip", "") or ""):
+        missing.append("源地址")
+    if not getattr(health, "dns_servers", None):
+        missing.append("该接口 DNS")
+    return "缺少%s" % "/".join(missing) if missing else None
+
+
 def path_request_from_snapshot(snapshot: Any, role: str, *,
                                generation: int = 0) -> Optional[Any]:
     """由三轴快照构造**接口受限**验证请求（V0.5-4）。
@@ -149,7 +173,7 @@ def path_request_from_snapshot(snapshot: Any, role: str, *,
     source_ip = str(getattr(health, "source_ip", "") or "")
     dns = tuple(str(value) for value in
                 (getattr(health, "dns_servers", None) or ()))
-    if not isinstance(if_index, int) or not source_ip or not dns:
+    if path_request_failure_reason(snapshot, role) is not None:
         return None
     from campus_reconnect import PathVerificationRequest   # 延迟 import：避免循环依赖
 
@@ -469,6 +493,8 @@ class DualPathRecoveryController:
         self._pending: Dict[str, float] = {}
         #: 最近一次**发起**验证的时刻：路径 → 时刻（限速用，见 ``_should_reverify``）。
         self._attempted: Dict[str, float] = {}
+        #: 记录因快照缺少接口事实而暂缓的路径；事实补齐后只重试这些路径。
+        self._missing_request_roles: set[str] = set()
         self._last_event: Optional[RecoveryEvent] = None
         self._last_snapshot: Any = None
         self._last_tick: Optional[DualPathTick] = None
@@ -780,6 +806,17 @@ class DualPathRecoveryController:
             if refresh_due and retry_due:
                 wanted.append((active, "刷新当前出口的公网验证"))
 
+        # 每条已连接链路都必须独立验证。即使首次快照缺少 ifIndex、源地址或
+        # DNS，事件仍会被记录为 CONNECTED；当后续快照补齐事实时，不能因为
+        # ``_axis_states`` 已经是 CONNECTED 就永久跳过验证。
+        for role in (PATH_ETHERNET, PATH_WIFI):
+            if any(existing == role for existing, _ in wanted):
+                continue
+            if role in self._missing_request_roles \
+                    and _axis_state(self._last_snapshot, role) in CONNECTED_STATES \
+                    and self._should_reverify(role, moment):
+                wanted.append((role, "独立确认 %s 接口可以真实上网" % PATH_LABEL.get(role, role)))
+
         requests: List[Any] = []
         for role, reason in wanted:
             if role in self._pending:
@@ -789,10 +826,12 @@ class DualPathRecoveryController:
             request = path_request_from_snapshot(self._last_snapshot, role,
                                                  generation=self.network_epoch)
             if request is None:
+                self._missing_request_roles.add(role)
                 notes.append("无法构造 %s 的接口受限验证请求"
                              "（缺 ifIndex / 源地址 / 该接口 DNS）：fail-closed，不验证"
                              % PATH_LABEL.get(role, role))
                 continue
+            self._missing_request_roles.discard(role)
             self._pending[role] = moment
             self._attempted[role] = moment
             self.verification_requests += 1

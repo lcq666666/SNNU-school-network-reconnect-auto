@@ -20,23 +20,30 @@ class SetupResult:
 class AutomaticSetup:
     """Inject every host operation so the default suite never touches a live client."""
 
-    def __init__(self, compatibility, roots, lifecycle, *, cancelled=lambda: False):
+    def __init__(self, compatibility, roots, lifecycle, *, cancelled=lambda: False,
+                 allow_client_restart=False):
         self.compat = compatibility
         self.roots = roots
         self.lifecycle = lifecycle
         self.cancelled = cancelled
+        self.allow_client_restart = allow_client_restart is True
 
     def run(self, *, restart_client=False):
-        recover = getattr(self.lifecycle, "recover", None)
-        if recover is not None:
-            recover()
         if self.cancelled():
             return SetupResult(False, "在线守护已暂停")
-        changed = False
         pending = self.compat.pending_backup()
+        if pending is not None and not self.allow_client_restart:
+            return SetupResult(False, "检测到上次联网软件恢复记录，已保留现状等待人工处理")
+        recover = getattr(self.lifecycle, "recover", None)
+        if recover is not None and self.allow_client_restart:
+            recover()
+        changed = False
         if pending is not None:
             # Existing conflict checks prevent overwriting later user changes.
             journal = json.loads(Path(pending).read_text(encoding="utf-8"))
+            if (journal.get("root") and self.compat.client_running()
+                    and not self.allow_client_restart):
+                return SetupResult(False, "联网软件运行中，上次配置恢复将在它退出后继续")
             token = self.lifecycle.pause() if journal.get("root") else []
             try:
                 self.compat.restore(pending)
@@ -59,6 +66,9 @@ class AutomaticSetup:
         ready = self.compat.persistent_ready(root)
         if ready and not restart_client:
             return SetupResult(True, "联网保护已就绪", changed)
+        if self.compat.client_running() and not self.allow_client_restart:
+            return SetupResult(
+                False, "基础联网保护已就绪；完整兼容规则将在联网软件退出后自动保存", changed)
         if self.cancelled():
             return SetupResult(False, "在线守护已暂停", changed)
         token = self.lifecycle.pause()
@@ -164,8 +174,18 @@ class WindowsClientLifecycle:
                 self.journal.unlink(missing_ok=True)
             return
         for _, executable in token:
-            self.launch([executable], cwd=str(Path(executable).parent),
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            kwargs = {"cwd": str(Path(executable).parent),
+                      "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+            # 自动联网保护只需要恢复 Clash 的后台实例，不应把客户端主窗口
+            # 突然推到办公桌面前。注入的测试 launcher 保持原有调用形状；
+            # 真实 Windows Popen 使用 STARTUPINFO 请求隐藏初始窗口。
+            startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+            if startupinfo_factory is not None:
+                startupinfo = startupinfo_factory()
+                startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+                startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+                kwargs["startupinfo"] = startupinfo
+            self.launch([executable], **kwargs)
         if self.journal is not None:
             for _ in range(10):
                 clients = self.clients()

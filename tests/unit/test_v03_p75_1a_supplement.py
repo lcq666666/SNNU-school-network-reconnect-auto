@@ -139,6 +139,21 @@ def test_u75_1a_05_consecutive_timeouts_then_recovery():
     assert source._inflight_count == 0
 
 
+def test_u75_1a_05b_stuck_inflight_window_is_rebuilt_after_bound():
+    """迟到的 PowerShell 线程不能永久占满槽位，采集器必须有界自愈。"""
+    source, clock, jobs = _queued_source(max_inflight=1)
+    assert source.request()
+    clock.advance(2)
+    assert not source.request()  # 超时后仍保留旧线程的槽位
+    clock.advance(source._inflight_rebuild_after + 1)
+    assert source.request() is True
+    assert source.rebuild_count == 1
+    assert source.retired_inflight == 1
+    assert source.generation == 2
+    jobs[-1]()
+    assert source.observe().trusted
+
+
 def test_late_completion_without_retry_is_not_published():
     source, clock, jobs = _queued_source()
     source.request()

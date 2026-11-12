@@ -520,6 +520,7 @@ class TraySnapshotSource:
         self.degraded_grace = float(min(MAX_DEGRADED_GRACE,
                                         max(0.0, degraded_grace)))
         self._max_inflight = int(max(1, max_inflight))
+        self._hard_inflight_limit = self._max_inflight * 2
         self._spawn = spawn or _default_spawn
         self._log = log
         self._lock = threading.Lock()
@@ -549,6 +550,22 @@ class TraySnapshotSource:
         self._active_task_id = 0
         #: 并发采集线程数（防止超时重试造成无限堆积）。
         self._inflight_count = 0
+        self._inflight_tasks: set[int] = set()
+        self._retired_tasks: set[int] = set()
+        # 超时的 PowerShell 线程不能被 Python 强制取消。若它们长期不退出，
+        # 旧实现会把 max_inflight 永久占满，之后再也没有机会发布新快照。
+        # 仅用任务 token 淘汰迟到结果，并在有界时间后重建逻辑采集窗口。
+        self._inflight_blocked_since: Optional[float] = None
+        self._inflight_rebuild_after = max(60.0, self.collect_timeout * 2.0)
+        self.rebuild_count = 0
+        self.retired_inflight = 0
+        self.last_failure_reason = ""
+        self.last_failure_at: Optional[float] = None
+        self.consecutive_failures = 0
+        self.last_task_id = 0
+        self.last_generation_before: Optional[Tuple[Any, int]] = None
+        self.last_generation_after: Optional[Tuple[Any, int]] = None
+        self._last_invalidation = None
         #: 统计（便于验收与告警）。
         self.collect_count = 0
         self.error_count = 0
@@ -581,16 +598,26 @@ class TraySnapshotSource:
         已发布的旧快照也会在 :meth:`observe` 里被判 ``GENERATION_MISMATCH``。
         """
         with self._lock:
+            before = self.current_generation()
+            self._last_invalidation = (before[0], reason)
             self.generation += 1
             bumped = self.generation
+            self.last_generation_before = before
+            self.last_generation_after = self.current_generation()
+            self._task_seq += 1
+            self._active_task_id = self._task_seq
+            self._collecting = False
+            self._collect_started_at = None
+            self._last_request_at = None
             # 阶段 B：配置 / SSID / 模式变化后，旧 LKG 的依据已失效，必须清空，
             # 否则降级会把「变化前的网络身份」当作当前依据（安全硬要求）。
             self._lkg_snapshot = None
             self._lkg_at = None
             self._lkg_external = None
             self._lkg_signature = ()
-        self._note("三轴观测代次失效（%s）：作废在途采集结果与 LKG，新代次=%d"
-                   % (reason or "未说明原因", bumped))
+        self._note("三轴观测代次失效：reason=%s generation=%r->%r task=%d"
+                   % (reason or "未说明原因", before,
+                      self.last_generation_after, self._active_task_id))
         return bumped
 
     # ---- 采集（非阻塞） ---- #
@@ -615,15 +642,59 @@ class TraySnapshotSource:
                 # 超时：提升任务 ID + 自增代次，确保旧线程结果一定被丢弃
                 self._collecting = False
                 self.timeout_count += 1
+                before = self.current_generation()
                 self.generation += 1
                 self._task_seq += 1
                 self._active_task_id = self._task_seq
                 self._error = "采集超时（>%.0fs）" % self.collect_timeout
-                self._note("三轴采集超时（%.0fs）：丢弃本轮结果"
-                           % self.collect_timeout)
-            if self._inflight_count >= self._max_inflight:
+                self.last_generation_before = before
+                self.last_generation_after = self.current_generation()
+                self._record_failure(self._error, stamp)
+                self._note("三轴采集超时：task=%d elapsed=%.1fs generation=%r->%r inflight=%d"
+                           % (self.last_task_id, elapsed, before,
+                              self.last_generation_after, self._inflight_count))
+            if len(self._retired_tasks) + self._inflight_count >= self._hard_inflight_limit:
                 self.rejected_inflight_limit += 1
+                if self.last_failure_reason != "采集任务达到硬上限":
+                    self._note("三轴采集任务达到硬上限：active=%d retired=%d limit=%d；保留安全门，等待任务退出"
+                               % (self._inflight_count, len(self._retired_tasks),
+                                  self._hard_inflight_limit))
+                self._record_failure("采集任务达到硬上限", stamp)
                 return False
+            if self._inflight_count >= self._max_inflight:
+                if self._inflight_blocked_since is None:
+                    self._inflight_blocked_since = stamp
+                blocked_for = stamp - self._inflight_blocked_since
+                if (blocked_for < self._inflight_rebuild_after
+                        or len(self._retired_tasks) + self._inflight_count
+                        >= self._hard_inflight_limit):
+                    self.rejected_inflight_limit += 1
+                    self._record_failure(
+                        "采集并发槽位已满（已有 %d 个迟到任务，等待 %.0fs）"
+                        % (self._inflight_count, blocked_for), stamp)
+                    return False
+                # 不能取消已卡住的线程，但可以安全地淘汰它们的结果。
+                # 递增 task id 后，所有迟到完成都会走 mismatch 分支。
+                before = self.current_generation()
+                retired = self._inflight_count
+                self._retired_tasks.update(self._inflight_tasks)
+                self._inflight_tasks.clear()
+                self.retired_inflight += retired
+                self.rebuild_count += 1
+                self._inflight_count = 0
+                self._collecting = False
+                self._collect_started_at = None
+                self.generation += 1
+                self._task_seq += 1
+                self._active_task_id = self._task_seq
+                self._inflight_blocked_since = None
+                self.last_generation_before = before
+                self.last_generation_after = self.current_generation()
+                self._record_failure(
+                    "采集器重建：并发槽位 %.0fs 未释放，淘汰 %d 个迟到任务"
+                    % (blocked_for, retired), stamp)
+                self._note("三轴采集器有界重建：淘汰 %d 个迟到任务，新代次=%d"
+                           % (retired, self.generation))
             if (self._last_request_at is not None
                     and (stamp - self._last_request_at) < self.min_interval):
                 self.throttled += 1
@@ -635,16 +706,21 @@ class TraySnapshotSource:
             task_id = self._task_seq
             self._active_task_id = task_id
             self._inflight_count += 1
+            self._inflight_tasks.add(task_id)
+            self._inflight_blocked_since = None
             started_generation = self.current_generation()
+            self.last_task_id = task_id
         try:
             self._spawn(lambda: self._run(task_id, started_generation, stamp))
         except Exception as exc:                    # 起线程失败不得拖垮调用方
             with self._lock:
                 self._inflight_count = max(0, self._inflight_count - 1)
+                self._inflight_tasks.discard(task_id)
                 if task_id == self._active_task_id:
                     self._collecting = False
                     self.error_count += 1
                     self._error = "采集线程启动失败：%s" % type(exc).__name__
+                    self._record_failure(self._error, stamp)
             self._note("三轴采集线程启动失败：%s" % type(exc).__name__)
             return False
         return True
@@ -653,7 +729,9 @@ class TraySnapshotSource:
         """同步采集（预热/测试）；与后台入口共用单飞和在途上限。"""
         stamp = self._clock()
         with self._lock:
-            if self._collecting or self._inflight_count >= self._max_inflight:
+            if (self._collecting or self._inflight_count >= self._max_inflight
+                    or len(self._retired_tasks) + self._inflight_count
+                    >= self._hard_inflight_limit):
                 return self._snapshot
             if (self._last_request_at is not None
                     and stamp - self._last_request_at < self.min_interval):
@@ -666,7 +744,10 @@ class TraySnapshotSource:
             self._collecting = True
             self._collect_started_at = stamp
             self._inflight_count += 1
+            self._inflight_tasks.add(task_id)
+            self._inflight_blocked_since = None
             generation = self.current_generation()
+            self.last_task_id = task_id
         self._run(task_id, generation, stamp)
         with self._lock:
             return self._snapshot
@@ -688,7 +769,11 @@ class TraySnapshotSource:
             except Exception as exc:
                 error = "%s: %s" % (type(exc).__name__, exc)
         with self._lock:
-            self._inflight_count = max(0, self._inflight_count - 1)
+            if task_id in self._retired_tasks:
+                self._retired_tasks.remove(task_id)
+            elif task_id in self._inflight_tasks:
+                self._inflight_tasks.remove(task_id)
+                self._inflight_count = max(0, self._inflight_count - 1)
             # 任务 ID 匹配：只有当前活跃任务才能修改状态
             if task_id != self._active_task_id:
                 self.dropped_task_mismatch += 1
@@ -702,10 +787,12 @@ class TraySnapshotSource:
                 self._task_seq += 1
                 self._active_task_id = self._task_seq
                 self._error = "采集超时（>%.0fs）" % self.collect_timeout
+                self._record_failure(self._error, self._clock())
                 return
             if error:
                 self.error_count += 1
                 self._error = error
+                self._record_failure(error, self._clock())
                 self._note("三轴采集失败：%s" % error)
                 return
             if generation != self.current_generation():
@@ -732,7 +819,15 @@ class TraySnapshotSource:
             self._snapshot_at = self._clock()
             self._snapshot_generation = self.current_generation()
             self._error = ""
+            self.consecutive_failures = 0
+            self.last_failure_reason = ""
+            self.last_failure_at = None
             self.collect_count += 1
+            self._last_invalidation = None
+            self._note("三轴采集发布：task=%d elapsed=%.1fs generation=%r inflight=%d retired=%d"
+                       % (task_id, self._clock() - started_at,
+                          self._snapshot_generation, self._inflight_count,
+                          len(self._retired_tasks)))
             # 阶段 B：只有「完整三轴 + 可定位目标接口」的快照才有资格成为 LKG，
             # 与 is_auto_executable_snapshot 的 AUTO 授权判据保持同一套真值。
             if is_full_snapshot(snapshot) and is_auto_executable_snapshot(snapshot)[0]:
@@ -740,6 +835,12 @@ class TraySnapshotSource:
                 self._lkg_at = self._snapshot_at
                 self._lkg_external = self._snapshot_generation[0]
                 self._lkg_signature = signature
+
+    def _record_failure(self, reason: str, stamp: float) -> None:
+        """记录可聚合的采集故障，避免只留下无原因的代次递增。"""
+        self.last_failure_reason = str(reason or "")[:240]
+        self.last_failure_at = float(stamp)
+        self.consecutive_failures += 1
 
     # ---- 读取（非阻塞） ---- #
     @staticmethod

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import platform
 import re
@@ -479,10 +480,19 @@ def parse_dns_servers(payload: Any) -> List[Dict[str, Any]]:
     rows = []
     for row in _as_list(payload):
         addresses = _pick(row, "ServerAddresses") or []
-        if isinstance(addresses, str):
+        if not isinstance(addresses, (list, tuple)):
             addresses = [addresses]
+        normalized = []
+        for address in addresses:
+            text = str(address or "").strip()
+            try:
+                parsed = ipaddress.ip_address(text)
+            except ValueError:
+                continue
+            if parsed.version == 4 and text not in normalized:
+                normalized.append(text)
         rows.append({"if_index": _as_int(_pick(row, "InterfaceIndex", "ifIndex")),
-                     "server_addresses": list(addresses)})
+                     "server_addresses": normalized})
     return rows
 
 

@@ -119,6 +119,11 @@ def set_theme(mode):
 def bind_theme(widget, role, **info):
     """Tag a widget so apply_theme() can repaint it after a palette switch."""
     widget._campus_theme = (role, info)
+    if ctk is not None and isinstance(widget, ctk.CTkScrollableFrame):
+        # Its scrollbar is a sibling of the inner frame, so the normal tree
+        # walk cannot infer which page palette it belongs to.
+        widget._scrollbar._campus_theme = (
+            "scrollbar", {"console": bool(info.get("console"))})
     return widget
 
 
@@ -210,14 +215,15 @@ def apply_theme(*roots):
     for root in candidates:
         if root is None:
             continue
-        for widget in _walk(root):
+        for widget in (root, *_walk(root)):
             key = id(widget)
             if key in seen:
                 continue
             seen.add(key)
             # CTkScrollableFrame creates its CTkScrollbar internally without a theme
             # mark; colour it directly so scrollbars follow the active palette.
-            if ctk is not None and isinstance(widget, ctk.CTkScrollbar):
+            if (ctk is not None and isinstance(widget, ctk.CTkScrollbar)
+                    and not getattr(widget, "_campus_theme", None)):
                 try:
                     if widget.winfo_exists():
                         widget.configure(

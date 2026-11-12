@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -522,11 +523,15 @@ def test_ui63_manual_verification_runs_in_background_and_shows_sites(monkeypatch
     app = _make_app(monkeypatch)
     verifier = ScriptedVerifier(ok=True)
     app._path_verifier = verifier
+    fresh = snapshot(H, H)
+    app._snapshot_source = SimpleNamespace(
+        observe=lambda: ObservationResult(trusted=True, snapshot=fresh, age=0.0),
+        collect_now=lambda: fresh)
     # 先喂一份快照给整合层（真实入口是 _dual_path_step；这里用 public tick）。
     result = TickResult(at=10.0, mode=FailoverMode.AUTO,
                         state=FailoverState.ETHERNET_PRIMARY,
                         previous_state=FailoverState.ETHERNET_PRIMARY)
-    app.dual_path.tick(result, snapshot(H, H), trusted=True, now=10.0)
+    app.dual_path.tick(result, fresh, trusted=True, now=10.0)
 
     app.on_verify_now("wifi")
     assert wait_until(lambda: "wifi" in app.manual_verification), "手动验证未完成"
@@ -540,6 +545,10 @@ def test_ui63_manual_verification_runs_in_background_and_shows_sites(monkeypatch
 def test_ui64_manual_verification_without_interface_facts_is_fail_closed(monkeypatch):
     app = _make_app(monkeypatch)
     app._path_verifier = ScriptedVerifier()
+    app._snapshot_source = SimpleNamespace(
+        collect_now=lambda: None,
+        observe=lambda: ObservationResult(trusted=False, snapshot=None,
+                                          reason="SNAPSHOT_NO_DATA"))
     notes = []
     monkeypatch.setattr(app, "notify", lambda title, body="": notes.append(title))
     app.on_verify_now("wifi")                 # 从未观测 ⇒ 缺 ifIndex/源地址/DNS

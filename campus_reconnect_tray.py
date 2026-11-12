@@ -63,7 +63,8 @@ except ImportError:  # Linux 离线测试：winreg 只在 Windows 存在
     winreg = None  # type: ignore[assignment]
 from PIL import Image, ImageDraw
 
-from campus_core import (E_CRED_BACKEND, E_CRED_MISSING, SCHEMA_VERSION,
+from campus_core import (E_AUTH_CAPTCHA, E_AUTH_REJECTED, E_CRED_BACKEND,
+                         E_CRED_MISSING, SCHEMA_VERSION,
                          CredentialClear, CredentialLoad, CredentialSave,
                          ProxyApplyResult, RepairAdapters, RepairOptions,
                          TimerTable, __version__, repair_service,
@@ -75,7 +76,7 @@ from campus_reconnect import (VERIFY_DNS_DEGRADED,
                               internet_ok, ip_channel_ok, portal_login,
                               portal_reachable,
                               resolve_port, setup_logging, verify_internet,
-                              wifi_reconnect, wifi_state)
+                              wifi_reconnect, wifi_state, PORTAL_ROOT)
 from campus_windows import CredentialStore, ProxyController, default_refresh
 from campus_install import data_directory, migrate_config, previous_install_directory
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
@@ -85,6 +86,8 @@ from campus_tray_observer import (MODE_DEGRADED, MODE_REFUSED,
                                   is_auto_executable_snapshot,
                                   is_full_snapshot)
 from campus_failover import FailoverMode, FailoverPolicy, PATH_LABEL
+from campus_dual_path import (path_request_failure_reason,
+                               path_request_from_snapshot)
 from campus_network import HealthState
 from campus_remote import (MonitorWatchdog, RemoteSafetyGuard,
                            apply_watchdog_decision, build_windows_remote_ops)
@@ -705,6 +708,7 @@ class TrayApp:
         self._last_result = None
         #: Edge 兜底：同一故障周期只自动打开一次（F19）；手动按钮可再次打开。
         self._edge_opened_this_cycle = False
+        self._lifeline_auth_notified = False
         #: V0.4-1：**本「在线段」**是否已做过连接后真实上网校验（进入在线段校验一次，
         #: 判为离线时重置 ⇒ 掉线后再连上/重连成功会重新校验）。
         self._online_verified = False
@@ -1159,6 +1163,8 @@ class TrayApp:
 
     def _uu_recovery_after_verification(self, follow, verification):
         """恢复流水线的**最后一步**：验证通过 ⇒ 清退重启 UU 远程（默认关闭）。"""
+        if self.get_config().get("lifeline_enabled", False):
+            return  # online guard owns recovery; interface checks only supply evidence
         request = getattr(follow, "uu_request", None)
         if request is None:
             return
@@ -1904,15 +1910,75 @@ class TrayApp:
         except Exception as exc:
             self.log.warning("构造接口受限验证请求异常：%s", type(exc).__name__)
             request = None
-        if request is None:
-            self.notify("无法验证",
-                        "缺少 %s 的接口事实（ifIndex / 源地址 / 该接口 DNS）："
-                        "按 fail-closed 不发起探测" % PATH_LABEL.get(role, role))
+        # A request built from the controller is only usable when it still
+        # refers to the current trusted observation. DHCP/source changes must
+        # force a fresh read instead of putting stale evidence in the ledger.
+        fresh = False
+        try:
+            observation = self.snapshot_source().observe()
+            fresh = bool(getattr(observation, "trusted", False))
+            fresh = fresh and getattr(observation, "snapshot", None) is controller.last_snapshot
+            age = getattr(observation, "age", None)
+            fresh = fresh and (age is None or age <= float(self.config.get(
+                "snapshot_max_age", SNAPSHOT_MAX_AGE)))
+        except Exception as exc:
+            self.log.info("读取手动验证新鲜度失败：%s", type(exc).__name__)
+        if request is None or not fresh:
+            self.notify("暂时无法验证",
+                        "正在读取 %s 的最新连接信息，随后自动验证；"
+                        "如果仍缺少接口信息，助手会继续后台监测。"
+                        % PATH_LABEL.get(role, role))
+            self._refresh_then_verify_async(role)
             return
         self._manual_verify_async(role, request)
         self.notify("正在验证",
                     "已请求 %s 的接口受限验证（后台线程，只看真实上网结果）"
                     % PATH_LABEL.get(role, role))
+
+    def _refresh_then_verify_async(self, role: str) -> None:
+        """手动验证缺少快照时先做一次只读刷新，再决定是否探测。
+
+        旧实现直接把「尚未完成后台采集」显示成缺少接口，用户只能重复点击。
+        刷新在短命后台线程执行；仍缺事实时给出具体缺项，继续严格 fail-closed。
+        """
+        busy = getattr(self, "_manual_verify_refresh_busy", None)
+        if busy is None:
+            busy = self._manual_verify_refresh_busy = threading.Event()
+        if busy.is_set():
+            return
+        busy.set()
+
+        def _run():
+            try:
+                source = self.snapshot_source()
+                source.collect_now()
+                observation = source.observe()
+                snapshot = (observation.snapshot
+                            if getattr(observation, "trusted", False)
+                            else None)
+                request = path_request_from_snapshot(
+                    snapshot, role,
+                    generation=int(getattr(self.dual_path, "network_epoch", 0)))
+                if request is None:
+                    reason = path_request_failure_reason(snapshot, role)
+                    self.notify(
+                        "暂时无法验证",
+                        "%s；已保留安全限制，不会猜测接口或使用以太网代替 Wi-Fi。"
+                        % (reason or "Wi-Fi 信息尚未完整采集"))
+                    return
+                self._manual_verify_async(role, request)
+                self.notify("正在验证",
+                            "已读取最新 %s 接口信息，开始后台验证。"
+                            % PATH_LABEL.get(role, role))
+            except Exception as exc:
+                self.log.warning("刷新 %s 接口信息失败：%s",
+                                 role, type(exc).__name__)
+                self.notify("暂时无法验证", "网络信息读取失败，助手会在后台继续监测。")
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-manual-verify-refresh").start()
 
     def _manual_verify_async(self, role: str, request) -> None:
         """在独立短命线程里执行一次**手动**接口受限验证，并把证据交回整合层。"""
@@ -1931,7 +1997,9 @@ class TrayApp:
             else:
                 self.log.warning("手动验证 %s 未通过：%s", role, result.reason)
             try:
-                follow = controller.on_verification(result, now=time.monotonic())
+                follow = controller.on_verification(
+                    result, now=time.monotonic(),
+                    request_epoch=getattr(request, "network_generation", None))
             except Exception as exc:
                 self.log.warning("手动验证结果回灌异常：%s", type(exc).__name__)
                 return
@@ -2520,22 +2588,41 @@ class TrayApp:
             self._timeline_reconnect(False, detail, elapsed)
 
     def _edge_note(self, cfg) -> str:
-        """按结果如实报告 Edge 兜底；仅在需人工处理时触发，且同周期限一次（F19）。"""
-        if not cfg.get("browser_fallback"):
-            return ""
+        """认证失败时给普通用户明确的人工登录提示（同周期限一次）。
+
+        Portal 的不同实现可能只返回 ``E_AUTH_*``，也可能在 SNNU 专用链路
+        中返回 ``E_SNNU_AUTH_FAILED``。两类都表示自动认证不能继续，不能把
+        它们当成普通网络探测失败而静默重试。
+        """
         result = self._last_result
+        error_code = str(getattr(result, "error_code", "") or "").upper()
+        detail = str(getattr(result, "detail", "") or "").upper()
         needs_user = bool(getattr(result, "needs_user", False))
-        if not needs_user:
+        auth_failed = (error_code in (E_AUTH_REJECTED, E_AUTH_CAPTCHA,
+                                      "E_SNNU_AUTH_FAILED")
+                       or "E_SNNU_AUTH_FAILED" in detail)
+        if not (needs_user or auth_failed):
             return ""   # 非人工处理类故障（如探测不可信）不打开浏览器
+        if not cfg.get("browser_fallback"):
+            return "\n校园网认证失败，请打开登录页手动登录：%s" % PORTAL_ROOT
         if self._cancelled():
-            return "\n已取消，未打开 Edge"
+            return "\n校园网认证失败，请打开登录页手动登录：%s" % PORTAL_ROOT
         if self._edge_opened_this_cycle:
-            return "\n本故障周期已打开过 Edge，未重复打开"
+            return ("\n本故障周期已打开过 Edge，未重复打开；"
+                    "校园网认证失败，请完成手动登录")
         launch = edge_fallback(self.log)
         self._edge_opened_this_cycle = True
         if getattr(launch, "launched", False):
-            return "\n已打开 Edge 供手动登录"
-        return "\n未能自动打开 Edge（可手动访问 Portal 登录页）"
+            return "\n校园网认证失败，已打开登录页，请完成手动登录"
+        return "\n校园网认证失败，请手动打开登录页：%s" % PORTAL_ROOT
+
+    def on_open_portal(self, icon=None, item=None):
+        """显式打开校园网登录页；只由用户点击触发，不由后台监测调用。"""
+        launch = edge_fallback(self.log, force=True)
+        if getattr(launch, "launched", False):
+            self.notify("校园网登录", "已打开登录页，请完成账号、密码和验证码填写")
+        else:
+            self.notify("校园网登录", "请手动打开登录页：%s" % PORTAL_ROOT)
 
     def _apply_consent(self, value, save=False):
         """用户显式改变代理授权：提升授权版本，使过期的询问结果失效（F12）。"""
@@ -2741,7 +2828,15 @@ class TrayApp:
             return next_probe
         if self.config.get("lifeline_enabled", False):
             self._lifeline_was_enabled = True
-            self._observe_snapshot()  # Read-only interface data for the dashboard.
+            observation = self._observe_snapshot()
+            if observation is not None and observation.trusted:
+                # 在线守护走独立恢复调度，但两条物理链路仍要独立验证。
+                # 不推进 failover、不执行路由/认证计划，UU 仍由守护链路负责。
+                from campus_failover import TickResult
+                self._dual_path_step(
+                    now, observation.snapshot, trusted=True,
+                    result=TickResult(at=now, mode=FailoverMode.MONITOR,
+                                      state=self.failover.manager.state))
             self._lifeline_tick()
             return self._next_probe_time(now)
         if self._lifeline_busy.is_set():
@@ -3334,12 +3429,8 @@ class TrayApp:
         if self._proxy_failure_count >= 3 and now - self._proxy_restart_at >= 300:
             self._proxy_restart_at = now
             self._proxy_failure_count = 0
-            if self._automatic_setup is None:
-                from campus_auto_setup import windows_setup
-                self._automatic_setup = windows_setup(cancelled=lambda: self._cancelled()
-                    or not self.get_config().get("automatic_proxy_enabled", True))
-            self._automatic_setup_message = "正在恢复联网软件"
-            self._automatic_setup.run(restart_client=True)
+            self._automatic_setup_message = "联网软件连接异常，已保留客户端及原有配置"
+            self.log.warning("[代理守护] 连续三次代理探测失败：保留客户端，不自动停止或拉起窗口")
         return False
 
     def _lifeline_tick(self):
@@ -3378,6 +3469,18 @@ class TrayApp:
                     session, RepairOptions.from_mapping(cfg), time.monotonic,
                     adapters, get_credentials,
                     cancelled=self._cancelled, sleep=self.stop_event.wait, log=self.log)
+            self._last_result = result
+            error_code = str(getattr(result, "error_code", "") or "").upper()
+            detail_upper = str(getattr(result, "detail", "") or "").upper()
+            if (getattr(result, "needs_user", False)
+                    or error_code in (E_AUTH_REJECTED, E_AUTH_CAPTCHA, "E_SNNU_AUTH_FAILED")
+                    or "E_SNNU_AUTH_FAILED" in detail_upper):
+                if not self._lifeline_auth_notified:
+                    self._lifeline_auth_notified = True
+                    self._ui_post(lambda: self.notify(
+                        "校园网需要手动登录",
+                        "自动登录未完成，请打开校园网登录页填写账号、密码和验证码：%s"
+                        % PORTAL_ROOT))
             return result.ok, result.detail
 
         def run():
@@ -3411,6 +3514,8 @@ class TrayApp:
                 self._lifeline_observed_at = time.monotonic()
                 self._last_system_probe = (self._lifeline.last_network is True, "三层恢复独立公网校验")
                 healthy = self._lifeline.last_network is True and self._lifeline.last_uu is True
+                if healthy:
+                    self._lifeline_auth_notified = False
                 self.set_state("online" if healthy else "reconnecting",
                                self._lifeline.detail)
             except Exception as exc:
@@ -3900,6 +4005,7 @@ class TrayApp:
                              lambda icon, item: self.on_verify_now("ethernet")),
             pystray.MenuItem("立即验证 SNNU Wi-Fi",
                              lambda icon, item: self.on_verify_now("wifi")),
+            pystray.MenuItem("打开校园网登录页", self.on_open_portal),
             pystray.MenuItem("重启 UU Remote（手动）", self.on_restart_uu_remote),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("运行模式", mode_menu),

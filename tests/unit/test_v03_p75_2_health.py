@@ -8,7 +8,7 @@ from campus_network import HealthAxis, HealthState, InterfaceHealthChecker, eval
 from campus_tray_observer import is_auto_executable_snapshot
 from tests.fakes import FakeProbeEngine
 from tests.unit.test_v03_p1_health import (
-    ETH_IP, WIFI_IP, ETH_ROUTE, WIFI_ROUTE, _report, _healthy_engine,
+    ETH_ADAPTER, ETH_IP, WIFI_IP, ETH_ROUTE, WIFI_ROUTE, _report, _healthy_engine,
 )
 
 
@@ -117,6 +117,29 @@ def test_dns_config_collection_and_interface_selection():
     assert _interface_dns(report, 5) == ["10.0.0.1"]
     assert report.to_dict()["dns_servers"] == report.dns_servers
     assert "dns_servers" in report.commands_executed
+
+
+def test_wifi_is_evaluated_when_ethernet_is_down():
+    """有线断开不得短路 Wi-Fi 轴；Wi-Fi 仍使用自己的接口证据。"""
+    engine = _healthy_engine(FakeProbeEngine())
+    report = _report(
+        eth=dict(ETH_ADAPTER, Status="Disconnected"),
+        ips=[WIFI_IP], routes=[WIFI_ROUTE])
+    report.dns_servers = [{"if_index": 5, "server_addresses": ["10.0.0.1"]}]
+    snapshot = evaluate(report, engine)
+    assert snapshot.ethernet.state is HealthState.LINK_DOWN
+    assert snapshot.wifi.state is HealthState.HEALTHY
+    assert snapshot.recommendation.preferred == "wifi"
+    assert engine.calls["tcp"], "Wi-Fi 轴未独立发起探测"
+
+
+def test_wifi_missing_interface_facts_remains_fail_closed_with_reason():
+    from campus_dual_path import path_request_failure_reason, path_request_from_snapshot
+    report = _report(ips=[ETH_IP, WIFI_IP], routes=[ETH_ROUTE, WIFI_ROUTE])
+    report.dns_servers = []
+    snapshot = evaluate(report, _healthy_engine(FakeProbeEngine()))
+    assert path_request_from_snapshot(snapshot, "wifi") is None
+    assert path_request_failure_reason(snapshot, "wifi") == "缺少该接口 DNS"
 
 
 def test_plain_http_portal_probe_is_available_without_disabling_tls():

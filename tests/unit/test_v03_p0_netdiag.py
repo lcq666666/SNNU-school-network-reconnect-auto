@@ -456,6 +456,16 @@ def test_wifi_target_mismatch_is_flagged():
     assert wifi["interfaces"][0]["matches_target"] is False
 
 
+def test_dns_parser_normalizes_singleton_and_discards_non_ipv4_values():
+    rows = netdiag.parse_dns_servers(
+        '{"InterfaceIndex":5,"ServerAddresses":"10.0.0.1"}')
+    assert rows == [{"if_index": 5, "server_addresses": ["10.0.0.1"]}]
+    rows = netdiag.parse_dns_servers(
+        _json({"InterfaceIndex": 5,
+               "ServerAddresses": ["10.0.0.1", "::1", "bad", "10.0.0.1"]}))
+    assert rows[0]["server_addresses"] == ["10.0.0.1"]
+
+
 # --------------------------------------------------------------------------- #
 # 只读安全自检（防止有人日后往命令表里混入写命令）
 # --------------------------------------------------------------------------- #

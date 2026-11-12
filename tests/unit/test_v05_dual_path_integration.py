@@ -779,6 +779,14 @@ def test_request_from_snapshot_requires_interface_ip_and_dns():
     assert dp.path_request_from_snapshot(snapshot(H, H), "loopback") is None
 
 
+def test_request_failure_reason_names_the_missing_wifi_fact():
+    assert dp.path_request_failure_reason(
+        snapshot(H, H, wifi_dns=()), PATH_WIFI) == "缺少该接口 DNS"
+    assert dp.path_request_failure_reason(
+        snapshot(H, H, wifi_ip=""), PATH_WIFI) == "缺少源地址"
+    assert dp.path_request_failure_reason(snapshot(H, None), PATH_WIFI) == "Wi-Fi轴未采集"
+
+
 def test_light_gate_verification_only_probes_the_gate_site():
     """轻量闸门确认（kill 前再确认）只跑闸门一站，仍走接口受限通道。"""
     session = FakeSession()

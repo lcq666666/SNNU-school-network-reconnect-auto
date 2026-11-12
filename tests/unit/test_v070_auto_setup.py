@@ -26,7 +26,10 @@ def setup(tmp_path):
     compat, root, registry = fixture(tmp_path)
     lifecycle = Lifecycle()
     compat.client_running = lambda: lifecycle.running
-    return AutomaticSetup(compat, lambda: [root], lifecycle), lifecycle, root, registry
+    # Explicit opt-in exercises the transactional manual restart path. Runtime
+    # windows_setup keeps the default False and never interrupts a running GUI.
+    return AutomaticSetup(compat, lambda: [root], lifecycle,
+                          allow_client_restart=True), lifecycle, root, registry
 
 
 def test_background_setup_stops_client_backs_up_then_restores_it(tmp_path):
@@ -151,7 +154,7 @@ def test_background_setup_serializes_with_recovery_and_backs_off(monkeypatch):
     assert not app._repair_busy.is_set()
 
 
-def test_proxy_failures_require_three_samples_and_restart_cooldown(monkeypatch):
+def test_proxy_failures_never_restart_or_open_the_client(monkeypatch):
     import campus_reconnect_tray as tray
     app = tray.TrayApp(logging.getLogger("campus"), config=dict(tray.DEFAULT_CONFIG))
     app._observed_proxy_endpoint = lambda: "127.0.0.1:8118"
@@ -169,10 +172,10 @@ def test_proxy_failures_require_three_samples_and_restart_cooldown(monkeypatch):
     app._guard_proxy_health()
     assert calls == []
     app._guard_proxy_health()
-    assert calls == [{"restart_client": True}]
+    assert calls == []
     for _ in range(5):
         app._guard_proxy_health()
-    assert len(calls) == 1
+    assert calls == []
     monkeypatch.setattr(tray, "probe_via_proxy", lambda *a: SimpleNamespace(proxy_ok=True))
     assert app._guard_proxy_health()
     assert app._proxy_failure_count == 0
