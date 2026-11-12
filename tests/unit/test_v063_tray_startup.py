@@ -36,7 +36,16 @@ def test_background_duplicate_exits_without_dialog(monkeypatch):
 
 
 @pytest.mark.parametrize(("args", "open_dashboard"), [([], True), (["--background"], False)])
-def test_manual_start_queues_dashboard_after_starting_tray(monkeypatch, args, open_dashboard):
+@pytest.mark.parametrize("packaged", [False, True])
+def test_manual_start_queues_dashboard_after_starting_tray(monkeypatch, args, open_dashboard, packaged):
+    import campus_resilience_windows as native
+    monkeypatch.setattr(tray.sys, "frozen", packaged, raising=False)
+    monkeypatch.setattr(tray, "get_autostart_command", lambda: '"C:/old/CampusReconnect.exe" --background')
+    monkeypatch.setattr(tray, "autostart_matches_current", lambda: False)
+    monkeypatch.setattr(tray, "load_config", lambda: dict(tray.DEFAULT_CONFIG))
+    monkeypatch.setattr(tray, "migrate_config", Mock())
+    monkeypatch.setattr(tray, "set_autostart", Mock())
+    monkeypatch.setattr(native, "recover_pending_proxy", Mock())
     monkeypatch.setattr(tray, "setup_logging", Mock())
     monkeypatch.setattr(tray.engine, "claim_single_instance", Mock(
         return_value=SingleInstanceResult(ok=True)))
@@ -48,6 +57,8 @@ def test_manual_start_queues_dashboard_after_starting_tray(monkeypatch, args, op
     monkeypatch.setattr(tray, "TrayApp", Mock(return_value=app))
 
     assert tray.main(args) == 0
+    assert tray.migrate_config.call_count == int(packaged)
+    assert tray.set_autostart.call_count == int(packaged)
     app.start.assert_called_once_with()
     assert app.on_dashboard.call_count == int(open_dashboard)
     if open_dashboard:

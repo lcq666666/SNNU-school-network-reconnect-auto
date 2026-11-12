@@ -934,7 +934,8 @@ def test_t05_tray_background_verification_feeds_the_gate(monkeypatch):
 
     tick = app._dual_path_step(10.0, snap, trusted=True, result=result)
     assert tick.needs_verification
-    assert wait_until(lambda: len(verifier.calls) == len(tick.verify_requests)), \
+    assert wait_until(lambda: len(verifier.calls) == len(tick.verify_requests)
+                      and app.dual_path.gate.verified_for(PATH_WIFI) is not None), \
         "后台验证线程未完成本轮接口受限验证"
 
     request = [r for r in verifier.calls if r.role == PATH_WIFI][0]

@@ -4662,19 +4662,21 @@ def main(argv=None) -> int:
     previous = previous_install_directory(old_command)
     if previous is not None:
         candidates.append(previous / "tray_config.json")
-    migrate_config(Path(CONFIG_FILE), candidates)
+    packaged = bool(getattr(sys, "frozen", False))
+    if packaged:
+        migrate_config(Path(CONFIG_FILE), candidates)
     try:
         from campus_resilience_windows import recover_pending_proxy
         recover_pending_proxy()
     except Exception as exc:
         log.error("上次代理配置恢复未完成：%s", type(exc).__name__)
-    if previous is not None and not autostart_matches_current():
+    if packaged and previous is not None and not autostart_matches_current():
         if not set_autostart(True):
             log.warning("旧版开机自启迁移失败")
     root = tk.Tk()
     root.withdraw()
     boot_config = load_config()
-    if (args.background and args.update_receipt is None and boot_config.get("lifeline_enabled", False)
+    if (packaged and args.background and args.update_receipt is None and boot_config.get("lifeline_enabled", False)
             and boot_config.get("lock_after_autologon", True)):
         from campus_boot import autologon_ready, lock_after_boot
         if autologon_ready():
