@@ -622,6 +622,33 @@ def test_power_settings_action_opens_windows_sleep_page(monkeypatch):
     assert opened == ["ms-settings:powersleep"]
 
 
+def test_power_guard_action_applies_and_rechecks_in_background(monkeypatch, tmp_path):
+    app = _make_app(monkeypatch, remote_guard=True)
+    import campus_install
+    import campus_windows_guard
+
+    monkeypatch.setattr(campus_install, "data_directory", lambda: tmp_path)
+    calls = []
+    monkeypatch.setattr(campus_windows_guard, "configure_power",
+                        lambda *, backup_path: calls.append(backup_path) or
+                        SimpleNamespace(power=True, detail="已应用"))
+    report = SimpleNamespace(items=[SimpleNamespace(key="sleep", status="PASS")])
+    refreshed = []
+    monkeypatch.setattr(app, "startup_readiness_check",
+                        lambda: refreshed.append(True) or report)
+    notices = []
+    monkeypatch.setattr(app, "notify",
+                        lambda *args, **kwargs: notices.append(args))
+
+    app.on_apply_power_guard()
+
+    assert wait_until(lambda: not app._power_guard_busy.is_set())
+    assert calls == [tmp_path / "power-guard-backup.json"]
+    assert refreshed == [True]
+    assert notices == [("睡眠保护已应用",
+                        "当前电源计划已关闭睡眠/休眠超时，原设置已备份。")]
+
+
 def test_notification_click_action_is_bound_to_tray_icon(monkeypatch):
     app = _make_app(monkeypatch)
     bound = []
@@ -654,7 +681,7 @@ def test_windows_balloon_click_dispatches_only_attached_action():
     assert calls == ["opened"]
 
 
-def test_sleep_readiness_notification_opens_power_settings(monkeypatch):
+def test_sleep_readiness_notification_applies_power_guard_once_per_state(monkeypatch):
     app = _make_app(monkeypatch, remote_guard=True)
     item = SimpleNamespace(key="sleep", status="ACTION")
     report = SimpleNamespace(
@@ -666,17 +693,23 @@ def test_sleep_readiness_notification_opens_power_settings(monkeypatch):
     notices = []
     monkeypatch.setattr(app, "notify",
                         lambda *args, **kwargs: notices.append((args, kwargs)))
-    opened = []
-    monkeypatch.setattr(app, "_update_opener",
-                        lambda uri: opened.append(uri) or True)
+    applied = []
+    monkeypatch.setattr(app, "on_apply_power_guard",
+                        lambda: applied.append("apply"))
 
     app.startup_readiness_check()
+    app.startup_readiness_check()
 
+    assert len(notices) == 1, "同一电源缺口不应每轮重复弹窗"
     args, kwargs = notices[0]
     assert args[0] == "在线保护需要处理"
-    assert "点击此通知" in args[1]
+    assert "立即应用电源保护" in args[1]
     kwargs["on_click"]()
-    assert opened == ["ms-settings:powersleep"]
+    assert applied == ["apply"]
+
+    report.warnings = ["其他问题"]
+    app.startup_readiness_check()
+    assert len(notices) == 2, "告警内容改变后应再次提醒"
 
 
 def test_ui66_manual_uu_restart_aborts_when_verification_fails(monkeypatch):

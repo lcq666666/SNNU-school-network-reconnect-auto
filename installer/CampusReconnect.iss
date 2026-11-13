@@ -1,6 +1,6 @@
 ; CampusReconnect standard per-user Windows installer.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.9.3"
+  #define MyAppVersion "0.9.4"
 #endif
 
 #define MyAppName "校园网自动重连助手"

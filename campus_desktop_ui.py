@@ -718,8 +718,11 @@ def build_recovery_page(app, body, refs):
                               wraplength=520, justify="left")
     refs["readiness"].pack(fill="x", pady=(8, 0))
     refs["sleep_action"] = button(
-        block, "打开电源设置", app.on_open_power_settings)
+        block, "一键关闭睡眠/休眠", app.on_apply_power_guard)
     refs["sleep_action"].pack_forget()
+    refs["sleep_settings_action"] = button(
+        block, "打开电源设置", app.on_open_power_settings)
+    refs["sleep_settings_action"].pack_forget()
     divider(body).pack(fill="x", padx=24, pady=(10, 0))
     refs["steps"] = {}
     for index, (key, title) in enumerate((("detect", "检查连接"),
@@ -1005,6 +1008,7 @@ def render_dashboard(app, state):
     if report is None:
         refs["readiness"].configure(text="正在自动检查系统与 UU…")
         _set_packed_visibility(refs["sleep_action"], False)
+        _set_packed_visibility(refs["sleep_settings_action"], False)
     else:
         lines = ["自动检查：%s" % ("全部通过" if report.automatic_ok else
                                   "有项目需要处理")]
@@ -1016,6 +1020,9 @@ def render_dashboard(app, state):
         refs["readiness"].configure(text="\n".join(lines))
         _set_packed_visibility(refs["sleep_action"], sleep_action_required(report),
                                anchor="w", pady=(8, 0))
+        _set_packed_visibility(refs["sleep_settings_action"],
+                               sleep_action_required(report),
+                               anchor="w", pady=(6, 0))
     lines = app._dashboard_timeline_lines(limit=10)
     refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines
                               else "尚无网络故障事件记录")

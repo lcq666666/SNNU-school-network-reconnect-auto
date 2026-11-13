@@ -810,6 +810,8 @@ class TrayApp:
         self.remote = None
         #: Latest automatic readiness report; presentation reads this only.
         self.readiness_report = None
+        self._last_readiness_warning_signature = None
+        self._power_guard_busy = threading.Event()
         #: 后台监控看门狗（纯逻辑；巡检线程由 :meth:`start_supervisor` 启动）。
         self._watchdog = MonitorWatchdog(
             heartbeat_timeout=WATCHDOG_HEARTBEAT_TIMEOUT,
@@ -2433,17 +2435,20 @@ class TrayApp:
             self.log.warning("无人值守需要处理：%s", warning)
         for note in report.manual_notes:
             self.log.info("无人值守待确认：%s", note)
-        if report.warnings:
+        warning_signature = tuple(report.warnings)
+        should_notify = warning_signature != self._last_readiness_warning_signature
+        self._last_readiness_warning_signature = warning_signature
+        if report.warnings and should_notify:
             sleep_needs_action = any(
                 item.key == "sleep" and item.status == "ACTION"
                 for item in report.items)
             self.notify("在线保护需要处理",
                         "；".join(report.warnings[:2])
-                        + ("。点击此通知打开电源设置。" if sleep_needs_action
+                        + ("。点击此通知立即应用电源保护。" if sleep_needs_action
                            else "。打开主界面 > 在线守护查看处理入口。"),
-                        on_click=(self.on_open_power_settings
+                        on_click=(self.on_apply_power_guard
                                   if sleep_needs_action else None))
-        else:
+        elif not report.warnings:
             self.log.info("无人值守自动检查通过；人工确认项已单独列出")
         return report
 
@@ -2470,6 +2475,42 @@ class TrayApp:
                 self.startup_readiness_check()
             except Exception as exc:
                 self.log.warning("就绪状态刷新失败：%s", type(exc).__name__)
+
+    def on_apply_power_guard(self):
+        """Apply the reversible sleep/hibernate guard off the UI thread."""
+        if self._power_guard_busy.is_set():
+            return
+        self._power_guard_busy.set()
+
+        def _run():
+            try:
+                from campus_install import data_directory
+                from campus_windows_guard import configure_power
+
+                result = configure_power(
+                    backup_path=data_directory() / "power-guard-backup.json")
+                if not result.power:
+                    self.notify("电源保护未完成", result.detail)
+                    return
+                report = self.startup_readiness_check()
+                sleep_item = next((item for item in report.items
+                                   if item.key == "sleep"), None) if report else None
+                if sleep_item is None or sleep_item.status == "PASS":
+                    self.notify("睡眠保护已应用",
+                                "当前电源计划已关闭睡眠/休眠超时，原设置已备份。")
+                else:
+                    self.notify("电源保护待确认",
+                                "已尝试修改，但复查仍发现睡眠设置未关闭。" +
+                                "可以打开 Windows 电源设置检查。")
+            except Exception as exc:
+                self.log.warning("应用电源保护失败：%s", type(exc).__name__)
+                self.notify("电源保护未完成",
+                            "本次没有确认修改成功，请打开 Windows 电源设置检查。")
+            finally:
+                self._power_guard_busy.clear()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="campus-power-guard").start()
 
     def on_open_power_settings(self):
         """Open the Windows power settings page for the actionable sleep item."""

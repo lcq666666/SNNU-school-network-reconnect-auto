@@ -105,7 +105,7 @@ def test_fusion_healthy_big_status_and_gauges():
         root.destroy()
 
 
-def test_recovery_page_sleep_action_opens_settings_only_when_needed(monkeypatch):
+def test_recovery_page_offers_power_fix_and_settings_only_when_needed(monkeypatch):
     app, root, refs = _open_app()
     opened = []
     monkeypatch.setattr(app, "_update_opener",
@@ -117,7 +117,10 @@ def test_recovery_page_sleep_action_opens_settings_only_when_needed(monkeypatch)
         root.update_idletasks()
         action = refs["sleep_action"]
         assert action.winfo_manager() == "pack"
-        action.invoke()
+        assert action.cget("text") == "一键关闭睡眠/休眠"
+        settings_action = refs["sleep_settings_action"]
+        assert settings_action.winfo_manager() == "pack"
+        settings_action.invoke()
         assert opened == ["ms-settings:powersleep"]
 
         app.readiness_report = ReadinessReport(items=[RemoteReadinessItem(
@@ -125,6 +128,7 @@ def test_recovery_page_sleep_action_opens_settings_only_when_needed(monkeypatch)
         app._render_dashboard_ctk(_state())
         root.update_idletasks()
         assert action.winfo_manager() == ""
+        assert settings_action.winfo_manager() == ""
     finally:
         app._close_dashboard()
         root.destroy()
