@@ -104,7 +104,7 @@ from campus_uu_recovery import (confirm_back as uu_confirm_back,
                                 tier2_processes as uu_tier2_processes)
 from campus_wifi_bringup import (build_snnu_open_profile_xml,
                                  run_bringup as wifi_run_bringup)
-from campus_update import (UPDATE_CHECK_INTERVAL_S,
+from campus_update import (UPDATE_CHECK_INTERVAL_S, UPDATE_RETRY_INTERVAL_S,
                            UPDATE_FIRST_CHECK_DELAY_S, check_latest,
                            is_newer, should_notify)
 
@@ -215,7 +215,7 @@ DEFAULT_CONFIG = {
     "lifeline_reboot_enabled": False,
     "lock_after_autologon": True,
     "autologon_prompted": False,
-    "update_check_enabled": True,  # 启动 60 秒后首次检查，之后每 6 小时
+    "update_check_enabled": True,  # 启动 15 秒后首次检查，失败 5 分钟重试
     "update_notified_tag": None,   # 气泡已弹过的版本 tag（同一版本只弹一次）
     "update_dismissed_tag": None,  # 用户点过“以后再说 / 下载更新”的版本 tag
 }
@@ -807,9 +807,14 @@ class TrayApp:
         self._update_busy = threading.Event()
         #: 最近一次检查线程（测试用 ``join`` 等它跑完；生产不依赖它）。
         self._update_thread = None
-        #: 下一次定时检查时刻（monotonic）；启动后 60 秒首次检查。
+        #: 兼容旧测试和“立即检查”按钮的下一次检查时刻。
         self._update_next_check_at = (time.monotonic()
                                       + UPDATE_FIRST_CHECK_DELAY_S)
+        #: 独立更新调度器；不依赖网络探测工作线程。
+        self._update_scheduler_thread = None
+        self._update_last_checked_at = None
+        self._update_last_reason = ""
+        self._update_last_check_ok = False
         #: 注入点：测试可替换为返回假 session 的工厂；默认用专用直连会话。
         self._update_session_factory = None
         #: 注入点：测试可替换为记录调用的 opener；默认打开系统浏览器。
@@ -2794,8 +2799,6 @@ class TrayApp:
                     if self.stop_event.is_set():
                         break
                     next_probe = self._dispatch(cmd, next_probe)
-                    # V0.6.2：更新检查挂在已有工作循环上，不另起常驻线程。
-                    self._maybe_check_update()
                 except Exception as exc:   # 工作单元整体异常边界（F02）
                     self._report_worker_error("工作单元异常", exc)
                     self._repair_busy.clear()
@@ -3279,8 +3282,8 @@ class TrayApp:
     def _maybe_check_update(self, now: float = None) -> None:
         """工作循环每轮调用：到点才触发一次检查，其余时间直接返回。
 
-        首次检查在启动后 60 秒，之后每 6 小时；开关关闭时只推迟下次
-        检查，不发请求。检查本身走独立短命线程，不阻塞探测循环。
+        兼容旧调用方的定时门；生产启动流程使用独立调度器。
+        检查本身走独立短命线程，不阻塞探测循环。
         """
         if self.stop_event.is_set():
             return
@@ -3302,10 +3305,13 @@ class TrayApp:
         横幅由 1 秒渲染周期读取 ``_update_info`` 后决定是否显示。
         """
         if self._update_busy.is_set():
+            self.log.debug("[更新] 已有检查在途，本次请求合并")
             return
         self._update_busy.set()
+        self.log.info("[更新] 开始检查最新版本")
 
         def _run():
+            session = None
             try:
                 factory = getattr(self, "_update_session_factory", None)
                 if factory is not None:
@@ -3319,13 +3325,49 @@ class TrayApp:
                         info, reason = check_latest(fallback)
                 self._on_update_checked(info, reason)
             except Exception as exc:  # noqa: BLE001 - 检查不得影响工作线程
-                self.log.info("[更新] 检查异常：%s", type(exc).__name__)
+                self._on_update_checked(None, "检查异常：%s" % type(exc).__name__)
             finally:
+                close = getattr(session, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        pass
                 self._update_busy.clear()
 
         thread = threading.Thread(target=_run, daemon=True,
                                   name="campus-update")
         self._update_thread = thread
+        thread.start()
+
+    def _start_update_scheduler(self) -> None:
+        """启动不依赖网络工作线程的更新检查调度器。
+
+        旧版本把检查挂在探测循环尾部；探测线程被长时间 I/O、恢复任务或
+        观测异常占住时，更新检查可能永远没有机会运行。调度器只负责等待、
+        发起短命检查线程和按结果选择下次间隔，不触碰 Tk 控件。
+        """
+        current = getattr(self, "_update_scheduler_thread", None)
+        if current is not None and current.is_alive():
+            return
+
+        def run():
+            if self.stop_event.wait(UPDATE_FIRST_CHECK_DELAY_S):
+                return
+            while not self.stop_event.is_set():
+                self._check_update_async()
+                # 等待本轮完成，避免失败重试和上一轮请求重叠。
+                while self._update_busy.is_set() and not self.stop_event.wait(0.25):
+                    pass
+                delay = (UPDATE_CHECK_INTERVAL_S
+                         if self._update_last_check_ok
+                         else UPDATE_RETRY_INTERVAL_S)
+                if self.stop_event.wait(delay):
+                    return
+
+        thread = threading.Thread(target=run, daemon=True,
+                                  name="campus-update-scheduler")
+        self._update_scheduler_thread = thread
         thread.start()
 
     def _on_update_checked(self, info, reason: str) -> None:
@@ -3337,11 +3379,18 @@ class TrayApp:
         不再弹）。是否显示横幅另由 ``update_dismissed_tag`` 决定。
         """
         if info is None:
+            self._update_last_check_ok = False
+            self._update_last_reason = reason or "未知错误"
+            self._update_last_checked_at = time.monotonic()
             self.log.info("[更新] 检查失败：%s", reason)
             return
+        self._update_last_check_ok = True
+        self._update_last_reason = ""
+        self._update_last_checked_at = time.monotonic()
         self._update_info = info
         if not should_notify(info, __version__,
                              self.config.get("update_notified_tag")):
+            self.log.info("[更新] 检查完成：当前已是 %s", info.tag)
             return
         self.log.info("[更新] 发现新版本 %s（当前 v%s）",
                       info.tag, __version__)
@@ -3713,7 +3762,12 @@ class TrayApp:
         """设置页“更新”区文案：当前版本与最新版本（只显示，不下载）。"""
         info = getattr(self, "_update_info", None)
         if info is None:
-            latest = "最新版本：尚未检查到（启动 60 秒后首次检查；失败只记日志）"
+            if self._update_busy.is_set():
+                latest = "最新版本：正在检查"
+            elif self._update_last_reason:
+                latest = "更新检查失败：%s（稍后自动重试）" % self._update_last_reason
+            else:
+                latest = "最新版本：尚未检查到（等待启动检查）"
         elif is_newer(info.tag, __version__):
             latest = "最新版本：%s（有更新可用）" % info.tag
         else:
@@ -4382,7 +4436,7 @@ class TrayApp:
         ttk.Label(diag, text="软件更新", font=("Microsoft YaHei", 10, "bold")).grid(
             row=11, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(
-            diag, text="自动检查更新（启动 60 秒后首次检查，之后每 6 小时）",
+            diag, text="自动检查更新（启动 15 秒后检查，失败 5 分钟重试）",
             variable=v_update).grid(row=12, column=0, columnspan=2, sticky="w")
         ttk.Label(diag, text=self._update_status_text(), justify="left",
                   foreground="#8b949e", wraplength=520).grid(
@@ -4558,6 +4612,7 @@ class TrayApp:
                                  self.build_menu())
         threading.Thread(target=self.icon.run, daemon=True).start()
         self._ensure_worker()
+        self._start_update_scheduler()
         threading.Timer(5.0, self._prompt_auto_switch_once).start()
         self._startup_timer = threading.Timer(2.0, self._startup_notify)
         self._startup_timer.daemon = True

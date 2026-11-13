@@ -15,8 +15,10 @@ import re
 
 UPDATE_REPO = "lcq666666/SNNU-school-network-reconnect-auto"
 UPDATE_API_URL = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
-#: 首次检查：启动后 60 秒（等网络稳定，不抢启动流程）。
-UPDATE_FIRST_CHECK_DELAY_S = 60.0
+#: 首次检查：启动后 15 秒。更新检查独立于网络探测循环，不阻塞启动。
+UPDATE_FIRST_CHECK_DELAY_S = 15.0
+#: 检查失败时的重试间隔。校园网 / GitHub 短暂不可用不应让用户等 6 小时。
+UPDATE_RETRY_INTERVAL_S = 300.0
 #: 之后每 6 小时检查一次。
 UPDATE_CHECK_INTERVAL_S = 6 * 3600.0
 #: 单次 GitHub API 请求超时（秒）。

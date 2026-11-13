@@ -243,7 +243,40 @@ def test_on_update_checked_failure_is_silent(monkeypatch):
     app._on_update_checked(None, "请求失败：ConnectTimeout")
     assert notified == []
     assert app._update_info is None
+    assert app._update_last_check_ok is False
+    assert "ConnectTimeout" in app._update_last_reason
     assert saved == []
+
+
+def test_update_scheduler_runs_independently_of_worker(monkeypatch):
+    app = _app()
+
+    class StopAfterOneWait:
+        def __init__(self):
+            self.waits = 0
+
+        def is_set(self):
+            return False
+
+        def wait(self, _timeout):
+            self.waits += 1
+            return self.waits >= 2
+
+    stop = StopAfterOneWait()
+    app.stop_event = stop
+    called = []
+
+    def check():
+        called.append(True)
+        app._update_last_check_ok = True
+
+    app._check_update_async = check
+    monkeypatch.setattr(tray, "UPDATE_FIRST_CHECK_DELAY_S", 0.0)
+    monkeypatch.setattr(tray, "UPDATE_CHECK_INTERVAL_S", 0.0)
+    app._start_update_scheduler()
+    app._update_scheduler_thread.join(timeout=2)
+    assert not app._update_scheduler_thread.is_alive()
+    assert called == [True]
 
 
 def test_update_status_text_variants():
