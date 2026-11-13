@@ -111,6 +111,15 @@ def test_reboot_requires_enabled_and_startup_readiness(tmp_path):
     assert calls.count("repair") == repairs + 1
 
 
+def test_first_layer_uses_network_only_action_when_supplied(tmp_path):
+    calls = []
+    controller, _, _ = make_controller(tmp_path)
+    controller.ops.network_repair = lambda: calls.append("network-only") or (False, "wifi retry")
+    controller.tick(1000)
+    controller.tick(1031)
+    assert calls == ["network-only"]
+
+
 def test_migration_prefers_existing_stable_config(tmp_path):
     from campus_install import migrate_config
     source = tmp_path / "old.json"

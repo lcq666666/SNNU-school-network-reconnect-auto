@@ -149,17 +149,18 @@ def check_latest(session, repo: str = UPDATE_REPO):
         return None, reason
 
 
-def download_update(session, info, directory, progress=None) -> Path:
-    """Download the tagged executable and verify its release SHA256 sidecar."""
+def _download_verified_asset(session, info, directory, filename, progress=None) -> Path:
+    """Download one release asset and validate its sidecar and PE header."""
     if parse_version(info.tag) is None or not re.fullmatch(r"v?\d+(?:\.\d+){0,2}", info.tag):
         raise ValueError("更新版本号无效")
     base = "https://github.com/%s/releases/download/%s/" % (UPDATE_REPO, info.tag)
-    checksum = session.get(base + "CampusReconnect.exe.sha256", timeout=(5, 20))
+    checksum = session.get(base + filename + ".sha256", timeout=(5, 20))
     try:
         if checksum.status_code != 200:
             raise ValueError("无法获取更新 SHA256 校验文件")
         match = re.fullmatch(
-            r"\s*([a-fA-F0-9]{64})\s+\*?CampusReconnect\.exe\s*(?:size=(\d+)\s*)?",
+            r"\s*([a-fA-F0-9]{64})\s+\*?" + re.escape(filename)
+            + r"\s*(?:size=(\d+)\s*)?",
             checksum.text)
         if match is None:
             raise ValueError("更新 SHA256 文件格式无效")
@@ -169,9 +170,9 @@ def download_update(session, info, directory, progress=None) -> Path:
         checksum.close()
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    temporary = directory / "CampusReconnect.download"
-    target = directory / "CampusReconnect.exe"
-    response = session.get(base + "CampusReconnect.exe", timeout=(5, 30), stream=True)
+    temporary = directory / (filename + ".download")
+    target = directory / filename
+    response = session.get(base + filename, timeout=(5, 30), stream=True)
     try:
         if response.status_code != 200:
             raise ValueError("更新下载失败 HTTP %s" % response.status_code)
@@ -205,3 +206,14 @@ def download_update(session, info, directory, progress=None) -> Path:
     finally:
         response.close()
         temporary.unlink(missing_ok=True)
+
+
+def download_update(session, info, directory, progress=None) -> Path:
+    """Download the tagged portable executable and verify its sidecar."""
+    return _download_verified_asset(session, info, directory, "CampusReconnect.exe", progress)
+
+
+def download_installer(session, info, directory, progress=None) -> Path:
+    """Download the standard installer and verify its sidecar."""
+    return _download_verified_asset(session, info, directory,
+                                    "CampusReconnectSetup.exe", progress)

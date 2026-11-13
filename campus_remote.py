@@ -52,6 +52,7 @@ __all__ = [
     "LISTEN_STATE", "LOG_KINDS", "WATCHDOG_ACTIONS", "DEFAULT_REMOTE_CLIENTS",
     "REMOTE_TRAY_MARKERS", "RemoteClientSpec", "RemoteProbe", "RemoteActivity",
     "RemoteStatus", "RemoteReadinessItem", "ReadinessReport", "RemoteOps",
+    "READINESS_PASS", "READINESS_ACTION", "READINESS_CHECKING", "READINESS_MANUAL",
     "RemoteSafetyGuard", "WatchdogDecision", "MonitorWatchdog",
     "RemoteEventLog", "record_tick_events", "apply_watchdog_decision",
     "build_windows_remote_ops", "format_remote_status", "format_readiness",
@@ -75,6 +76,11 @@ WATCHDOG_ACTIONS: Tuple[str, ...] = (
 
 #: 托盘自启项识别关键字（无人值守就绪自检用）。
 REMOTE_TRAY_MARKERS = ("campusreconnect", "campus_reconnect")
+
+READINESS_PASS = "PASS"
+READINESS_ACTION = "ACTION"
+READINESS_CHECKING = "CHECKING"
+READINESS_MANUAL = "MANUAL"
 
 
 @dataclass(frozen=True)
@@ -230,11 +236,28 @@ class RemoteReadinessItem:
     detail: str = ""
     manual: bool = False
     severity: str = "info"
+    status: str = ""
+    action: str = ""
+
+    def __post_init__(self):
+        if not self.status:
+            self.status = READINESS_MANUAL if self.manual else (
+                READINESS_PASS if self.ok else READINESS_ACTION)
+        if not self.action:
+            self.action = {
+                READINESS_PASS: "无需处理",
+                READINESS_MANUAL: "请在对应软件中确认",
+            }.get(self.status, "打开设置完成处理")
+
+    @property
+    def actionable(self) -> bool:
+        return self.status == READINESS_ACTION
 
     def to_dict(self) -> Dict[str, Any]:
         return {"key": self.key, "label": self.label, "ok": self.ok,
                 "detail": self.detail, "manual": self.manual,
-                "severity": self.severity}
+                "severity": self.severity, "status": self.status,
+                "action": self.action}
 
 
 @dataclass
@@ -246,18 +269,41 @@ class ReadinessReport:
 
     @property
     def ok(self) -> bool:
-        """全部**可自动判定**的项通过时为 ``True``（人工项不参与判定）。"""
-        return all(item.ok for item in self.items if not item.manual)
+        """兼容旧调用方；等同于 ``automatic_ok``。"""
+        return self.automatic_ok
+
+    @property
+    def automatic_ok(self) -> bool:
+        return bool(self.items) and all(
+            item.status == READINESS_PASS for item in self.items
+            if item.status != READINESS_MANUAL)
+
+    @property
+    def blocking_items(self) -> List[RemoteReadinessItem]:
+        return [item for item in self.items if item.status == READINESS_ACTION]
+
+    @property
+    def manual_items(self) -> List[RemoteReadinessItem]:
+        return [item for item in self.items if item.status == READINESS_MANUAL]
 
     @property
     def warnings(self) -> List[str]:
+        """Return only actionable failures; manual confirmations are not warnings."""
         return ["%s：%s" % (item.label, item.detail)
-                for item in self.items if not item.ok]
+                for item in self.blocking_items]
+
+    @property
+    def manual_notes(self) -> List[str]:
+        return ["%s：%s" % (item.label, item.detail)
+                for item in self.manual_items]
 
     def to_dict(self) -> Dict[str, Any]:
         return {"contract_version": self.contract_version, "ok": self.ok,
+                "automatic_ok": self.automatic_ok,
+                "blocking_items": [item.to_dict() for item in self.blocking_items],
+                "manual_items": [item.to_dict() for item in self.manual_items],
                 "items": [item.to_dict() for item in self.items],
-                "warnings": self.warnings}
+                "warnings": self.warnings, "manual_notes": self.manual_notes}
 
 
 # --------------------------------------------------------------------------- #
@@ -459,7 +505,8 @@ class RemoteSafetyGuard:
         items: List[RemoteReadinessItem] = []
         if data is None:
             items.append(RemoteReadinessItem(
-                "probe", "远控探测", False, "未采集到探测数据", severity="warn"))
+                "probe", "远控探测", False, "正在等待首次探测结果",
+                status=READINESS_CHECKING, action="等待自动检查完成", severity="warn"))
             report = ReadinessReport(items=items)
             self.last_readiness = report
             return report
@@ -467,17 +514,18 @@ class RemoteSafetyGuard:
         items.append(self._sleep_item(data))
         items.append(self._logon_item(data))
         items.append(self._remote_client_item(data))
+        items.append(self._remote_external_item(data))
         items.append(self._tray_autostart_item(data))
         items.append(self._credentials_item())
         items.append(RemoteReadinessItem(
             "external_recovery", "外部进程恢复机制", False,
             "进程内看门狗无法应对整个进程崩溃：需人工配置并验证独立启动/服务恢复机制",
-            manual=True, severity="manual"))
+            manual=True, status=READINESS_MANUAL, action="需要人工确认", severity="manual"))
         items.append(RemoteReadinessItem(
             "remote_reconnect", "远控客户端无人值守/自动重连", False,
             "需人工确认：远控客户端允许无人值守访问，且断线后能自动重连"
             "（无法程序化验证）",
-            manual=True, severity="manual"))
+            manual=True, status=READINESS_MANUAL, action="在 UU 客户端确认", severity="manual"))
         if data.error:
             items.append(RemoteReadinessItem(
                 "probe_error", "探测完整性", False, data.error, severity="warn"))
@@ -492,7 +540,8 @@ class RemoteSafetyGuard:
         if standby is None and hibernate is None:
             return RemoteReadinessItem(
                 "sleep", "睡眠/休眠", False,
-                "睡眠状态查询失败或无输出：请在电源选项中人工确认已关闭睡眠/休眠",
+                "睡眠状态查询失败或无输出：请在电源选项中确认",
+                action="重新检查电源设置",
                 severity="warn")
         ac_timeout = sleep.get("sleep_timeout_ac")
         dc_timeout = sleep.get("sleep_timeout_dc")
@@ -501,6 +550,7 @@ class RemoteSafetyGuard:
             return RemoteReadinessItem(
                 "sleep", "睡眠/休眠", False,
                 "睡眠能力可用且实际电源计划存在超时配置：需关闭睡眠/休眠",
+                action="自动关闭睡眠超时",
                 severity="warn")
         if standby or hibernate:
             return RemoteReadinessItem(
@@ -514,11 +564,12 @@ class RemoteSafetyGuard:
         if logon.get("auto_admin_logon"):
             return RemoteReadinessItem(
                 "auto_logon", "自动登录", True,
-                "AutoAdminLogon 已启用（用户=%s）" % (logon.get("user") or "?"))
+                "AutoAdminLogon 已启用（用户=%s）" % (logon.get("user") or "?"),
+                action="无需处理")
         return RemoteReadinessItem(
             "auto_logon", "自动登录", False,
             "AutoAdminLogon 未配置：Windows 重启后不会自动进入用户会话，"
-            "托盘与远控客户端不会自启", severity="warn")
+            "托盘与远控客户端不会自启", action="打开重启恢复设置", severity="warn")
 
     def _remote_client_item(self, probe: RemoteProbe) -> RemoteReadinessItem:
         keys, labels, _rows = _clients_of(probe, self.clients)
@@ -528,16 +579,33 @@ class RemoteSafetyGuard:
             detail = "已检测到运行中的远控客户端：%s" % running
             if autostart:
                 detail += "；自启项：%s" % ", ".join(autostart)
-            return RemoteReadinessItem("remote_client", "远控客户端", True, detail)
+            return RemoteReadinessItem("remote_client", "远控客户端", True, detail,
+                                       action="无需处理")
         if autostart:
             return RemoteReadinessItem(
                 "remote_client", "远控客户端", True,
                 "当前未运行，但存在自启项（%s）：重启后可由系统拉起"
-                % ", ".join(autostart))
+                % ", ".join(autostart), action="无需处理")
         return RemoteReadinessItem(
             "remote_client", "远控客户端", False,
             "未检测到已知远控客户端进程，也未发现对应自启项：无人值守将无法远程接入",
+            action="检查 UU 安装和自启",
             severity="warn")
+
+    def _remote_external_item(self, probe: RemoteProbe) -> RemoteReadinessItem:
+        """Check the observable external TCP/UDP leg independently of process state."""
+        established = [row for row in probe.ports
+                       if str(row.get("state") or "").lower() == "established"
+                       and str(row.get("remote_address") or "") not in
+                       ("", "0.0.0.0", "127.0.0.1", "::1")]
+        if established or probe.udp_endpoints:
+            return RemoteReadinessItem(
+                "remote_external", "UU 外部连接", True,
+                "已检测到外部 TCP/UDP 连接", action="无需处理")
+        return RemoteReadinessItem(
+            "remote_external", "UU 外部连接", False,
+            "未检测到 UU 外部 TCP/UDP 连接：远程接入可能不可用",
+            action="重新检查 UU 网络连接", severity="warn")
 
     def _tray_autostart_item(self, probe: RemoteProbe) -> RemoteReadinessItem:
         found = [entry for entry in probe.run_entries
@@ -548,30 +616,36 @@ class RemoteSafetyGuard:
             return RemoteReadinessItem(
                 "tray_autostart", "托盘自启", True,
                 "已配置自启项：%s"
-                % ", ".join(str(e.get("name") or "?") for e in found))
+                % ", ".join(str(e.get("name") or "?") for e in found),
+                action="无需处理")
         return RemoteReadinessItem(
             "tray_autostart", "托盘自启", False,
             "未发现 CampusReconnectTray 自启项：重启后监测不会自动运行",
+            action="自动开启助手自启",
             severity="warn")
 
     def _credentials_item(self) -> RemoteReadinessItem:
         if self.ops is None:
             return RemoteReadinessItem(
                 "credentials", "校园网凭据", False, "未注入凭据检查能力",
+                action="重新检查凭据",
                 severity="warn")
         try:
             present = bool(self.ops.credentials_present())
         except Exception as exc:
             return RemoteReadinessItem(
                 "credentials", "校园网凭据", False,
-                "凭据检查失败：%s" % type(exc).__name__, severity="warn")
+                "凭据检查失败：%s" % type(exc).__name__, action="重新检查凭据",
+                severity="warn")
         if present:
             return RemoteReadinessItem(
                 "credentials", "校园网凭据", True,
-                "Windows 凭据管理器中已保存账号密码（仅判断存在性）")
+                "Windows 凭据管理器中已保存账号密码（仅判断存在性）",
+                action="无需处理")
         return RemoteReadinessItem(
             "credentials", "校园网凭据", False,
-            "未找到已保存的校园网凭据：故障后无法自动认证", severity="warn")
+            "未找到已保存的校园网凭据：故障后无法自动认证",
+            action="设置校园网账号", severity="warn")
 
     @staticmethod
     def _autostart_entries(probe: RemoteProbe) -> List[str]:
@@ -861,7 +935,9 @@ def _read_command(runner: Any, name: str, pids: Optional[List[int]] = None) -> s
     """执行一条**只读**诊断命令并返回 stdout（失败返回空串）。"""
     from tools import netdiag
 
-    script = netdiag.COMMANDS[name]
+    script = netdiag.COMMANDS.get(name)
+    if script is None:
+        script = netdiag.READINESS_COMMANDS[name]
     if pids:
         script = script.replace("{pids}", ",".join(str(p) for p in pids))
     try:
@@ -895,6 +971,12 @@ def build_windows_remote_ops(runner: Any, *,
         if with_readiness:
             probe.sleep_states = netdiag.parse_powercfg(
                 _read_command(runner, "sleep_states"))
+            plan = netdiag.parse_powercfg(_read_command(runner, "power_plan"))
+            for key in ("standby_available", "hibernate_available",
+                        "sleep_timeout_ac", "sleep_timeout_dc",
+                        "hibernate_timeout_ac", "hibernate_timeout_dc"):
+                if key in plan:
+                    probe.sleep_states[key] = plan[key]
             probe.auto_logon = netdiag.parse_winlogon(
                 _read_command(runner, "winlogon"))
             probe.run_entries = netdiag.parse_run_entries(
@@ -953,9 +1035,17 @@ def format_remote_status(status: RemoteStatus, *,
 
 def format_readiness(report: ReadinessReport) -> str:
     """渲染无人值守就绪清单。"""
-    lines: List[str] = ["[无人值守就绪自检] %s"
-                        % ("通过（人工项除外）" if report.ok else "存在缺口")]
+    if report.automatic_ok:
+        headline = "自动检查通过"
+    elif report.blocking_items:
+        headline = "有项目需要处理"
+    else:
+        headline = "正在检查"
+    lines: List[str] = ["[无人值守就绪自检] %s" % headline]
     for item in report.items:
-        mark = "OK  " if item.ok else ("人工" if item.manual else "缺口")
-        lines.append("  [%s] %s：%s" % (mark, item.label, item.detail))
+        mark = {READINESS_PASS: "通过", READINESS_ACTION: "处理",
+                READINESS_CHECKING: "检查中", READINESS_MANUAL: "待确认"}.get(
+                    item.status, "状态")
+        lines.append("  [%s] %s：%s（%s）" % (mark, item.label,
+                                                item.detail, item.action))
     return "\n".join(lines)

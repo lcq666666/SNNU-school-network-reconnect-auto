@@ -519,6 +519,19 @@ def test_powercfg_parses_available_sleep_states():
     states = netdiag.parse_powercfg(POWERCFG_TEXT)
     assert states["standby_available"] is True
     assert states["hibernate_available"] is True
+
+
+def test_powercfg_query_parses_effective_timeout_indexes():
+    states = netdiag.parse_powercfg(
+        "Power Setting GUID (STANDBYIDLE)\n"
+        " Current AC Power Setting Index: 0x00000000\n"
+        " Current DC Power Setting Index: 0x00000000\n"
+        "Power Setting GUID (HIBERNATEIDLE)\n"
+        " Current AC Power Setting Index: 0x0000003c\n"
+        " Current DC Power Setting Index: 0x0000001e\n")
+    assert states["sleep_timeout_ac"] == 0
+    assert states["sleep_timeout_dc"] == 0
+    assert states["hibernate_timeout_ac"] == 60
     assert states["mentions_standby"] is True
 
 

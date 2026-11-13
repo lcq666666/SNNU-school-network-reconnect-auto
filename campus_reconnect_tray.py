@@ -214,6 +214,7 @@ DEFAULT_CONFIG = {
     "automatic_proxy_enabled": True,
     "lifeline_reboot_enabled": False,
     "lock_after_autologon": True,
+    "autologon_prompted": False,
     "update_check_enabled": True,  # 启动 60 秒后首次检查，之后每 6 小时
     "update_notified_tag": None,   # 气泡已弹过的版本 tag（同一版本只弹一次）
     "update_dismissed_tag": None,  # 用户点过“以后再说 / 下载更新”的版本 tag
@@ -497,7 +498,8 @@ def load_config() -> dict:
     cfg.update(_read_v06_keys(text))
     cfg.update(_read_update_keys(text))
     raw = _raw_config(text)
-    for key in ("lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon", "automatic_proxy_enabled"):
+    for key in ("lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon",
+                "automatic_proxy_enabled", "autologon_prompted"):
         cfg[key] = raw.get(key) if isinstance(raw.get(key), bool) else DEFAULT_CONFIG[key]
     if not result.ok:
         logger = logging.getLogger("campus")
@@ -770,6 +772,8 @@ class TrayApp:
         self._remote_probe_busy = threading.Event()
         #: 远程保障守卫（接线后非 ``None``）。
         self.remote = None
+        #: Latest automatic readiness report; presentation reads this only.
+        self.readiness_report = None
         #: 后台监控看门狗（纯逻辑；巡检线程由 :meth:`start_supervisor` 启动）。
         self._watchdog = MonitorWatchdog(
             heartbeat_timeout=WATCHDOG_HEARTBEAT_TIMEOUT,
@@ -786,6 +790,7 @@ class TrayApp:
         self._automatic_setup_armed = False
         self._automatic_setup_next = 0.0
         self._automatic_setup_message = "等待后台检查"
+        self._interactive_start = False
         self._automatic_setup = None
         self._proxy_failure_count = 0
         self._proxy_restart_at = -300.0
@@ -2352,7 +2357,7 @@ class TrayApp:
             return None
 
     def startup_readiness_check(self):
-        """启动时的无人值守就绪自检（只读；把缺口写入日志与气泡通知）。"""
+        """启动时的无人值守就绪自检（只读；结果同时提供给界面）。"""
         guard = getattr(self, "remote", None)
         if guard is None or self._remote_ops is None:
             return None
@@ -2363,13 +2368,41 @@ class TrayApp:
         except Exception as exc:
             self.log.warning("就绪自检失败：%s", type(exc).__name__)
             return None
+        self.readiness_report = report
+        self._maybe_prompt_autologon(report)
         for warning in report.warnings:
-            self.log.warning("无人值守缺口：%s", warning)
+            self.log.warning("无人值守需要处理：%s", warning)
+        for note in report.manual_notes:
+            self.log.info("无人值守待确认：%s", note)
         if report.warnings:
-            self.notify("无人值守存在缺口", "；".join(report.warnings[:2]))
+            self.notify("在线保护需要处理", "；".join(report.warnings[:2]))
         else:
-            self.log.info("无人值守就绪自检通过（人工项除外）")
+            self.log.info("无人值守自动检查通过；人工确认项已单独列出")
         return report
+
+    def _maybe_prompt_autologon(self, report) -> None:
+        """首次交互式打包启动时引导用户完成官方自动登录设置一次。"""
+        if not (getattr(sys, "frozen", False) and self._interactive_start):
+            return
+        if self.get_config().get("autologon_prompted", False):
+            return
+        item = next((entry for entry in report.items if entry.key == "auto_logon"), None)
+        if item is None or item.status != "ACTION":
+            return
+        self.update_config({"autologon_prompted": True})
+        cfg = self.get_config()
+        if not save_config(cfg):
+            self.log.warning("自动登录引导状态保存失败，本次仍只引导一次")
+        self.log.info("Windows 自动登录尚未配置，启动微软官方 Autologon 设置向导")
+        self._ui_post(self._configure_boot_recovery)
+
+    def readiness_loop(self):
+        """Refresh system/UU readiness without blocking the network worker."""
+        while not self.stop_event.wait(300):
+            try:
+                self.startup_readiness_check()
+            except Exception as exc:
+                self.log.warning("就绪状态刷新失败：%s", type(exc).__name__)
 
     # ---------- 图标与通知 ----------
     def make_image(self):
@@ -3358,13 +3391,38 @@ class TrayApp:
     def enable_automatic_setup(self, *, first_install=False):
         """Arm only in the real entry point; constructors and startup self-tests stay offline."""
         self._automatic_setup_armed = True
-        if first_install:
-            cfg = self.get_config()
-            cfg.update(lifeline_enabled=True, automatic_proxy_enabled=True, v06_auto_prompted=True)
-            if save_config(cfg):
-                self.update_config(cfg)
-            if not get_autostart() and not set_autostart(True):
-                self.log.warning("首次启动未能设置开机运行")
+        # A packaged install is the real user entry point.  Every launch repairs
+        # reversible guard settings so an upgrade cannot silently lose the
+        # user's online protection.  Unit-test construction stays side-effect free.
+        if not getattr(sys, "frozen", False):
+            if first_install:
+                cfg = self.get_config()
+                cfg.update(lifeline_enabled=True, automatic_proxy_enabled=True,
+                           v06_auto_prompted=True)
+                if save_config(cfg):
+                    self.update_config(cfg)
+                if not get_autostart() and not set_autostart(True):
+                    self.log.warning("首次启动未能设置开机运行")
+            return
+        cfg = self.get_config()
+        cfg.update(lifeline_enabled=True, automatic_proxy_enabled=True,
+                   v06_auto_prompted=True, lifeline_reboot_enabled=True)
+        if save_config(cfg):
+            self.update_config(cfg)
+        try:
+            from campus_windows_guard import configure_startup_guard
+            result = configure_startup_guard(
+                get_autostart=get_autostart, set_autostart=set_autostart,
+                backup_path=data_directory() / "power-guard-backup.json")
+            self._autostart_enabled = result.autostart
+            self._automatic_setup_message = result.detail
+            if not result.autostart:
+                self.log.warning("助手登录后自启未完成：%s", result.detail)
+            else:
+                self.log.info("启动保护检查：%s", result.detail)
+        except Exception as exc:
+            self._automatic_setup_message = "启动保护检查未完成，将在后台重试"
+            self.log.warning("启动保护配置失败：%s", type(exc).__name__)
 
     def on_toggle_online_guard(self):
         enabled = not bool(self.get_config().get("lifeline_enabled"))
@@ -3483,6 +3541,19 @@ class TrayApp:
                         % PORTAL_ROOT))
             return result.ok, result.detail
 
+        def network_repair():
+            """Layer one: only ask Windows to reconnect SNNU Wi-Fi.
+
+            Portal credentials and proxy changes belong to the second layer;
+            keeping this action small makes a transient Wi-Fi drop cheap and
+            prevents a healthy proxy configuration from being touched.
+            """
+            cfg = self.get_config()
+            ok = wifi_reconnect(cfg.get("ssid") or "SNNU", self.log,
+                                profile=cfg.get("profile"),
+                                interface=cfg.get("interface"))
+            return bool(ok), "Wi-Fi 已重新连接" if ok else "Wi-Fi 常规重连未完成"
+
         def run():
             try:
                 from campus_resilience import RecoveryController, RecoveryOps
@@ -3505,7 +3576,8 @@ class TrayApp:
                         proxy_disable=active(native.proxy_disable),
                         proxy_restore=native.proxy_restore, repair=active(repair),
                         reboot_ready=lambda: get_autostart() and autologon_ready(),
-                        reboot=active(native.schedule_reboot), cancel_reboot=native.cancel_reboot)
+                        reboot=active(native.schedule_reboot), cancel_reboot=native.cancel_reboot,
+                        network_repair=active(network_repair))
                     self._lifeline = RecoveryController(
                         data_directory() / "recovery.json", ops,
                         log=lambda message: self.log.info("[三层恢复] %s", message))
@@ -3561,24 +3633,31 @@ class TrayApp:
         def download():
             try:
                 import requests
-                from campus_update import download_update
-                from campus_update_install import launch_installer
+                from campus_update import download_installer, download_update
+                from campus_update_install import launch_installer, launch_setup
                 directory = data_directory() / "updates" / info.tag
                 with requests.Session() as session:
                     try:
-                        staged = download_update(session, info, directory, progress)
+                        installed = Path(sys.executable).parent.name.lower() == "campusreconnect"
+                        downloader = download_installer if installed else download_update
+                        staged = downloader(session, info, directory, progress)
                     except (OSError, ValueError, requests.RequestException):
                         if cancelled.is_set() or self.stop_event.is_set():
                             return
                         with direct_session() as fallback:
-                            staged = download_update(fallback, info, directory, progress)
+                            installed = Path(sys.executable).parent.name.lower() == "campusreconnect"
+                            downloader = download_installer if installed else download_update
+                            staged = downloader(fallback, info, directory, progress)
                 if cancelled.is_set() or self.stop_event.is_set():
                     return
                 if self._repair_busy.is_set() or self._lifeline_busy.is_set():
                     raise RuntimeError("网络恢复正在执行，请在恢复完成后再次安装更新")
                 if not save_config(self.get_config()):
                     raise OSError("更新前保存配置失败")
-                launch_installer(staged, Path(sys.executable), info.tag, directory)
+                if Path(sys.executable).parent.name.lower() == "campusreconnect":
+                    launch_setup(staged)
+                else:
+                    launch_installer(staged, Path(sys.executable), info.tag, directory)
                 self._ui_post(self.on_quit)
             except Exception as exc:
                 message = str(exc)
@@ -4702,6 +4781,7 @@ def main(argv=None) -> int:
     first_install = packaged and not Path(CONFIG_FILE).exists()
     app = TrayApp(log)
     app.root = root
+    app._interactive_start = not args.background
     if packaged:
         app.enable_automatic_setup(first_install=first_install)
     app._autostart_enabled = get_autostart()
@@ -4720,6 +4800,8 @@ def main(argv=None) -> int:
                      name="campus-recovery", daemon=True).start()
     threading.Thread(target=app.startup_readiness_check,
                      name="campus-readiness", daemon=True).start()
+    threading.Thread(target=app.readiness_loop,
+                     name="campus-readiness-loop", daemon=True).start()
     app._start_ui_pump()
     app.start()
     if not args.background:

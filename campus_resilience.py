@@ -23,6 +23,10 @@ class RecoveryOps:
     reboot_ready: Callable
     reboot: Callable
     cancel_reboot: Callable
+    # Optional first-layer action.  Older callers fall back to ``repair``;
+    # production supplies a network-only reconnect so proxy/auth work remains
+    # isolated to layer two.
+    network_repair: Callable | None = None
 
 
 class RecoveryController:
@@ -98,7 +102,8 @@ class RecoveryController:
             self.save()
             self.log("第一层恢复：尝试常规网络重连，再重启 UU")
             try:
-                _ok, self.detail = self.ops.repair()
+                action = self.ops.network_repair or self.ops.repair
+                _ok, self.detail = action()
             except Exception as exc:
                 self.log("常规网络重连未完成（%s），继续 UU 恢复" % type(exc).__name__)
             self.ops.restart_uu()

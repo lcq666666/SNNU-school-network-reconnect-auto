@@ -222,13 +222,26 @@ def test_u7_11_readiness_full_pass():
     report = guard.readiness()
     assert report.ok is True, report.warnings
     assert [i.key for i in report.items] == ["sleep", "auto_logon",
-                                              "remote_client", "tray_autostart",
+                                              "remote_client", "remote_external",
+                                              "tray_autostart",
                                               "credentials", "external_recovery",
                                               "remote_reconnect"]
     manual = [i for i in report.items if i.manual]
     assert len(manual) == 2
     payload = report.to_dict()
     assert payload["ok"] is True and payload["items"]
+
+
+def test_u7_11_readiness_manual_items_are_not_actionable_warnings():
+    guard = _guard(ops=_readiness_ops())
+    report = guard.readiness()
+    assert report.automatic_ok is True
+    assert report.blocking_items == []
+    assert len(report.manual_items) == 2
+    assert report.warnings == []
+    assert len(report.manual_notes) == 2
+    assert all(item.status == cr.READINESS_MANUAL for item in report.manual_items)
+    assert report.to_dict()["manual_items"]
 
 
 def test_u7_12_readiness_reports_each_gap():
@@ -269,6 +282,14 @@ def test_u7_14_readiness_probe_failure_is_reported():
     report = guard.readiness()
     assert report.ok is False
     assert any("探测" in i.label or i.key == "probe_error" for i in report.items)
+
+
+def test_u7_14_readiness_without_probe_is_checking_not_a_false_gap():
+    guard = _guard(ops=None)
+    report = guard.readiness()
+    assert report.items[0].status == cr.READINESS_CHECKING
+    assert report.blocking_items == []
+    assert report.manual_items == []
 
 
 # --------------------------------------------------------------------------- #
@@ -487,6 +508,6 @@ def test_u7_25_build_windows_remote_ops_is_read_only(fake_runner):
     for name, script in fake_runner.commands:
         assert "Set-" not in script and "Remove-" not in script
         assert name in {"remote_processes", "remote_tcp", "remote_udp",
-                        "sleep_states", "winlogon", "run_entries"}
+        "sleep_states", "power_plan", "winlogon", "run_entries"}
 
 

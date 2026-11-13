@@ -116,6 +116,33 @@ def write_manifest() -> Path:
     return DIST_DIR / "build_info.json"
 
 
+def build_installer() -> int:
+    """Build the standard installer when Inno Setup is available.
+
+    Local source builds may not have ISCC installed; Windows release CI
+    installs it and treats a missing compiler as a hard failure there.
+    """
+    from tools.build_installer import build
+    version = build_info.build_metadata()["version"]
+    try:
+        installer = build(version)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print("安装包构建失败：", exc)
+        return 1
+    if installer is None:
+        print("未找到 ISCC.exe，跳过本机构建安装包")
+        return 0
+    if not installer.is_file():
+        print("安装包构建未生成：", installer)
+        return 1
+    digest = _sha256(installer)
+    (DIST_DIR / "CampusReconnectSetup.exe.sha256").write_text(
+        "%s  %s\nsize=%d\n" % (digest, installer.name, installer.stat().st_size),
+        encoding="utf-8")
+    print("安装包 SHA256 %s" % digest)
+    return 0
+
+
 def main(argv=None) -> int:
     _ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="CampusReconnect 受控构建")
@@ -139,6 +166,9 @@ def main(argv=None) -> int:
     if code != 0:
         return code
     write_manifest()
+    code = build_installer()
+    if code != 0:
+        return code
     return 0
 
 

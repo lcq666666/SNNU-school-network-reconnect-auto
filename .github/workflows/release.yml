@@ -37,6 +37,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-lock.txt
 
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress --yes
+
       # 发布前跑完整校验（测试 + ruff），再构建。
       - name: Build release artifacts
         run: python tools/build_release.py
@@ -50,6 +54,8 @@ jobs:
             gh release upload "${GITHUB_REF_NAME}" \
               dist/CampusReconnect.exe \
               dist/CampusReconnect.exe.sha256 \
+              dist/CampusReconnectSetup.exe \
+              dist/CampusReconnectSetup.exe.sha256 \
               dist/build_info.json --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
@@ -57,5 +63,7 @@ jobs:
               --notes "自动化受控构建；版本与源码 commit 见 build_info.json。" \
               dist/CampusReconnect.exe \
               dist/CampusReconnect.exe.sha256 \
+              dist/CampusReconnectSetup.exe \
+              dist/CampusReconnectSetup.exe.sha256 \
               dist/build_info.json
           fi

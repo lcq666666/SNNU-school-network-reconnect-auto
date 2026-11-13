@@ -177,6 +177,12 @@ _COMMANDS: Dict[str, str] = {
 
 COMMANDS: Dict[str, str] = dict(_COMMANDS)  # 公开只读命令表（测试自检用）
 
+# 启动就绪检查使用的额外只读命令。它们不属于批量 P0 网络诊断，避免
+# 改变 ``collect()`` 的冻结命令集合；调用方可以按需读取此表。
+READINESS_COMMANDS: Dict[str, str] = {
+    "power_plan": "powercfg /query",
+}
+
 #: 按需执行的命令（不在 collect() 批量跑，由 P1 NetworkObserver 按目标调用）：
 #: remote_tcp/remote_udp 依赖进程 PID，route_lookup 依赖目标地址。
 ONDEMAND_COMMANDS = ("remote_tcp", "remote_udp", "route_lookup")
@@ -219,8 +225,8 @@ def assert_read_only(script: str) -> None:
                 raise ValueError("netsh 仅允许 show 子命令：%r" % chunk)
             continue
         if head.startswith("powercfg"):
-            if len(parts) != 2 or parts[1].lower() != "/a":
-                raise ValueError("powercfg 仅允许只读参数 /a：%r" % chunk)
+            if (len(parts) != 2 or parts[1].lower() not in ("/a", "/query")):
+                raise ValueError("powercfg 仅允许只读参数 /a 或 /query：%r" % chunk)
             continue
         low = head.lower()
         if index == 0 and not head.startswith(READ_ONLY_LEAD):
@@ -718,13 +724,30 @@ def parse_powercfg(text: Any) -> Dict[str, Any]:
                 "mentions_standby": None, "note": "powercfg 无输出", "raw": ""}
     split = re.search(r"(not available|不可用|无法使用)", lowered)
     head = lowered[:split.start()] if split else lowered
-    return {
+    result = {
         "standby_available": ("standby" in head or "待机" in head),
         "hibernate_available": ("hibernate" in head or "休眠" in head),
         "mentions_standby": ("standby" in lowered or "待机" in lowered),
         "note": None,
         "raw": raw[:1500],
     }
+    # ``powercfg /a`` only reports capability.  If the caller also supplied
+    # ``powercfg /query`` output, expose the effective AC/DC timeout indexes.
+    for name, marker in (("standby", "standbyidle"),
+                         ("hibernate", "hibernateidle")):
+        section = re.search(marker + r".*?(?=(?:standbyidle|hibernateidle)|$)",
+                            lowered, re.S)
+        if section is None:
+            continue
+        body = section.group(0)
+        for scope in ("ac", "dc"):
+            match = re.search(
+                r"current\s+%s\s+power\s+setting\s+index\s*:\s*0x([0-9a-f]+)"
+                % scope, body, re.I)
+            if match:
+                timeout_name = "sleep" if name == "standby" else "hibernate"
+                result["%s_timeout_%s" % (timeout_name, scope)] = int(match.group(1), 16)
+    return result
 
 
 def parse_winlogon(payload: Any) -> Dict[str, Any]:

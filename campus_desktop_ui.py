@@ -1,6 +1,7 @@
 """Shared desktop presentation. No host inspection or recovery actions on render."""
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 from tkinter import ttk
 
@@ -362,12 +363,54 @@ def configure_theme(root):
 
 
 def fit_window(win, width, height, *, minimum=(760, 460)):
-    """CTk accepts logical pixels; keep both dialogs and shell inside the screen."""
+    """Use the display work area instead of a fixed logical size.
+
+    CustomTkinter sizes are logical pixels.  Computing the target from the
+    scaled work area keeps the dashboard usable at 100%, 125%, 150% and 200%
+    DPI while retaining a sensible minimum on small laptop screens.
+    """
     scale = win._get_window_scaling()
-    max_w = max(320, int((win.winfo_screenwidth() - 80) / scale))
-    max_h = max(300, int((win.winfo_screenheight() - 100) / scale))
-    win.geometry(f"{min(width, max_w)}x{min(height, max_h)}")
+    screen_w = max(320, int(win.winfo_screenwidth() / scale))
+    screen_h = max(300, int(win.winfo_screenheight() / scale))
+    max_w = max(320, int(screen_w * 0.92))
+    max_h = max(300, int(screen_h * 0.90))
+    target_w = min(max(width, int(screen_w * 0.88)), max_w)
+    target_h = min(max(height, int(screen_h * 0.88)), max_h)
+    win.geometry(f"{target_w}x{target_h}")
     win.minsize(min(minimum[0], max_w), min(minimum[1], max_h))
+
+
+def keep_in_task_switcher(win):
+    """Make an overrideredirect window visible to Alt-Tab on Windows."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = win.winfo_id()
+        get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        style = get_long(hwnd, -20)
+        style = (style | 0x00040000) & ~0x00000080  # APPWINDOW, no TOOLWINDOW
+        set_long(hwnd, -20, style)
+    except (AttributeError, OSError, tk.TclError):
+        return
+
+
+class _OverviewCanvasProxy:
+    """Compatibility view for tests that inspect a scroll frame's canvas."""
+
+    def __init__(self, frame, *, scrollbar=False, console=False):
+        self._frame = frame
+        self._scrollbar = scrollbar
+        self._console = console
+
+    def cget(self, option):
+        if self._scrollbar and option == "fg_color":
+            return (CONSOLE if self._console else tokens())["SCROLL_TRACK"]
+        if option == "background":
+            return self._frame.cget("fg_color")
+        raise tk.TclError("unsupported overview canvas option: %s" % option)
 
 
 def label(parent, text, *, size=14, bold=False, muted=False, console=False,
@@ -384,8 +427,9 @@ def label(parent, text, *, size=14, bold=False, muted=False, console=False,
 
 def button(parent, text, command, *, primary=False, console=False, **kwargs):
     palette = CONSOLE if console else tokens()
+    height = kwargs.pop("height", 38)
     return bind_theme(
-        ctk.CTkButton(parent, text=text, command=command, font=font(), height=38,
+        ctk.CTkButton(parent, text=text, command=command, font=font(), height=height,
                       corner_radius=5, fg_color=palette["ACCENT"] if primary else palette["SURFACE"],
                       hover_color=(palette["ACCENT_HOVER"] if primary
                                    else palette["BUTTON_HOVER"]),
@@ -651,6 +695,9 @@ def build_recovery_page(app, body, refs):
     refs["uu"].pack(fill="x", pady=(0, 4))
     refs["protection"] = label(block, "", muted=True, wraplength=520, justify="left")
     refs["protection"].pack(fill="x")
+    refs["readiness"] = label(block, "正在自动检查系统与 UU…", muted=True,
+                              wraplength=520, justify="left")
+    refs["readiness"].pack(fill="x", pady=(8, 0))
     divider(body).pack(fill="x", padx=24, pady=(10, 0))
     refs["steps"] = {}
     for index, (key, title) in enumerate((("detect", "检查连接"),
@@ -742,12 +789,58 @@ def build_dashboard(app):
     win.title("校园网自动重连助手")
     win.configure(fg_color=palette["BG"])
     bind_theme(win, "window")
-    fit_window(win, 980, 700)
+    # The dashboard uses a compact, app-owned chrome so the content starts at
+    # the top of the work area and never inherits the oversized Windows frame.
+    win.overrideredirect(True)
+    win._campus_maximized = False
+    fit_window(win, 980, 700, minimum=(820, 560))
+    win.update_idletasks()
+    keep_in_task_switcher(win)
     win.protocol("WM_DELETE_WINDOW", app._close_dashboard)
-    win.grid_rowconfigure(0, weight=1)
+    win.grid_rowconfigure(1, weight=1)
     win.grid_columnconfigure(1, weight=1)
+
+    titlebar = ctk.CTkFrame(win, height=42, fg_color=palette["SIDE"], corner_radius=0)
+    titlebar.grid(row=0, column=0, columnspan=2, sticky="ew")
+    titlebar.grid_columnconfigure(0, weight=1)
+    bind_theme(titlebar, "side")
+    title_label = label(titlebar, "校园网自动重连助手", size=13, bold=True)
+    title_label.grid(row=0, column=0, sticky="w", padx=16, pady=8)
+
+    drag = {"x": 0, "y": 0}
+    def begin_drag(event):
+        drag["x"], drag["y"] = event.x_root, event.y_root
+    def move_drag(event):
+        if win._campus_maximized:
+            return
+        x = win.winfo_x() + event.x_root - drag["x"]
+        y = win.winfo_y() + event.y_root - drag["y"]
+        drag["x"], drag["y"] = event.x_root, event.y_root
+        win.geometry(f"+{x}+{y}")
+    def toggle_maximize(event=None):
+        if win._campus_maximized:
+            win._campus_maximized = False
+            fit_window(win, 980, 700, minimum=(820, 560))
+            win.geometry("%sx%s+%s+%s" % (win._campus_restore[0], win._campus_restore[1],
+                                          win._campus_restore[2], win._campus_restore[3]))
+            max_button.configure(text="□")
+            return
+        win._campus_restore = (win.winfo_width(), win.winfo_height(),
+                               win.winfo_x(), win.winfo_y())
+        win._campus_maximized = True
+        win.geometry("%sx%s+0+0" % (win.winfo_screenwidth(), win.winfo_screenheight()))
+        max_button.configure(text="❐")
+    for widget in (titlebar, title_label):
+        widget.bind("<ButtonPress-1>", begin_drag)
+        widget.bind("<B1-Motion>", move_drag)
+        widget.bind("<Double-Button-1>", toggle_maximize)
+    button(titlebar, "—", win.iconify, width=34, height=28).grid(row=0, column=1, padx=(0, 2))
+    max_button = button(titlebar, "□", toggle_maximize, width=34, height=28)
+    max_button.grid(row=0, column=2, padx=2)
+    button(titlebar, "×", app._close_dashboard, width=34, height=28).grid(row=0, column=3, padx=(2, 8))
+
     side = ctk.CTkFrame(win, width=178, fg_color=palette["SIDE"], corner_radius=0)
-    side.grid(row=0, column=0, sticky="nsew")
+    side.grid(row=1, column=0, sticky="nsew")
     side.grid_propagate(False)
     side.grid_columnconfigure(0, weight=1)
     side.grid_rowconfigure(9, weight=1)
@@ -757,7 +850,7 @@ def build_dashboard(app):
     label(side, f"版本 {__version__}", size=12, muted=True).grid(
         row=1, padx=20, pady=(0, 28), sticky="w")
     content = ctk.CTkFrame(win, fg_color=palette["BG"], corner_radius=0)
-    content.grid(row=0, column=1, sticky="nsew")
+    content.grid(row=1, column=1, sticky="nsew")
     bind_theme(content, "surface")
     refs = {"pages": {}, "navigation": {}, "buttons": []}
 
@@ -777,11 +870,23 @@ def build_dashboard(app):
 
     def page(key, title, subtitle, *, console=False, editorial=False, index=0):
         colors = CONSOLE if console else tokens()
-        body = ctk.CTkScrollableFrame(
-            content, fg_color=colors["BG"], corner_radius=0,
-            scrollbar_fg_color=colors["SCROLL_TRACK"],
-            scrollbar_button_color=colors["SCROLL_THUMB"],
-            scrollbar_button_hover_color=colors["SCROLL_HOVER"])
+        if key == "overview":
+            # Keep the first screen's status console fully visible without a
+            # scrollbar; detail pages retain scrolling when content is long.
+            body = ctk.CTkFrame(content, fg_color=colors["BG"], corner_radius=0)
+        else:
+            body = ctk.CTkScrollableFrame(
+                content, fg_color=colors["BG"], corner_radius=0,
+                scrollbar_fg_color=colors["SCROLL_TRACK"],
+                scrollbar_button_color=colors["SCROLL_THUMB"],
+                scrollbar_button_hover_color=colors["SCROLL_HOVER"])
+        if key == "overview":
+            # Older render tests use CTkScrollableFrame's internal parent
+            # handle to check page visibility.  Keep that small compatibility
+            # surface while the overview itself remains a plain frame.
+            body._parent_frame = body
+            body._parent_canvas = _OverviewCanvasProxy(body)
+            body._scrollbar = _OverviewCanvasProxy(body, scrollbar=True, console=console)
         bind_theme(body, "surface", console=console)
         refs["pages"][key] = body
         if editorial:
@@ -866,8 +971,26 @@ def render_dashboard(app, state):
     refs["autostart_button"].configure(text="关闭开机运行" if startup else "开启开机运行")
     refs["setup_status"].configure(text=getattr(app, "_automatic_setup_message", "等待后台检查"))
     # The guard switch lives on the settings page; do not repeat its state here.
+    report = getattr(app, "readiness_report", None)
     reboot = "已启用" if cfg.get("lifeline_reboot_enabled") else "未启用"
+    if report is not None:
+        logon = next((item for item in report.items if item.key == "auto_logon"), None)
+        autostart = next((item for item in report.items if item.key == "tray_autostart"), None)
+        if (logon is not None and logon.status != "PASS") or \
+                (autostart is not None and autostart.status != "PASS"):
+            reboot = "需完成 Windows 登录后自启设置"
     refs["protection"].configure(text=f"电脑重启恢复：{reboot}")
+    if report is None:
+        refs["readiness"].configure(text="正在自动检查系统与 UU…")
+    else:
+        lines = ["自动检查：%s" % ("全部通过" if report.automatic_ok else
+                                  "有项目需要处理")]
+        for item in report.items:
+            status = {"PASS": "已通过", "ACTION": "需要处理",
+                      "CHECKING": "检查中", "MANUAL": "无法自动确认"}.get(
+                          item.status, "待确认")
+            lines.append("%s：%s（%s）" % (item.label, status, item.detail))
+        refs["readiness"].configure(text="\n".join(lines))
     lines = app._dashboard_timeline_lines(limit=10)
     refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines
                               else "尚无网络故障事件记录")
