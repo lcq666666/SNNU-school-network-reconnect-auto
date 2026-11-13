@@ -26,6 +26,19 @@ def test_updater_reports_preflight_failure_without_replacing_target():
     assert "throw 'Staged update startup check failed'" in preflight
 
 
+def test_updater_waits_for_all_target_processes_and_preflights_copied_file():
+    wait_all = UPDATE_SCRIPT.index("Get-TargetProcessIds")
+    copy_incoming = UPDATE_SCRIPT.index("Copy-Item -LiteralPath $staged -Destination $incoming -Force")
+    copied_hash = UPDATE_SCRIPT.index("Copied update SHA256 mismatch")
+    copied_preflight = UPDATE_SCRIPT.index("Preflighting the copied executable before replacement.")
+    replace_exe = UPDATE_SCRIPT.index("[IO.File]::Replace($incoming, $target, $backup)")
+    target_hash = UPDATE_SCRIPT.index("Replaced executable SHA256 mismatch")
+    assert wait_all < copy_incoming < copied_hash < copied_preflight < replace_exe < target_hash
+    assert "Old application processes did not exit" in UPDATE_SCRIPT
+    assert "Updated application exited before startup receipt" in UPDATE_SCRIPT
+    assert "Update failed:" in UPDATE_SCRIPT
+
+
 def test_staged_executable_preflight_accepts_loadable_binary(tmp_path, monkeypatch):
     def run(command, **kwargs):
         assert command[1] == "--load-check"

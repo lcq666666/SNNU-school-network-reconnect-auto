@@ -16,23 +16,41 @@ $taskConfig = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
 $target = [IO.Path]::GetFullPath($taskConfig.target)
 $staged = [IO.Path]::GetFullPath($taskConfig.staged)
 $backup = $target + '.previous'
-$incoming = $target + '.incoming'
+$incoming = $target + '.incoming.exe'
 $startupReport = $taskConfig.receipt + '.preflight'
+$updateLog = $taskConfig.error + '.log'
 $replaced = $false
 $started = $null
-try {
-    $stream = [IO.File]::OpenRead($staged)
+function Write-UpdateLog([string]$Message) {
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -LiteralPath $updateLog -Value ("$stamp $Message") -Encoding UTF8
+}
+function Get-TargetProcessIds {
+    $ids = @(Get-CimInstance -ClassName Win32_Process | Where-Object {
+        $_.ExecutablePath -and
+        [IO.Path]::GetFullPath($_.ExecutablePath).Equals(
+            $target, [StringComparison]::OrdinalIgnoreCase)
+    } | ForEach-Object { [int]$_.ProcessId })
+    return $ids
+}
+function Get-FileSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
-        $digest = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+        return [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
     } finally {
         $stream.Dispose()
         $hasher.Dispose()
     }
-    if ($digest -ne $taskConfig.sha256) {
+}
+try {
+    Remove-Item -LiteralPath $updateLog -Force -ErrorAction SilentlyContinue
+    Write-UpdateLog 'Checking downloaded update checksum.'
+    if ((Get-FileSha256 $staged) -ne $taskConfig.sha256) {
         throw 'Staged update SHA256 mismatch'
     }
     Remove-Item -LiteralPath $startupReport -Force -ErrorAction SilentlyContinue
+    Write-UpdateLog 'Preflighting downloaded update.'
     $check = Start-Process -FilePath $staged `
         -ArgumentList @('--load-check', ('"' + $startupReport + '"')) `
         -Wait -PassThru -WindowStyle Hidden
@@ -41,9 +59,31 @@ try {
         throw 'Staged update startup check failed'
     }
     Remove-Item -LiteralPath $startupReport -Force -ErrorAction SilentlyContinue
-    $old = Get-Process -Id $taskConfig.pid -ErrorAction SilentlyContinue
-    if ($old) { Wait-Process -Id $old.Id -Timeout 60 -ErrorAction SilentlyContinue }
+    Write-UpdateLog 'Waiting for every old process at the target path to exit.'
+    $deadline = (Get-Date).AddSeconds(60)
+    do {
+        $oldIds = @(Get-TargetProcessIds)
+        if ($oldIds.Count -eq 0) { break }
+        if ((Get-Date) -ge $deadline) {
+            throw ('Old application processes did not exit: ' + ($oldIds -join ', '))
+        }
+        Start-Sleep -Milliseconds 500
+    } while ($true)
+    Write-UpdateLog 'Copying update beside the target executable.'
     Copy-Item -LiteralPath $staged -Destination $incoming -Force
+    if ((Get-FileSha256 $incoming) -ne $taskConfig.sha256) {
+        throw 'Copied update SHA256 mismatch'
+    }
+    Remove-Item -LiteralPath $startupReport -Force -ErrorAction SilentlyContinue
+    Write-UpdateLog 'Preflighting the copied executable before replacement.'
+    $check = Start-Process -FilePath $incoming `
+        -ArgumentList @('--load-check', ('"' + $startupReport + '"')) `
+        -Wait -PassThru -WindowStyle Hidden
+    if ($check.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $startupReport) `
+        -or (Get-Content -LiteralPath $startupReport -Raw).Trim() -ne 'ok') {
+        throw ('Copied update startup check failed with exit code ' + $check.ExitCode)
+    }
+    Remove-Item -LiteralPath $startupReport -Force -ErrorAction SilentlyContinue
     $ready = $false
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
         try {
@@ -58,17 +98,28 @@ try {
         } catch { Start-Sleep -Seconds 1 }
     }
     if (-not $ready) { throw 'Executable replacement timed out' }
+    if ((Get-FileSha256 $target) -ne $taskConfig.sha256) {
+        throw 'Replaced executable SHA256 mismatch'
+    }
+    Write-UpdateLog 'Replacement verified; starting updated application.'
     $arguments = @('--background', '--update-receipt', ('"' + $taskConfig.receipt + '"'))
     $started = Start-Process -FilePath $target -ArgumentList $arguments -PassThru -WindowStyle Hidden
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
         if (Test-Path -LiteralPath $taskConfig.receipt) {
             $receipt = Get-Content -LiteralPath $taskConfig.receipt -Raw | ConvertFrom-Json
-            if ($receipt.version -eq $taskConfig.version) { exit 0 }
+            if ($receipt.version -eq $taskConfig.version) {
+                Write-UpdateLog ('Updated application startup confirmed; version ' + $receipt.version + '.')
+                exit 0
+            }
+        }
+        if ($started.HasExited) {
+            throw ('Updated application exited before startup receipt; exit code ' + $started.ExitCode)
         }
         Start-Sleep -Seconds 1
     }
     throw 'Updated application startup was not confirmed'
 } catch {
+    Write-UpdateLog ('Update failed: ' + $_.Exception.Message)
     $_.Exception.Message | Out-File -LiteralPath $taskConfig.error -Encoding utf8
     if ($replaced -and (Test-Path -LiteralPath $backup)) {
         if ($started -and (-not $started.HasExited)) {
@@ -89,10 +140,17 @@ try {
         if (-not $restored) {
             'Rollback failed. The previous executable is preserved in the .previous file.' |
                 Out-File -LiteralPath $taskConfig.error -Encoding utf8 -Append
+            Write-UpdateLog 'Rollback failed; previous executable remains in the .previous file.'
             exit 1
         }
+        Write-UpdateLog 'Previous executable restored after failed update.'
     }
-    Start-Process -FilePath $target -ArgumentList '--background' -WindowStyle Hidden
+    if (@(Get-TargetProcessIds).Count -eq 0) {
+        Start-Process -FilePath $target -ArgumentList '--background' -WindowStyle Hidden
+        Write-UpdateLog 'Started the restored application.'
+    } else {
+        Write-UpdateLog 'Restored application is already running.'
+    }
     exit 1
 }
 '''
