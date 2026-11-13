@@ -1,5 +1,11 @@
 # 校园网自动重连助手（SNNU · Windows · Clash Verge Rev）
 
+## v0.9.3 通知跳转与恢复界面修复
+
+在线保护发现睡眠/休眠设置需要处理时，点击 Windows 托盘通知会直接打开对应的电源设置页面；在线守护页也会提供同一入口，并在检查通过后隐藏。手动重启 UU 的确认等待移到后台，避免窗口卡住；原有网络验证和安全门保持生效。
+
+[下载 v0.9.3](https://github.com/lcq666666/SNNU-school-network-reconnect-auto/releases/tag/v0.9.3)。
+
 ## v0.9.0 全自动持续在线
 
 发布同时提供 `CampusReconnectSetup.exe` 安装版和 `CampusReconnect.exe` 便携版。安装版写入当前用户的开始菜单、桌面快捷方式和登录后自启，升级时保留 `%LOCALAPPDATA%\CampusReconnect` 下的账号凭据、配置、日志和恢复记录；便携版继续使用单文件更新。

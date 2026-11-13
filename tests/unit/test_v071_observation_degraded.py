@@ -302,6 +302,34 @@ def test_u71_b_17_invalidate_clears_lkg():
     assert source._lkg_at is None
 
 
+def test_repeated_invalidation_discards_inflight_results_until_fresh_publish():
+    """重复相同原因作废也必须淘汰中间启动的旧采集任务。"""
+    clock = VirtualClock()
+    source, jobs = _primed(clock)
+    clock.advance(3.0)
+    assert source.request(clock.now) is True
+    stale_job = jobs.pop(0)
+
+    source.invalidate("SSID 变化")
+    source.request(clock.now)
+    fresh_job = jobs.pop(0)
+    source.invalidate("SSID 变化")
+
+    stale_job()
+    refused = source.observe(clock.now)
+    assert refused.trusted is False
+    assert refused.mode == tso.MODE_REFUSED
+
+    fresh_job()
+    assert source.observe(clock.now).trusted is False
+    assert source.request(clock.now) is True
+    newest_job = jobs.pop(0)
+    newest_job()
+    current = source.observe(clock.now)
+    assert current.trusted is True
+    assert current.mode == tso.MODE_FULL
+
+
 def test_u71_b_18_external_generation_change_is_hard_refused():
     state = {"cfg": 1}
     clock = VirtualClock()

@@ -150,6 +150,42 @@ DASHBOARD_HEIGHT = 620
 DASHBOARD_MIN_WIDTH = 820
 DASHBOARD_MIN_HEIGHT = 560
 
+# pystray's Windows backend receives NIN_BALLOONUSERCLICK but does not expose
+# it. Keep a small callback hook so actionable readiness notices can navigate.
+NIN_BALLOONUSERCLICK = 0x0405
+NIN_BALLOONTIMEOUT = 0x0404
+
+
+def dispatch_balloon_click(event_code, action):
+    """Run a pending notification action for the Windows balloon click event."""
+    if event_code != NIN_BALLOONUSERCLICK or not callable(action):
+        return False
+    try:
+        action()
+    except Exception:
+        pass
+    return True
+
+
+class ActionableTrayIcon(pystray.Icon):
+    """pystray icon with activation support for clicked Windows notifications."""
+
+    def __init__(self, *args, **kwargs):
+        self._notification_action = None
+        super().__init__(*args, **kwargs)
+
+    def set_notification_action(self, action):
+        self._notification_action = action
+
+    def _on_notify(self, wparam, lparam):
+        action = self._notification_action
+        if dispatch_balloon_click(lparam, action):
+            self._notification_action = None
+            return
+        handler = getattr(super(), "_on_notify", None)
+        if handler is not None:
+            return handler(wparam, lparam)
+
 #: V0.3 P7 看门狗：巡检间隔与心跳容忍窗口（秒）。
 WATCHDOG_INTERVAL = 30.0
 WATCHDOG_HEARTBEAT_TIMEOUT = 90.0
@@ -2031,16 +2067,34 @@ class TrayApp:
         （``remote_restart_enabled=False``），用户当面确认即视为本次授权，但仍
         **必须**先通过接口受限验证与轻量再确认（fail-closed），且只动用户态进程。
         """
-        answer = self._ui_ask(
-            "重启 UU 远程",
-            "将清退并重启 UU 远程（网易 GameViewer）的**用户态**进程。\n"
-            "只会处理当前用户的 GameViewer / GameViewerLauncher，"
-            "不动 GameViewerService，也不会断开远程会话服务。\n\n"
-            "继续前会先做一次接口受限上网验证；验证不过则不清退。\n\n是否继续？")
-        if not answer:
-            self.notify("已取消", "未清退任何 UU 进程")
+        busy = getattr(self, "_manual_uu_confirm_busy", None)
+        if busy is None:
+            busy = self._manual_uu_confirm_busy = threading.Event()
+        if busy.is_set():
+            self.notify("正在确认", "请先完成当前的 UU 重启确认")
             return
-        self._manual_uu_restart_async()
+        busy.set()
+
+        def _confirm_and_restart():
+            try:
+                answer = self._ui_ask(
+                    "重启 UU 远程",
+                    "将清退并重启 UU 远程（网易 GameViewer）的**用户态**进程。\n"
+                    "只会处理当前用户的 GameViewer / GameViewerLauncher，"
+                    "不动 GameViewerService，也不会断开远程会话服务。\n\n"
+                    "继续前会先做一次接口受限上网验证；验证不过则不清退。\n\n是否继续？")
+                if answer:
+                    self._manual_uu_restart_async()
+                else:
+                    self.notify("已取消", "未清退任何 UU 进程")
+            except Exception as exc:
+                self.log.warning("UU 重启确认异常：%s", type(exc).__name__)
+                self.notify("无法确认", "未清退任何 UU 进程")
+            finally:
+                busy.clear()
+
+        threading.Thread(target=_confirm_and_restart, daemon=True,
+                         name="campus-manual-uu-confirm").start()
 
     def _manual_uu_restart_async(self) -> None:
         busy = getattr(self, "_manual_uu_busy", None)
@@ -2380,7 +2434,15 @@ class TrayApp:
         for note in report.manual_notes:
             self.log.info("无人值守待确认：%s", note)
         if report.warnings:
-            self.notify("在线保护需要处理", "；".join(report.warnings[:2]))
+            sleep_needs_action = any(
+                item.key == "sleep" and item.status == "ACTION"
+                for item in report.items)
+            self.notify("在线保护需要处理",
+                        "；".join(report.warnings[:2])
+                        + ("。点击此通知打开电源设置。" if sleep_needs_action
+                           else "。打开主界面 > 在线守护查看处理入口。"),
+                        on_click=(self.on_open_power_settings
+                                  if sleep_needs_action else None))
         else:
             self.log.info("无人值守自动检查通过；人工确认项已单独列出")
         return report
@@ -2408,6 +2470,16 @@ class TrayApp:
                 self.startup_readiness_check()
             except Exception as exc:
                 self.log.warning("就绪状态刷新失败：%s", type(exc).__name__)
+
+    def on_open_power_settings(self):
+        """Open the Windows power settings page for the actionable sleep item."""
+        try:
+            opened = bool(self._update_opener("ms-settings:powersleep"))
+        except Exception as exc:
+            self.log.warning("打开电源设置失败：%s", type(exc).__name__)
+            opened = False
+        if not opened:
+            self.notify("无法打开设置", "请从 Windows 设置中打开“电源和睡眠”")
 
     # ---------- 图标与通知 ----------
     def make_image(self):
@@ -2437,13 +2509,17 @@ class TrayApp:
         if notify and prev != mode:
             self.notify(*notify)
 
-    def notify(self, title, body):
+    def notify(self, title, body, *, on_click=None):
         """发送气泡通知。注意 pystray 签名是 notify(message, title)。"""
+        self._notification_action = on_click
         if self.icon is None:
             return
         message = (body or "")[:255]
         head = (title or "")[:63]
         try:
+            set_action = getattr(self.icon, "set_notification_action", None)
+            if set_action is not None:
+                set_action(on_click)
             self.icon.notify(message, head)
         except Exception:
             self.log.warning("通知发送失败:\n%s", traceback.format_exc())
@@ -4608,8 +4684,8 @@ class TrayApp:
 
     # ---------- 启动 ----------
     def start(self):
-        self.icon = pystray.Icon(APP_NAME, self.make_image(), self.tooltip(),
-                                 self.build_menu())
+        self.icon = ActionableTrayIcon(APP_NAME, self.make_image(), self.tooltip(),
+                                       self.build_menu())
         threading.Thread(target=self.icon.run, daemon=True).start()
         self._ensure_worker()
         self._start_update_scheduler()

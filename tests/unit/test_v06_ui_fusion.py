@@ -9,7 +9,8 @@ import logging
 import pytest
 
 import campus_reconnect_tray as tray
-from campus_desktop_ui import CONSOLE
+from campus_desktop_ui import CONSOLE, sleep_action_required
+from campus_remote import ReadinessReport, RemoteReadinessItem
 from campus_timeline import NetworkTimeline
 from campus_ui_state import PathCard, StepView, UiState, UuView
 
@@ -45,6 +46,20 @@ def _state(overall="HEALTHY", headline="双链路正常", **over):
                             last_ok=True, detail="冷却 300 秒"))
     kwargs.update(over)
     return UiState(**kwargs)
+
+
+def test_sleep_readiness_exposes_action_only_for_actionable_gap():
+    action = RemoteReadinessItem("sleep", "睡眠/休眠", False,
+                                 "睡眠超时已启用", status="ACTION")
+    passed = RemoteReadinessItem("sleep", "睡眠/休眠", True,
+                                 "已关闭", status="PASS")
+    other_gap = RemoteReadinessItem("auto_logon", "自动登录", False,
+                                    "未启用", status="ACTION")
+
+    assert sleep_action_required(ReadinessReport(items=[action]))
+    assert not sleep_action_required(ReadinessReport(items=[passed]))
+    assert not sleep_action_required(ReadinessReport(items=[other_gap]))
+    assert not sleep_action_required(None)
 
 
 # Desktop rendering accepts immutable offline state fixtures.
@@ -85,6 +100,31 @@ def test_fusion_healthy_big_status_and_gauges():
         assert refs["status_cards"]["uu"]["value"].cget("text") == "就绪"
         assert "192.168.1.101" in refs["status_cards"]["ethernet"]["fact"].cget("text")
         assert refs["headline"].cget("text") == "双链路正常"
+    finally:
+        app._close_dashboard()
+        root.destroy()
+
+
+def test_recovery_page_sleep_action_opens_settings_only_when_needed(monkeypatch):
+    app, root, refs = _open_app()
+    opened = []
+    monkeypatch.setattr(app, "_update_opener",
+                        lambda uri: opened.append(uri) or True)
+    try:
+        app.readiness_report = ReadinessReport(items=[RemoteReadinessItem(
+            "sleep", "睡眠/休眠", False, "睡眠超时已启用", status="ACTION")])
+        app._render_dashboard_ctk(_state())
+        root.update_idletasks()
+        action = refs["sleep_action"]
+        assert action.winfo_manager() == "pack"
+        action.invoke()
+        assert opened == ["ms-settings:powersleep"]
+
+        app.readiness_report = ReadinessReport(items=[RemoteReadinessItem(
+            "sleep", "睡眠/休眠", True, "已关闭", status="PASS")])
+        app._render_dashboard_ctk(_state())
+        root.update_idletasks()
+        assert action.winfo_manager() == ""
     finally:
         app._close_dashboard()
         root.destroy()

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -573,9 +574,109 @@ def test_ui65_manual_uu_restart_requires_explicit_confirmation(monkeypatch):
     app = _make_app(monkeypatch)
     app._remote_app_ops = FakeRemoteAppOps(processes=UU_PROCESSES,
                                            run_entries=UU_RUN_ENTRIES)
-    monkeypatch.setattr(app, "_ui_ask", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_ui_ask", lambda *a, **k: False)
     app.on_restart_uu_remote()
+    assert wait_until(lambda: not app._manual_uu_confirm_busy.is_set())
     assert app._remote_app_ops.killed == [], "未确认却清退了 UU 进程"
+
+
+def test_manual_uu_restart_confirmation_does_not_block_ui_callback(monkeypatch):
+    """Tk 回调必须立即返回，让 UI 队列能显示并处理确认对话框。"""
+    app = _make_app(monkeypatch)
+    app.root = object()
+    ask_started = threading.Event()
+    allow_answer = threading.Event()
+    callback_done = threading.Event()
+
+    def blocked_ask(*args, **kwargs):
+        ask_started.set()
+        allow_answer.wait(1.0)
+        return False
+
+    monkeypatch.setattr(app, "_ui_ask", blocked_ask)
+
+    def invoke_from_ui():
+        try:
+            app.on_restart_uu_remote()
+        finally:
+            callback_done.set()
+
+    callback = threading.Thread(target=invoke_from_ui)
+    callback.start()
+    try:
+        assert ask_started.wait(0.5), "确认请求没有启动"
+        assert callback_done.wait(0.1), "UU 确认等待阻塞了 UI 回调"
+    finally:
+        allow_answer.set()
+        callback.join(1.0)
+
+
+def test_power_settings_action_opens_windows_sleep_page(monkeypatch):
+    app = _make_app(monkeypatch)
+    opened = []
+    monkeypatch.setattr(app, "_update_opener",
+                        lambda uri: opened.append(uri) or True)
+
+    app.on_open_power_settings()
+
+    assert opened == ["ms-settings:powersleep"]
+
+
+def test_notification_click_action_is_bound_to_tray_icon(monkeypatch):
+    app = _make_app(monkeypatch)
+    bound = []
+    shown = []
+    app.icon = SimpleNamespace(
+        set_notification_action=bound.append,
+        notify=lambda message, title: shown.append((message, title)))
+    def action():
+        return None
+
+    tray.TrayApp.notify(app, "在线保护需要处理", "睡眠设置", on_click=action)
+
+    assert bound == [action]
+    assert shown == [("睡眠设置", "在线保护需要处理")]
+
+
+def test_windows_balloon_click_dispatches_only_attached_action():
+    calls = []
+
+    def action():
+        calls.append("opened")
+
+    icon = SimpleNamespace(_notification_action=action)
+    tray.ActionableTrayIcon._on_notify(
+        icon, 0, tray.NIN_BALLOONUSERCLICK)
+    assert icon._notification_action is None
+    assert calls == ["opened"]
+    assert not tray.dispatch_balloon_click(tray.NIN_BALLOONTIMEOUT, action)
+    assert not tray.dispatch_balloon_click(tray.NIN_BALLOONUSERCLICK, None)
+    assert calls == ["opened"]
+
+
+def test_sleep_readiness_notification_opens_power_settings(monkeypatch):
+    app = _make_app(monkeypatch, remote_guard=True)
+    item = SimpleNamespace(key="sleep", status="ACTION")
+    report = SimpleNamespace(
+        warnings=["睡眠/休眠：睡眠超时已启用"], manual_notes=[],
+        items=[item], automatic_ok=False)
+    app.remote = SimpleNamespace(readiness=lambda: report)
+    app._remote_ops = object()
+    monkeypatch.setattr(app, "_maybe_prompt_autologon", lambda _report: None)
+    notices = []
+    monkeypatch.setattr(app, "notify",
+                        lambda *args, **kwargs: notices.append((args, kwargs)))
+    opened = []
+    monkeypatch.setattr(app, "_update_opener",
+                        lambda uri: opened.append(uri) or True)
+
+    app.startup_readiness_check()
+
+    args, kwargs = notices[0]
+    assert args[0] == "在线保护需要处理"
+    assert "点击此通知" in args[1]
+    kwargs["on_click"]()
+    assert opened == ["ms-settings:powersleep"]
 
 
 def test_ui66_manual_uu_restart_aborts_when_verification_fails(monkeypatch):

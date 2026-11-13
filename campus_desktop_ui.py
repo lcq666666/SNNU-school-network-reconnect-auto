@@ -280,6 +280,25 @@ def _tone(widget, tone, *, console=False):
     bind_theme(widget, "tone", tone=tone, console=console)
 
 
+def _set_packed_visibility(widget, visible, **pack_options):
+    """Show or hide an optional packed control without reordering it on refresh."""
+    try:
+        manager = widget.winfo_manager()
+    except (tk.TclError, AttributeError):
+        manager = ""
+    if visible and manager != "pack":
+        widget.pack(**pack_options)
+    elif not visible and manager == "pack":
+        widget.pack_forget()
+
+
+def sleep_action_required(report):
+    """Whether readiness currently exposes the power-settings action."""
+    return bool(report and any(
+        item.key == "sleep" and item.status == "ACTION"
+        for item in report.items))
+
+
 def font(size=14, bold=False):
     # Share immutable font instances within this interpreter, never across Tk roots.
     root = tk._default_root
@@ -698,6 +717,9 @@ def build_recovery_page(app, body, refs):
     refs["readiness"] = label(block, "正在自动检查系统与 UU…", muted=True,
                               wraplength=520, justify="left")
     refs["readiness"].pack(fill="x", pady=(8, 0))
+    refs["sleep_action"] = button(
+        block, "打开电源设置", app.on_open_power_settings)
+    refs["sleep_action"].pack_forget()
     divider(body).pack(fill="x", padx=24, pady=(10, 0))
     refs["steps"] = {}
     for index, (key, title) in enumerate((("detect", "检查连接"),
@@ -982,6 +1004,7 @@ def render_dashboard(app, state):
     refs["protection"].configure(text=f"电脑重启恢复：{reboot}")
     if report is None:
         refs["readiness"].configure(text="正在自动检查系统与 UU…")
+        _set_packed_visibility(refs["sleep_action"], False)
     else:
         lines = ["自动检查：%s" % ("全部通过" if report.automatic_ok else
                                   "有项目需要处理")]
@@ -991,6 +1014,8 @@ def render_dashboard(app, state):
                           item.status, "待确认")
             lines.append("%s：%s（%s）" % (item.label, status, item.detail))
         refs["readiness"].configure(text="\n".join(lines))
+        _set_packed_visibility(refs["sleep_action"], sleep_action_required(report),
+                               anchor="w", pady=(8, 0))
     lines = app._dashboard_timeline_lines(limit=10)
     refs["timeline"].configure(text="\n\n".join(map(translated_event, lines)) if lines
                               else "尚无网络故障事件记录")

@@ -271,6 +271,19 @@ def test_healthy_active_wifi_verification_is_refreshed_before_expiry():
     assert rig.step(D, H, WIFI_IF, dt=15).tick.verify_roles == ("wifi",)
 
 
+def test_wifi_is_reverified_when_interface_facts_arrive_after_initial_gap():
+    """Wi-Fi 初次缺 DNS 时 fail-closed，后续事实补齐后仍独立验证。"""
+    rig = Rig(uu_enabled=False)
+
+    first = rig.step(IU, C, ETH_IF, wifi_dns=())
+    assert "wifi" not in first.tick.verify_roles
+    assert "wifi" in rig.controller._missing_request_roles
+
+    refreshed = rig.step(IU, C, ETH_IF, dt=30.0, wifi_dns=WIFI_DNS)
+    assert refreshed.tick.verify_roles == ("wifi",)
+    assert rig.verifier.roles[-1] == "wifi"
+
+
 def test_two_portal_evictions_on_same_wifi_address_allow_one_uu_restart_each():
     rig = Rig()
     first = rig.step(D, H, WIFI_IF, dt=0)

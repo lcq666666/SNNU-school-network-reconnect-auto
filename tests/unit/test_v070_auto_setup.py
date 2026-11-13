@@ -86,6 +86,23 @@ def test_cancellation_after_client_stop_still_restarts_client(tmp_path):
     assert not result.ready and lifecycle.running
 
 
+def test_without_restart_permission_never_recovers_or_stops_client(tmp_path):
+    compat, root, _ = fixture(tmp_path)
+    lifecycle = Lifecycle()
+    recovered = []
+    lifecycle.recover = lambda: recovered.append("recover")
+    compat.client_running = lambda: lifecycle.running
+    setup = AutomaticSetup(compat, lambda: [root], lifecycle,
+                           allow_client_restart=False)
+
+    result = setup.run()
+
+    assert not result.ready
+    assert recovered == []
+    assert lifecycle.calls == []
+    assert lifecycle.running
+
+
 def test_healthy_configuration_can_restart_a_failed_client_without_rewriting(tmp_path):
     guard, lifecycle, _, _ = setup(tmp_path)
     guard.run()

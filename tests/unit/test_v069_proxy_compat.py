@@ -289,6 +289,7 @@ def test_proxy_dialog_follows_dark_theme_repaint(tmp_path, monkeypatch):
     import campus_desktop_ui as ud
     import campus_proxy_ui as ui
     from tests.fakes import desktop_test_root
+    ud.set_theme("light")
     root = desktop_test_root()
     root.withdraw()
     compat, folder, _ = fixture(tmp_path)
@@ -363,6 +364,7 @@ def test_proxy_dialog_follows_dark_theme_repaint(tmp_path, monkeypatch):
         assert refs["output"].cget("fg_color") == light["SURFACE"]
         assert primary_button.cget("fg_color") == light["ACCENT"]
     finally:
+        ud.set_theme("light")
         root.destroy()
 
 
