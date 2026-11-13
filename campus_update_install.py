@@ -205,13 +205,12 @@ def launch_installer(staged: Path, target: Path, version: str, directory: Path):
                      stderr=subprocess.DEVNULL, close_fds=True)
 
 
-def launch_setup(setup: Path) -> None:
-    """Start a verified Inno Setup package and let it replace the install."""
+def launch_setup(setup: Path):
+    """Start the interactive installer so its post-install launch is available."""
     setup = Path(setup).resolve()
     if not setup.is_file() or setup.suffix.lower() != ".exe":
         raise OSError("安装包文件不存在")
-    subprocess.Popen(
-        [str(setup), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    return subprocess.Popen(
+        [str(setup)],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, close_fds=True)

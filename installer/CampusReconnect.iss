@@ -1,6 +1,6 @@
 ; CampusReconnect standard per-user Windows installer.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.9.4"
+  #define MyAppVersion "0.9.5"
 #endif
 
 #define MyAppName "校园网自动重连助手"
@@ -41,4 +41,4 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--background"; \
-    Description: "启动校园网自动重连助手"; Flags: nowait postinstall skipifsilent
+    Description: "启动校园网自动重连助手"; Flags: nowait postinstall
