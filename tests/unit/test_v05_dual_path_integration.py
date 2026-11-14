@@ -271,6 +271,19 @@ def test_healthy_active_wifi_verification_is_refreshed_before_expiry():
     assert rig.step(D, H, WIFI_IF, dt=15).tick.verify_roles == ("wifi",)
 
 
+def test_connected_standby_is_refreshed_and_failed_verification_is_retried():
+    rig = Rig(uu_enabled=False)
+    rig.controller.refresh_active_verification = True
+    rig.verifier.fail(PATH_WIFI)
+    assert set(rig.step(H, IU, ETH_IF, dt=0).tick.verify_roles) == {"ethernet", "wifi"}
+    assert rig.step(H, IU, ETH_IF, dt=15).tick.verify_roles == ()
+    assert rig.step(H, IU, ETH_IF, dt=15).tick.verify_roles == ("wifi",)
+    rig.verifier.script(PATH_WIFI, {"verified": True})
+    rig.step(H, H, ETH_IF, dt=30)
+    assert "wifi" in rig.step(H, H, ETH_IF, dt=45).tick.verify_roles
+    assert not rig.uu_results
+
+
 def test_wifi_is_reverified_when_interface_facts_arrive_after_initial_gap():
     """Wi-Fi 初次缺 DNS 时 fail-closed，后续事实补齐后仍独立验证。"""
     rig = Rig(uu_enabled=False)

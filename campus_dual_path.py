@@ -812,9 +812,17 @@ class DualPathRecoveryController:
         for role in (PATH_ETHERNET, PATH_WIFI):
             if any(existing == role for existing, _ in wanted):
                 continue
-            if role in self._missing_request_roles \
-                    and _axis_state(self._last_snapshot, role) in CONNECTED_STATES \
-                    and self._should_reverify(role, moment):
+            if _axis_state(self._last_snapshot, role) not in CONNECTED_STATES:
+                continue
+            evidence = self.gate.evidence(role)
+            refresh_due = (evidence is not None
+                           and moment - evidence[0] >= self.gate.max_age * 0.75)
+            periodic = (self.refresh_active_verification
+                        and (self._should_reverify(role, moment) or refresh_due))
+            last = self._attempted.get(role)
+            retry_due = last is None or moment - last >= self.verification_retry_interval
+            if retry_due and (periodic or (role in self._missing_request_roles
+                                          and self._should_reverify(role, moment))):
                 wanted.append((role, "独立确认 %s 接口可以真实上网" % PATH_LABEL.get(role, role)))
 
         requests: List[Any] = []

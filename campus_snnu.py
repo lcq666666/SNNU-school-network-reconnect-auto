@@ -116,6 +116,7 @@ class SnnuAuthError(str, Enum):
     AUTH_PATH_UNCONFIRMED = "E_SNNU_AUTH_PATH_UNCONFIRMED"
     PORTAL_UNREACHABLE = "E_SNNU_PORTAL_UNREACHABLE"
     AUTH_FAILED = "E_SNNU_AUTH_FAILED"
+    INTERNET_UNREACHABLE = "E_SNNU_INTERNET_UNREACHABLE"
 
 
 # --------------------------------------------------------------------------- #
@@ -580,6 +581,9 @@ class SnnuBackupLink:
         result.ok = bool(getattr(repair, "ok", False))
         if result.ok:
             result.evidence.append("受控认证成功：%s" % result.detail)
+        elif getattr(repair, "auth_ok", False) is True:
+            result.error = SnnuAuthError.INTERNET_UNREACHABLE.value
+            result.evidence.append("校园认证成功，但无线公网验证未通过")
         else:
             result.error = SnnuAuthError.AUTH_FAILED.value
             result.evidence.append("受控认证未成功：%s（%s）"

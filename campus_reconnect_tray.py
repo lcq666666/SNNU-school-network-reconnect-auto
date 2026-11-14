@@ -3657,6 +3657,34 @@ class TrayApp:
             self.log.warning("[代理守护] 连续三次代理探测失败：保留客户端，不自动停止或拉起窗口")
         return False
 
+    def _repair_standby_wifi(self, wifi):
+        from campus_network import NetworkObserver
+        from campus_snnu import SnnuBackupLink
+        from tools.netdiag import PowerShellRunner
+
+        cfg = self.get_config()
+        observer = NetworkObserver(PowerShellRunner(timeout=5))
+        with direct_session() as session:
+            link = SnnuBackupLink(
+                ops=engine._snnu_ops(session, observer, self.log, wifi.interface,
+                                     require_web=True, force_login=True,
+                                     cancelled=self._cancelled,
+                                     sleep=self.stop_event.wait), session=session,
+                target_ssid=cfg.get("ssid") or "SNNU", interface=wifi.interface,
+                if_index=wifi.if_index, source_ip=wifi.source_ip,
+                allow_auth=True, reconnect_wifi=True, port=cfg.get("port"),
+                operator=cfg.get("yys", "mobile"),
+                account_format=cfg.get("account_format", "plain"),
+                sleep=self.stop_event.wait, log=self.log.info)
+            result = link.run()
+        if result.ok:
+            self._standby_auth_notified = False
+            self.snapshot_source().invalidate("备用 Wi-Fi 维护完成，重新采集并验证")
+        elif not getattr(self, "_standby_auth_notified", False):
+            self._standby_auth_notified = True
+            self.notify("无线备用连接待恢复", result.detail or "校园认证未完成，请检查账号或打开登录页")
+        return result
+
     def _lifeline_tick(self):
         if self._lifeline_busy.is_set() or self._repair_busy.is_set():
             return
@@ -3680,6 +3708,16 @@ class TrayApp:
             if direct_ok and self._automatic_setup_armed:
                 return self._guard_proxy_health()
             return direct_ok
+
+        def standby_repair():
+            from campus_resilience import StandbyWifiGuard
+            if not hasattr(self, "_standby_wifi_guard"):
+                self._standby_wifi_guard = StandbyWifiGuard(
+                    active(self._repair_standby_wifi), log=self.log.info)
+            moment = time.monotonic()
+            observation = self.snapshot_source().observe(moment)
+            self._standby_wifi_guard.tick(observation.snapshot,
+                trusted=observation.trusted, now=moment)
 
         def repair():
             cfg = self.get_config()
@@ -3743,7 +3781,8 @@ class TrayApp:
                         proxy_restore=native.proxy_restore, repair=active(repair),
                         reboot_ready=lambda: get_autostart() and autologon_ready(),
                         reboot=active(native.schedule_reboot), cancel_reboot=native.cancel_reboot,
-                        network_repair=active(network_repair))
+                        network_repair=active(network_repair),
+                        standby_repair=active(standby_repair))
                     self._lifeline = RecoveryController(
                         data_directory() / "recovery.json", ops,
                         log=lambda message: self.log.info("[三层恢复] %s", message))

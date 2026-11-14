@@ -1446,7 +1446,9 @@ def failover(session: requests.Session, args: argparse.Namespace,
 
 
 def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
-              interface: Optional[str], *, require_web: bool = False) -> SnnuOps:
+              interface: Optional[str], *, require_web: bool = False,
+              force_login: bool = False, cancelled=lambda: False,
+              sleep=time.sleep) -> SnnuOps:
     """P4 CLI 侧的注入式能力集合（指向本模块真实函数，便于测试替换）。
 
     ``repair`` 封装调用 ``campus_core.repair_service``（**不重写认证引擎**，
@@ -1475,9 +1477,13 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         if require_web:
             # Portal 或过滤网关可能允许 TCP 握手；认证前后都按网页内容确认公网。
             verify_web = partial(verify_internet, stop_on_failed_gate=True)
+            adapters = replace(_cli_adapters(), probe_online=verify_web)
+            if force_login:
+                adapters = replace(adapters, login=lambda sess, account, password, yys, port, logger:
+                    portal_login_detailed(sess, account, password, yys, port, logger, force_login=True))
             return repair_service(bound_session, options, time.monotonic,
-                                  replace(_cli_adapters(), probe_online=verify_web),
-                                  get_credentials, log=log)
+                                  adapters, get_credentials, log=log,
+                                  cancelled=cancelled, sleep=sleep)
         try:
             source_ip = _refresh_binding().source_ip
         except Exception as exc:  # 取不到源地址 ⇒ 不做 IP 级证据（见 _bound_tcp_probe）

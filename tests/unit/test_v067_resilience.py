@@ -44,6 +44,15 @@ def test_outage_advances_without_snapshot(tmp_path):
     assert calls[5] == "uu"
 
 
+def test_healthy_primary_still_maintains_standby_without_escalating(tmp_path):
+    controller, calls, _ = make_controller(tmp_path, online=True, uu=True)
+    controller.ops.standby_repair = lambda: calls.append("standby")
+    controller.tick(1000, allow_reboot=True)
+    assert calls == ["standby"]
+    assert controller.state["outage_at"] is None
+    assert controller.state["stage"] == "healthy"
+
+
 def test_proxy_restored_when_repair_raises(tmp_path):
     controller, calls, _ = make_controller(tmp_path, repair_error=True)
     controller.tick(1000)

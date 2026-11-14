@@ -27,6 +27,7 @@ class RecoveryOps:
     # production supplies a network-only reconnect so proxy/auth work remains
     # isolated to layer two.
     network_repair: Callable | None = None
+    standby_repair: Callable | None = None
 
 
 class RecoveryController:
@@ -89,6 +90,11 @@ class RecoveryController:
                               reboot_pending=False)
             self.save()
             self.detail = "公网校验通过，UU 已建立外部连接（远端会话可用性待控制端确认）"
+            if self.ops.standby_repair is not None:
+                try:
+                    self.ops.standby_repair()
+                except Exception as exc:
+                    self.log("备用链路维护未完成（%s），下轮继续检查" % type(exc).__name__)
             return
         if self.state["outage_at"] is None:
             self.state.update(stage="confirming", outage_at=now, next_action=now + 30)
@@ -146,3 +152,42 @@ class RecoveryController:
         self.ops.restart_uu()
         self.state["next_action"] = max(now + 180, self.clock() + 180)
         self.save()
+
+
+class StandbyWifiGuard:
+    """Maintain Wi-Fi behind a verified primary, with bounded serial retries."""
+
+    def __init__(self, repair, *, log=None):
+        self.repair = repair
+        self.log = log or (lambda message: None)
+        self.failures = 0
+        self.attempts = []
+
+    def tick(self, snapshot, *, trusted, now):
+        from campus_network import HealthState
+
+        eth = getattr(snapshot, "ethernet", None)
+        wifi = getattr(snapshot, "wifi", None)
+        egress = getattr(getattr(snapshot, "system", None), "egress", None)
+        if (not trusted or eth is None or wifi is None
+                or eth.state is not HealthState.HEALTHY
+                or getattr(egress, "if_index", None) != eth.if_index
+                or not wifi.if_index or not wifi.interface):
+            self.failures = 0
+            return
+        failures = {HealthState.CAPTIVE_PORTAL, HealthState.INTERNET_UNREACHABLE,
+                    HealthState.DNS_FAILURE, HealthState.LINK_DOWN, HealthState.NO_IP}
+        if wifi.state not in failures:
+            self.failures = 0
+            return
+        self.failures += 1
+        if self.failures < 3:
+            return
+        self.attempts = [stamp for stamp in self.attempts if now - stamp < 600]
+        if (len(self.attempts) >= 2
+                or self.attempts and now - self.attempts[-1] < 180):
+            return
+        self.attempts.append(now)
+        self.log("有线正常，维护 SNNU 无线备用链路（限定无线接口）")
+        result = self.repair(wifi)
+        self.log("无线备用维护结果：%s" % (getattr(result, "detail", "") or "等待独立验证"))
