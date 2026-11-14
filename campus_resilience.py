@@ -80,6 +80,11 @@ class RecoveryController:
         network = self.ops.network_ok()
         uu = self.ops.uu_ok() if network else False
         self.last_network, self.last_uu = network, uu
+        if network is True and self.ops.standby_repair is not None:
+            try:
+                self.ops.standby_repair()
+            except Exception as exc:
+                self.log("备用链路维护未完成（%s），下轮继续检查" % type(exc).__name__)
         if network is None or uu is None:
             self.detail = "网络或 UU 状态采集失败，等待复核"
             return
@@ -90,11 +95,6 @@ class RecoveryController:
                               reboot_pending=False)
             self.save()
             self.detail = "公网校验通过，UU 已建立外部连接（远端会话可用性待控制端确认）"
-            if self.ops.standby_repair is not None:
-                try:
-                    self.ops.standby_repair()
-                except Exception as exc:
-                    self.log("备用链路维护未完成（%s），下轮继续检查" % type(exc).__name__)
             return
         if self.state["outage_at"] is None:
             self.state.update(stage="confirming", outage_at=now, next_action=now + 30)
@@ -157,8 +157,9 @@ class RecoveryController:
 class StandbyWifiGuard:
     """Maintain Wi-Fi behind a verified primary, with bounded serial retries."""
 
-    def __init__(self, repair, *, log=None):
+    def __init__(self, repair, *, reset=None, log=None):
         self.repair = repair
+        self.reset = reset
         self.log = log or (lambda message: None)
         self.failures = 0
         self.attempts = []
@@ -190,4 +191,12 @@ class StandbyWifiGuard:
         self.attempts.append(now)
         self.log("有线正常，维护 SNNU 无线备用链路（限定无线接口）")
         result = self.repair(wifi)
+        repair = getattr(result, "repair", None)
+        if (self.reset is not None and not getattr(result, "ok", False)
+                and getattr(repair, "auth_ok", False) is True
+                and getattr(repair, "network_ok", None) is False):
+            renewed = self.reset(wifi)
+            if renewed is not None:
+                result = renewed
         self.log("无线备用维护结果：%s" % (getattr(result, "detail", "") or "等待独立验证"))
+        return result

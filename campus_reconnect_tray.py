@@ -249,6 +249,7 @@ DEFAULT_CONFIG = {
     "lifeline_enabled": False,
     "automatic_proxy_enabled": True,
     "lifeline_reboot_enabled": False,
+    "standby_session_reset_enabled": False,
     "lock_after_autologon": True,
     "autologon_prompted": False,
     "update_check_enabled": True,  # 启动 15 秒后首次检查，失败 5 分钟重试
@@ -535,7 +536,7 @@ def load_config() -> dict:
     cfg.update(_read_update_keys(text))
     raw = _raw_config(text)
     for key in ("lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon",
-                "automatic_proxy_enabled", "autologon_prompted"):
+                "automatic_proxy_enabled", "autologon_prompted", "standby_session_reset_enabled"):
         cfg[key] = raw.get(key) if isinstance(raw.get(key), bool) else DEFAULT_CONFIG[key]
     if not result.ok:
         logger = logging.getLogger("campus")
@@ -3680,10 +3681,72 @@ class TrayApp:
         if result.ok:
             self._standby_auth_notified = False
             self.snapshot_source().invalidate("备用 Wi-Fi 维护完成，重新采集并验证")
-        elif not getattr(self, "_standby_auth_notified", False):
+        elif (not cfg.get("standby_session_reset_enabled", False)
+              and not getattr(self, "_standby_auth_notified", False)):
             self._standby_auth_notified = True
             self.notify("无线备用连接待恢复", result.detail or "校园认证未完成，请检查账号或打开登录页")
         return result
+
+    def _reset_standby_wifi(self, wifi):
+        from campus_network import WindowsProbeEngine, _interface_dns
+        from campus_session_reset import reset_wireless_session
+        from campus_dual_path import path_request_from_snapshot
+        from tools import netdiag
+
+        def allowed():
+            cfg = self.get_config()
+            return (not self._cancelled() and cfg.get("lifeline_enabled", False)
+                    and cfg.get("standby_session_reset_enabled", False))
+
+        if not allowed():
+            return None
+        observation = self.snapshot_source().observe(time.monotonic())
+        if not observation.trusted:
+            return None
+        snapshot = observation.snapshot
+        current = getattr(snapshot, "wifi", None)
+        if (current is None or current.if_index != wifi.if_index
+                or current.source_ip != wifi.source_ip):
+            return None
+        report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
+        adapter = next((item for item in report.adapters
+                        if item.if_index == wifi.if_index and item.name == wifi.interface), None)
+        if (adapter is None or adapter.media != "wifi" or adapter.virtual is True
+                or engine._wifi_source_ip(report, wifi.if_index) != wifi.source_ip):
+            return None
+        def primary_ready():
+            fresh = self.snapshot_source().observe(time.monotonic())
+            if not allowed() or not fresh.trusted:
+                return False
+            snap = fresh.snapshot
+            eth = getattr(snap, "ethernet", None)
+            wire = getattr(snap, "wifi", None)
+            egress = getattr(getattr(snap, "system", None), "egress", None)
+            request = path_request_from_snapshot(snap, "ethernet")
+            if (eth is None or eth.state is not HealthState.HEALTHY or request is None
+                    or getattr(egress, "if_index", None) != eth.if_index
+                    or wire is None or wire.if_index != wifi.if_index
+                    or wire.source_ip != wifi.source_ip
+                    or engine.wifi_state(wifi.interface)[0] != (self.get_config().get("ssid") or "SNNU")):
+                return False
+            return self._build_path_verifier().verify(request).allows_recovery
+
+        creds = get_credentials()
+        if not creds:
+            return None
+        account = creds[0]
+        del creds
+        with direct_session() as session:
+            transport = WindowsProbeEngine(timeout=3).for_interface(
+                wifi.if_index, wifi.source_ip, _interface_dns(report, wifi.if_index))
+            transport.bind_session(session)
+            if engine.verify_internet(session, stop_on_failed_gate=True)[0]:
+                return None
+            return reset_wireless_session(
+                session=session, wifi=wifi, mac=adapter.mac, account=account,
+                journal=data_directory() / "wireless-session-reset.json",
+                primary_ready=primary_ready, relogin=lambda: self._repair_standby_wifi(wifi),
+                enabled=allowed(), cancelled=lambda: not allowed(), log=self.log.info)
 
     def _lifeline_tick(self):
         if self._lifeline_busy.is_set() or self._repair_busy.is_set():
@@ -3713,11 +3776,15 @@ class TrayApp:
             from campus_resilience import StandbyWifiGuard
             if not hasattr(self, "_standby_wifi_guard"):
                 self._standby_wifi_guard = StandbyWifiGuard(
-                    active(self._repair_standby_wifi), log=self.log.info)
+                    active(self._repair_standby_wifi), reset=active(self._reset_standby_wifi),
+                    log=self.log.info)
             moment = time.monotonic()
             observation = self.snapshot_source().observe(moment)
-            self._standby_wifi_guard.tick(observation.snapshot,
+            result = self._standby_wifi_guard.tick(observation.snapshot,
                 trusted=observation.trusted, now=moment)
+            if result is not None and not result.ok and not getattr(self, "_standby_auth_notified", False):
+                self._standby_auth_notified = True
+                self.notify("无线备用连接待恢复", result.detail or "无线公网未恢复，将继续检查")
 
         def repair():
             cfg = self.get_config()
@@ -4502,13 +4569,15 @@ class TrayApp:
         recover = page("恢复")
         v_lifeline = tk.BooleanVar(value=bool(self.config.get("lifeline_enabled", False)))
         v_reboot = tk.BooleanVar(value=bool(self.config.get("lifeline_reboot_enabled", False)))
+        v_session_reset = tk.BooleanVar(value=bool(self.config.get("standby_session_reset_enabled", False)))
         def save_lifeline():
             if v_reboot.get() and not self.config.get("lifeline_reboot_enabled", False):
                 if not messagebox.askyesno("启用强制重启恢复", "连续故障15分钟后，电脑将在60秒倒计时后强制重启。\n未保存文件可能丢失，每6小时最多一次。是否启用？", parent=win):
                     v_reboot.set(False)
                     return
             cfg = self.get_config()
-            cfg.update(lifeline_enabled=v_lifeline.get(), lifeline_reboot_enabled=v_reboot.get())
+            cfg.update(lifeline_enabled=v_lifeline.get(), lifeline_reboot_enabled=v_reboot.get(),
+                       standby_session_reset_enabled=v_session_reset.get())
             if save_config(cfg):
                 self.update_config(cfg)
             else:
@@ -4521,6 +4590,11 @@ class TrayApp:
                    command=self._configure_boot_recovery).grid(row=10, column=0, sticky="w", pady=8)
         ttk.Label(recover, text="自动登录需本地输入Windows账户密码。启用后先做一次受控重启验收。",
                   wraplength=560).grid(row=11, column=0, sticky="w")
+        ttk.Checkbutton(recover, text="无线持续无法上网时，允许断开本机校园无线会话后重新登录",
+                        variable=v_session_reset, command=save_lifeline).grid(
+                            row=12, column=0, sticky="w", pady=8)
+        ttk.Label(recover, text="有线验证通过、普通重登失败后才尝试，每6小时最多一次。",
+                  wraplength=560).grid(row=13, column=0, sticky="w")
         ttk.Label(recover, text="远程保障与切回策略",
                   font=("Microsoft YaHei", 10, "bold")).grid(
                       row=0, column=0, sticky="w", pady=(0, 6))
