@@ -10,6 +10,11 @@ from campus_update_install import UPDATE_SCRIPT
 from campus_reconnect_tray import _load_check
 
 
+def test_update_manifest_is_read_as_utf8():
+    assert ("Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 "
+            "| ConvertFrom-Json") in UPDATE_SCRIPT
+
+
 def test_updater_preflights_staged_exe_before_replacing_installed_exe():
     startup_check = UPDATE_SCRIPT.index("--load-check")
     replace_exe = UPDATE_SCRIPT.index("[IO.File]::Replace($incoming, $target, $backup)")

@@ -12,7 +12,7 @@ from campus_install import atomic_json
 UPDATE_SCRIPT = r'''
 param([string]$Manifest)
 $ErrorActionPreference = 'Stop'
-$taskConfig = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
+$taskConfig = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
 $target = [IO.Path]::GetFullPath($taskConfig.target)
 $staged = [IO.Path]::GetFullPath($taskConfig.staged)
 $backup = $target + '.previous'
