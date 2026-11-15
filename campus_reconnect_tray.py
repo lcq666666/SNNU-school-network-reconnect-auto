@@ -3766,10 +3766,69 @@ class TrayApp:
             return run
 
         def network_ok():
-            with direct_session() as session:
-                direct_ok = bool(verify_internet(session)[0])
+            # Lifeline health must use the same interface-scoped verifier as
+            # the dual-path recovery flow.  The old unbound probe could fail
+            # on one public hostname (or use the wrong default route) and then
+            # make the recovery controller reset Wi-Fi unnecessarily.
+            controller = getattr(self, "dual_path", None)
+            role = self._active_role_hint()
+            request = (controller.verification_request(role)
+                       if controller is not None else None)
+            # A snapshot can be temporarily untrusted while its collector is
+            # rebuilding after DHCP/interface changes.  Refresh the read-only
+            # facts once and derive whichever physical path is actually
+            # present; do not let a stale ``ethernet`` fallback suppress Wi-Fi
+            # recovery on a Wi-Fi-only machine.
+            if request is None:
+                try:
+                    observation = self._observe_snapshot(time.monotonic())
+                    snapshot = (getattr(observation, "usable_snapshot", None)
+                                or getattr(observation, "snapshot", None))
+                    for candidate in (role, "wifi", "ethernet"):
+                        request = (path_request_from_snapshot(
+                            snapshot, candidate,
+                            generation=(controller.network_epoch if controller else 0))
+                                   if snapshot is not None else None)
+                        if request is not None:
+                            role = candidate
+                            break
+                except Exception as exc:
+                    self.log.info("[三层恢复] 活动接口快照暂不可用：%s", type(exc).__name__)
+            if request is None:
+                self.log.info("[三层恢复] 缺少活动接口事实，暂不执行网络修复")
+                return None
+            try:
+                verification = self._build_path_verifier().verify(request)
+            except Exception as exc:
+                self.log.warning("[三层恢复] 接口受限公网验证异常：%s", type(exc).__name__)
+                return None
+            direct_ok = bool(verification.allows_recovery)
+            if not direct_ok:
+                # Baidu is a recovery gate, but it is also a single upstream
+                # dependency.  If two independent interface-bound targets are
+                # healthy and the gate failed only with a transient DNS/
+                # connection/timeout error, keep the Wi-Fi session intact and
+                # retry the gate later instead of resetting the adapter.
+                gate = getattr(verification, "gate_result", None)
+                gate_error = str(getattr(gate, "error", "") or "").lower()
+                cross_hits = sum(1 for item in
+                                 getattr(verification, "cross_results", ())
+                                 if getattr(item, "ok", False))
+                if (not getattr(verification, "captive_portal", False)
+                        and gate_error in {"dns", "connection", "timeout"}
+                        and cross_hits >= 2):
+                    direct_ok = True
+                    self.log.warning(
+                        "[三层恢复] 公网接口可用但百度闸门单点异常（交叉 %d/3），保留 Wi-Fi，稍后复核",
+                        cross_hits)
+            if not direct_ok:
+                self.log.info("[三层恢复] %s 接口验证未通过：%s",
+                              role, verification.reason or "未验证")
             if direct_ok and self._automatic_setup_armed:
-                return self._guard_proxy_health()
+                # Clash/system-proxy health is a separate axis.  A proxy
+                # failure may need proxy remediation, but must not trigger
+                # Wi-Fi reconnect or Portal re-authentication.
+                self._guard_proxy_health()
             return direct_ok
 
         def standby_repair():
@@ -3791,8 +3850,12 @@ class TrayApp:
             cfg.update(reconnect_wifi=True, browser_fallback=False)
             adapters = self._repair_adapters()
             adapters.probe_online = lambda session: verify_internet(session, stop_on_failed_gate=True)
+            # Reuse an already valid Portal session.  Forcing a POST on every
+            # second-layer retry can evict another device when the account has
+            # a concurrent-device limit; authentication is attempted only when
+            # the status page actually says this session needs it.
             adapters.login = lambda session, account, password, yys, port, log: engine.portal_login_detailed(
-                session, account, password, yys, port, log, force_login=True)
+                session, account, password, yys, port, log)
             with direct_session() as session:
                 result = repair_service(
                     session, RepairOptions.from_mapping(cfg), time.monotonic,
@@ -3820,6 +3883,13 @@ class TrayApp:
             prevents a healthy proxy configuration from being touched.
             """
             cfg = self.get_config()
+            current_ssid, _state = wifi_state(cfg.get("interface"))
+            target_ssid = (cfg.get("ssid") or "SNNU").strip()
+            if current_ssid and current_ssid.strip() == target_ssid:
+                # The link is already associated.  Do not issue ``netsh
+                # wlan connect`` for a Portal/DNS problem: Windows may tear
+                # down the adapter even though only authentication is stale.
+                return True, "Wi-Fi 已连接，跳过强制重连"
             ok = wifi_reconnect(cfg.get("ssid") or "SNNU", self.log,
                                 profile=cfg.get("profile"),
                                 interface=cfg.get("interface"))

@@ -37,11 +37,12 @@ def test_outage_advances_without_snapshot(tmp_path):
     controller, calls, _ = make_controller(tmp_path)
     controller.tick(1000)
     controller.tick(1031)
-    assert calls == ["repair", "uu"]
+    assert calls == ["repair"]
     controller.tick(1092)
-    assert calls[2:4] == ["proxy-off", "repair"]
-    assert calls[4][0] == "restore"
-    assert calls[5] == "uu"
+    assert "proxy-off" in calls
+    assert "repair" in calls[2:]
+    assert any(isinstance(item, tuple) and item[0] == "restore" for item in calls)
+    assert "uu" not in calls
 
 
 def test_healthy_primary_still_maintains_standby_without_escalating(tmp_path):
@@ -89,10 +90,34 @@ def test_healthy_network_with_uu_missing_recovers_uu(tmp_path):
     controller, calls, status = make_controller(tmp_path, online=True)
     controller.tick(1000)
     controller.tick(1031)
-    assert calls == ["repair", "uu"]
+    assert calls == []
+    assert controller.state["stage"] == "uu_restart"
+    controller.tick(1062)
+    assert calls == ["uu"]
     status["uu"] = True
     controller.tick(1040)
     assert controller.state["stage"] == "healthy"
+
+
+def test_network_outage_never_restarts_uu_even_after_second_layer(tmp_path):
+    controller, calls, _ = make_controller(tmp_path)
+    for stamp in (1000, 1031, 1092, 1273):
+        controller.tick(stamp)
+    assert "uu" not in calls
+
+
+def test_network_recovery_hands_off_to_uu_only_after_stable_recheck(tmp_path):
+    controller, calls, status = make_controller(tmp_path)
+    controller.tick(1000)
+    controller.tick(1031)
+    status.update(online=True, uu=False)
+    controller.tick(1100)
+    assert calls == ["repair"]
+    assert controller.state["stage"] == "uu_restart"
+    controller.tick(1129)
+    assert calls == ["repair"]
+    controller.tick(1131)
+    assert calls == ["repair", "uu"]
 
 
 def test_recovery_cancels_pending_reboot(tmp_path):
