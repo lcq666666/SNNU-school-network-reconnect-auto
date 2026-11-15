@@ -964,6 +964,42 @@ def _ipv4_ready(interface: Optional[str] = None) -> bool:
     return parse_ipconfig_ipv4(text, interface)
 
 
+def wifi_renew(interface: Optional[str], log: logging.Logger,
+               wait: Optional[Callable[[], bool]] = None,
+               timeout: float = 20.0) -> bool:
+    """Renew an associated adapter's DHCP lease without tearing down Wi-Fi.
+
+    A connected SSID with no usable IPv4 is a DHCP/address problem, not a
+    reason to issue ``netsh wlan connect`` immediately.  The bounded renew is
+    deliberately separate from :func:`wifi_reconnect` so callers can preserve
+    the radio association and any existing Portal session.
+    """
+    name = (interface or "").strip()
+    args = ["ipconfig", "/renew"] + ([name] if name else [])
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        done = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=10, check=False, creationflags=creationflags)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("DHCP 续租异常: %s", type(exc).__name__)
+        return False
+    if done.returncode != 0:
+        log.info("DHCP 续租未完成（返回码 %s）", done.returncode)
+        return False
+    ready = wait or (lambda: _ipv4_ready(interface))
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        try:
+            if ready():
+                log.info("Wi-Fi %s DHCP 续租后已获得可用地址。", name or "接口")
+                return True
+        except Exception as exc:
+            log.warning("等待 DHCP 地址异常: %s", type(exc).__name__)
+        time.sleep(2.0)
+    log.warning("Wi-Fi %s DHCP 续租后仍无可用 IPv4。", name or "接口")
+    return False
+
+
 def wifi_reconnect(ssid: str, log: logging.Logger, profile: Optional[str] = None,
                    interface: Optional[str] = None,
                    wait: Optional[Callable[[], bool]] = None,

@@ -283,3 +283,21 @@ def test_t29_reconnect_timeout_without_real_sleep(monkeypatch):
 
 def test_t29_reconnect_empty_name_is_rejected():
     assert engine.wifi_reconnect("", LOG) is False
+
+
+def test_dhcp_renew_keeps_association_and_waits_for_address(monkeypatch):
+    calls = {}
+
+    def fake_run(args, **kwargs):
+        calls["args"] = args
+        return _Done(0)
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    assert engine.wifi_renew("WLAN", LOG, wait=lambda: True) is True
+    assert calls["args"][:2] == ["ipconfig", "/renew"]
+    assert calls["args"][2:] == ["WLAN"]
+
+
+def test_dhcp_renew_failure_does_not_claim_recovery(monkeypatch):
+    monkeypatch.setattr(engine.subprocess, "run", lambda args, **kwargs: _Done(1))
+    assert engine.wifi_renew("WLAN", LOG, wait=lambda: True) is False

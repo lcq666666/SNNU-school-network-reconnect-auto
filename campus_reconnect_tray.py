@@ -76,7 +76,7 @@ from campus_reconnect import (VERIFY_DNS_DEGRADED,
                               internet_ok, ip_channel_ok, portal_login,
                               portal_reachable,
                               resolve_port, setup_logging, verify_internet,
-                              wifi_reconnect, wifi_state, PORTAL_ROOT)
+                              wifi_reconnect, wifi_renew, wifi_state, PORTAL_ROOT)
 from campus_windows import CredentialStore, ProxyController, default_refresh
 from campus_install import data_directory, migrate_config, previous_install_directory
 from campus_tray_failover import (MODE_ORDER, TrayFailoverBridge, light_snapshot,
@@ -3886,6 +3886,12 @@ class TrayApp:
             current_ssid, _state = wifi_state(cfg.get("interface"))
             target_ssid = (cfg.get("ssid") or "SNNU").strip()
             if current_ssid and current_ssid.strip() == target_ssid:
+                if not engine._ipv4_ready(cfg.get("interface")):
+                    renewed = wifi_renew(cfg.get("interface"), self.log)
+                    if renewed:
+                        return True, "Wi-Fi 已连接，DHCP 续租后地址已恢复"
+                    self.log.warning("Wi-Fi 已关联但无可用 IPv4，DHCP 续租失败，暂不强制重连")
+                    return False, "Wi-Fi 已关联但未获得可用 IPv4"
                 # The link is already associated.  Do not issue ``netsh
                 # wlan connect`` for a Portal/DNS problem: Windows may tear
                 # down the adapter even though only authentication is stale.
@@ -3894,6 +3900,33 @@ class TrayApp:
                                 profile=cfg.get("profile"),
                                 interface=cfg.get("interface"))
             return bool(ok), "Wi-Fi 已重新连接" if ok else "Wi-Fi 常规重连未完成"
+
+        def restart_uu_after_network():
+            """Final UU fallback: honor the user switch and shared cooldown."""
+            if not self.get_config().get("remote_restart_enabled", False):
+                self.log.info("[三层恢复] UU 兜底未开启，保留现有进程")
+                return False
+            if self._uu_available is False:
+                return False
+            guard = self._get_restart_guard()
+            allowed, reason = guard.allow()
+            if not allowed:
+                self.log.info("[三层恢复] UU 兜底跳过：%s", reason)
+                return False
+            try:
+                # ``native`` is imported in the worker below so importing the
+                # tray module remains safe on non-Windows hosts.  This
+                # callback runs from that worker, but it is also directly
+                # exercised by recovery tests; keep the dependency local so
+                # the closure never relies on a function-local name from
+                # ``run``.
+                import campus_resilience_windows as native
+                native.restart_uu(self.log.info)
+            except Exception as exc:
+                self.log.warning("[三层恢复] UU 兜底重启失败：%s", type(exc).__name__)
+                return False
+            guard.mark()
+            return True
 
         def run():
             try:
@@ -3912,7 +3945,7 @@ class TrayApp:
                         return native.uu_connected()
                     ops = RecoveryOps(
                         network_ok=network_ok, uu_ok=uu_ok,
-                        restart_uu=active(lambda: native.restart_uu(self.log.info) if self._uu_available else None),
+                        restart_uu=active(restart_uu_after_network),
                         proxy_snapshot=native.proxy_snapshot,
                         proxy_disable=active(native.proxy_disable),
                         proxy_restore=native.proxy_restore, repair=active(repair),

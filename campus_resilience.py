@@ -123,7 +123,14 @@ class RecoveryController:
             self.state.update(stage="uu_wait", next_action=now + 60)
             self.save()
             self.log("网络恢复后 UU 兜底：网络已确认恢复，UU 仍未建立外连，才重启 UU")
-            self.ops.restart_uu()
+            attempted = self.ops.restart_uu()
+            if attempted is False:
+                # A disabled/cooldown-limited fallback is not a successful
+                # restart.  Keep observing the already healthy network and
+                # retry after the controller's normal interval instead of
+                # getting stuck in ``uu_wait`` until the next outage.
+                self.state.update(stage="uu_observe", next_action=now + 60)
+                self.detail = "网络已恢复，UU 兜底暂未执行，等待下一轮复核"
             self.state["next_action"] = max(now, self.clock()) + 60
             self.save()
             return

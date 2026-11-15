@@ -120,6 +120,33 @@ def test_network_recovery_hands_off_to_uu_only_after_stable_recheck(tmp_path):
     assert calls == ["repair", "uu"]
 
 
+def test_uu_fallback_disabled_returns_to_observation(tmp_path):
+    controller, calls, status = make_controller(tmp_path, online=True)
+    controller.ops.restart_uu = lambda: calls.append("skip") or False
+    controller.tick(1000)
+    controller.tick(1031)
+    controller.tick(1062)
+    assert calls == ["skip"]
+    assert controller.state["stage"] == "uu_observe"
+
+
+def test_uu_fallback_exception_does_not_mark_restart_success(tmp_path):
+    controller, calls, status = make_controller(tmp_path, online=True)
+
+    def fail():
+        calls.append("attempt")
+        raise RuntimeError("disabled")
+
+    controller.ops.restart_uu = fail
+    controller.tick(1000)
+    controller.tick(1031)
+    with pytest.raises(RuntimeError):
+        controller.tick(1062)
+    # The controller's exception contract remains unchanged; the caller's
+    # wrapper is responsible for swallowing operational UU errors.
+    assert calls == ["attempt"]
+
+
 def test_recovery_cancels_pending_reboot(tmp_path):
     controller, calls, status = make_controller(tmp_path)
     controller.tick(1000)

@@ -1,5 +1,11 @@
 # 校园网自动重连助手（SNNU · Windows · Clash Verge Rev）
 
+## v0.10.2 网络恢复顺序与 DHCP 修复
+
+第一层恢复会优先保留已关联的 SNNU Wi-Fi：已有 IPv4 时不重复执行无线重连，只有缺少地址时先尝试 DHCP 续租，避免驱动重置和认证会话被无谓中断。第二层继续复用现有校园网会话，避免因账号设备数限制重复提交登录。只有网络已连续确认恢复、UU 外连仍失败且 UU 兜底开关和冷却条件允许时，才执行 UU 重启；网络未恢复时不会重启 UU。
+
+[下载 v0.10.2](https://github.com/lcq666666/SNNU-school-network-reconnect-auto/releases/tag/v0.10.2)。
+
 ## v0.10.1 修复安装后启动失败
 
 安装版改用目录式运行，将 Python 和应用依赖安装到程序目录，不再从 `%TEMP%\_MEI...` 临时解压后加载。安装程序要求 Windows 10/11。便携版仍是单文件格式；遇到 `Failed to load Python DLL` 时请使用 `CampusReconnectSetup.exe` 安装版。
