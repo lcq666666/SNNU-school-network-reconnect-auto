@@ -1,4 +1,6 @@
 """Static and offline checks for the standard Windows installer path."""
+from pathlib import Path
+
 import pytest
 
 
@@ -26,6 +28,7 @@ def test_build_finds_per_user_inno_setup_installation(tmp_path, monkeypatch):
     compiler.parent.mkdir(parents=True)
     compiler.write_bytes(b"MZ")
     monkeypatch.setattr(build_installer.shutil, "which", lambda _: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: path == compiler)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
 
     assert build_installer.find_iscc() == str(compiler)

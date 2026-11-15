@@ -1,10 +1,10 @@
 # 校园网自动重连助手（SNNU · Windows · Clash Verge Rev）
 
-## v0.10.0 修复安装后启动失败
+## v0.10.1 修复安装后启动失败
 
 安装版改用目录式运行，将 Python 和应用依赖安装到程序目录，不再从 `%TEMP%\_MEI...` 临时解压后加载。安装程序要求 Windows 10/11。便携版仍是单文件格式；遇到 `Failed to load Python DLL` 时请使用 `CampusReconnectSetup.exe` 安装版。
 
-[下载 v0.10.0](https://github.com/lcq666666/SNNU-school-network-reconnect-auto/releases/tag/v0.10.0)。
+[下载 v0.10.1](https://github.com/lcq666666/SNNU-school-network-reconnect-auto/releases/tag/v0.10.1)。
 
 ## v0.9.9 长时间断联与中文路径更新修复
 
