@@ -1,6 +1,6 @@
 ; CampusReconnect standard per-user Windows installer.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.9.7"
+  #define MyAppVersion "0.10.0"
 #endif
 
 #define MyAppName "校园网自动重连助手"
@@ -13,6 +13,7 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\CampusReconnect
+MinVersion=10.0
 DefaultGroupName={#MyAppName}
 OutputDir=..\dist
 OutputBaseFilename=CampusReconnectSetup
@@ -25,7 +26,8 @@ DisableProgramGroupPage=yes
 ; User data and logs live below %LOCALAPPDATA%\CampusReconnect and are preserved.
 
 [Files]
-Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\build\onedir-dist\CampusReconnect\*"; DestDir: "{app}"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

@@ -1,5 +1,11 @@
 # 校园网自动重连助手（SNNU · Windows · Clash Verge Rev）
 
+## v0.10.0 修复安装后启动失败
+
+安装版改用目录式运行，将 Python 和应用依赖安装到程序目录，不再从 `%TEMP%\_MEI...` 临时解压后加载。安装程序要求 Windows 10/11。便携版仍是单文件格式；遇到 `Failed to load Python DLL` 时请使用 `CampusReconnectSetup.exe` 安装版。
+
+[下载 v0.10.0](https://github.com/lcq666666/SNNU-school-network-reconnect-auto/releases/tag/v0.10.0)。
+
 ## v0.9.9 长时间断联与中文路径更新修复
 
 公网验证继续保留百度闸门，并统一复用 Mozilla、Apple、Microsoft 的独立联网检测页。
@@ -338,9 +344,8 @@ Edge 兜底 / 设置面板 / 打开日志 / 退出。
 
 ## 8. exe 版与换电脑使用
 
-release（或 `dist/` 目录）里的 `CampusReconnect.exe` 是 PyInstaller 打包的单文件版本，
-  
-**不需要安装 Python**，拷到任何 Windows 10/11 电脑双击即可运行：
+release（或 `dist/` 目录）里的 `CampusReconnect.exe` 是 PyInstaller 打包的单文件便携版；
+`CampusReconnectSetup.exe` 是目录式安装版，运行依赖随安装器一并部署。两者都不需要单独安装 Python。若单文件版启动时报 `Failed to load Python DLL`，请改用安装版：
 
 1. 首次运行会弹出"校园网账号设置"窗口，输入账号密码（只存本机凭据管理器）；
 2. 手动双击会打开主界面，开机自启则在托盘后台运行。连上 SNNU Wi-Fi，托盘图标变绿即开始保护；
@@ -401,6 +406,8 @@ rem 受控构建：测试 + ruff + PyInstaller（自动写入版本资源）
 构建产物：
 
 - `dist\CampusReconnect.exe`：内嵌 **版本号与源码 commit**（可用文件属性查看）；
+- `dist\CampusReconnectSetup.exe`：安装目录式运行包；打包后在 Windows Release runner 上执行启动自检；
+- `build\onedir-dist\CampusReconnect\`：安装版 EXE 与运行依赖目录；
 - `dist\build_info.json`：版本 / commit / Python 与架构 / 依赖清单；
 - `dist\CampusReconnect.exe.sha256`：SHA256 与字节大小。
 

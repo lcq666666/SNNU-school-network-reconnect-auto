@@ -25,6 +25,7 @@ from tools.pyinstaller_assets import filter_optional_assets  # noqa: E402
 _version_file = build_info.write_version_file(
     os.path.join(_SPEC_DIR, "build", "version_info.txt"))
 print("CampusReconnect version file:", _version_file)
+is_onedir = os.environ.get("CAMPUSRECONNECT_ONEDIR") == "1"
 
 datas = []
 binaries = []
@@ -58,14 +59,14 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [] if is_onedir else a.binaries,
+    [] if is_onedir else a.datas,
     [],
     name='CampusReconnect',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=not is_onedir,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -75,4 +76,16 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version=_version_file,
+    exclude_binaries=is_onedir,
 )
+
+if is_onedir:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name='CampusReconnect',
+    )

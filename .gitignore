@@ -12,6 +12,7 @@ CampusReconnect_V*.exe
 .venv/
 .venv-linux/  # Linux 离线验证 venv（不提交）
 .venv-build/  # 干净受控构建 venv（不提交）
+.venv-release/  # Python 3.12 受控发布构建环境（不提交）
 venv/
 
 # ---- 测试 / 静态检查缓存 ----

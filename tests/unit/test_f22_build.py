@@ -128,6 +128,13 @@ def test_t34_spec_embeds_version_file(project_root):
     assert "version=_version_file" in text
 
 
+def test_release_builder_startup_checks_portable_and_installed_packages(project_root):
+    text = (project_root / "tools" / "build_release.py").read_text(encoding="utf-8")
+    assert "ONEDIR_EXE" in text
+    assert "check_packaged_startup(ONEDIR_EXE)" in text
+    assert "CAMPUSRECONNECT_ONEDIR" in text
+
+
 def test_t34_packaging_keeps_only_used_ocr_models_and_no_video_backend():
     datas = [
         (r"site-packages\ddddocr\common_old.onnx", "ddddocr"),

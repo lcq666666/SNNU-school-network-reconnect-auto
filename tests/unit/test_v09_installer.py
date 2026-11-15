@@ -11,6 +11,34 @@ def test_inno_recipe_preserves_user_data_and_registers_startup(project_root):
     assert "Flags: nowait postinstall skipifsilent" not in text
 
 
+def test_installer_uses_onedir_runtime_outside_temp_and_requires_windows_10(project_root):
+    text = (project_root / "installer" / "CampusReconnect.iss").read_text(encoding="utf-8")
+    assert "MinVersion=10.0" in text
+    assert r"..\build\onedir-dist\CampusReconnect\*" in text
+    assert "recursesubdirs createallsubdirs" in text
+    assert r"..\dist\{#MyAppExeName}" not in text
+
+
+def test_build_finds_per_user_inno_setup_installation(tmp_path, monkeypatch):
+    from tools import build_installer
+
+    compiler = tmp_path / "Programs" / "Inno Setup 6" / "ISCC.exe"
+    compiler.parent.mkdir(parents=True)
+    compiler.write_bytes(b"MZ")
+    monkeypatch.setattr(build_installer.shutil, "which", lambda _: None)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert build_installer.find_iscc() == str(compiler)
+
+
+def test_packaging_spec_builds_onedir_without_upx_compression(project_root):
+    text = (project_root / "CampusReconnect.spec").read_text(encoding="utf-8")
+    assert "CAMPUSRECONNECT_ONEDIR" in text
+    assert "exclude_binaries=is_onedir" in text
+    assert "COLLECT(" in text
+    assert "upx=False" in text
+
+
 def test_installed_update_launches_visible_installer_and_propagates_start_failure(
         tmp_path, monkeypatch):
     import campus_update_install as update_install

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,8 @@ from tools import build_info  # noqa: E402
 
 DIST_DIR = PROJECT_ROOT / "dist"
 EXE_NAME = "CampusReconnect.exe"
+ONEDIR_DIST_DIR = PROJECT_ROOT / "build" / "onedir-dist"
+ONEDIR_EXE = ONEDIR_DIST_DIR / "CampusReconnect" / EXE_NAME
 
 
 def _ensure_utf8_stdio() -> None:
@@ -76,19 +79,29 @@ def build_checks() -> int:
     return _run([sys.executable, "-m", "ruff", "check", "."])
 
 
-def run_pyinstaller() -> int:
-    """调用 PyInstaller 按 spec 构建。"""
+def run_pyinstaller(onedir: bool = False) -> int:
+    """Build the portable executable or installed onedir package."""
     spec = PROJECT_ROOT / "CampusReconnect.spec"
-    return _run([sys.executable, "-m", "PyInstaller", "--noconfirm",
-                 "--distpath", str(DIST_DIR), str(spec)])
+    flavor = "onedir" if onedir else "onefile"
+    output = ONEDIR_DIST_DIR if onedir else DIST_DIR
+    work = PROJECT_ROOT / "build" / ("pyinstaller-" + flavor)
+    environment = os.environ.copy()
+    if onedir:
+        environment["CAMPUSRECONNECT_ONEDIR"] = "1"
+    else:
+        environment.pop("CAMPUSRECONNECT_ONEDIR", None)
+    return _run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+                 "--distpath", str(output), "--workpath", str(work), str(spec)],
+                env=environment)
 
 
-def check_packaged_startup() -> int:
-    """验证实际交付的 EXE；超时、非零退出或缺少成功报告均阻断发布。"""
+def check_packaged_startup(executable: Path | None = None) -> int:
+    """Verify an actual packaged EXE; a failed self-check blocks release."""
+    executable = Path(executable) if executable is not None else DIST_DIR / EXE_NAME
     with tempfile.TemporaryDirectory(prefix="campus-startup-") as directory:
         report = Path(directory) / "result.txt"
         try:
-            code = _run([str(DIST_DIR / EXE_NAME), "--startup-check", str(report)],
+            code = _run([str(executable), "--startup-check", str(report)],
                         timeout=30)
         except (OSError, subprocess.TimeoutExpired) as exc:
             print("EXE 启动自检失败：", exc)
@@ -163,6 +176,15 @@ def main(argv=None) -> int:
     if code != 0:
         return code
     code = check_packaged_startup()
+    if code != 0:
+        return code
+    code = run_pyinstaller(onedir=True)
+    if code != 0:
+        return code
+    if not ONEDIR_EXE.is_file():
+        print("目录式安装包构建未生成：", ONEDIR_EXE)
+        return 1
+    code = check_packaged_startup(ONEDIR_EXE)
     if code != 0:
         return code
     write_manifest()

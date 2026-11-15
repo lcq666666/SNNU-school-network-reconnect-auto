@@ -1,6 +1,7 @@
 """Build the per-user Inno Setup installer around the portable EXE."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,9 +15,14 @@ def find_iscc() -> str | None:
     found = shutil.which("ISCC.exe") or shutil.which("iscc.exe")
     if found:
         return found
-    for candidate in (
-            Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
-            Path(r"C:\Program Files\Inno Setup 6\ISCC.exe")):
+    candidates = [
+        Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
+        Path(r"C:\Program Files\Inno Setup 6\ISCC.exe"),
+    ]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "Programs" / "Inno Setup 6" / "ISCC.exe")
+    for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
     return None
