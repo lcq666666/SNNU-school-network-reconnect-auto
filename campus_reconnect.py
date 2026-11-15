@@ -65,9 +65,9 @@ from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          repair_service, resolve_url)
 from campus_failover import (FailoverMode, FailoverPolicy,
                              NetworkFailoverManager, format_tick)
-from campus_network import (DEFAULT_TCP_TARGETS, PORTAL_HINTS, NetworkObserver,
-                            WindowsProbeEngine, evaluate, format_snapshot,
-                            resolve_roles)
+from campus_network import (DEFAULT_HTTP_TARGETS, DEFAULT_TCP_TARGETS,
+                            PORTAL_HINTS, NetworkObserver, WindowsProbeEngine,
+                            evaluate, format_snapshot, resolve_roles)
 from campus_route_guard import (CompositeExecutor, MetricExecutor, RouteGuard,
                                 RouteJournal, build_windows_route_ops,
                                 format_route_change, format_route_snapshot)
@@ -291,12 +291,10 @@ def internet_ok(session: requests.Session,
 #: ``www.baidu.com`` 裸 URL 返回 3xx → 跟随重定向后 200，``<title>`` 为实测标题。
 VERIFY_GATE = ProbeSpec("http://www.baidu.com/", "百度一下，你就知道",
                         PROBE_HTML_TITLE)
-#: V0.4-1 **交叉**探测点：与闸门来源相互独立，命中 ``VERIFY_MIN_CROSS`` 站即认为真实可达。
-VERIFY_CROSS = (
-    ProbeSpec("http://www.qq.com/", "腾讯网", PROBE_HTML_TITLE),
-    ProbeSpec("http://www.163.com/", "网易", PROBE_HTML_TITLE),
-    ProbeSpec("http://www.sohu.com/", "搜狐", PROBE_HTML_TITLE),
-)
+#: Reuse the independently validated Mozilla/Apple/Microsoft endpoints from
+#: the interface health checker. Content-gated pages such as QQ/163/Sohu can
+#: return policy/anti-bot 403 or 501 responses while general Internet works.
+VERIFY_CROSS = DEFAULT_HTTP_TARGETS
 #: 交叉命中数下限（方案 §6 Q2 默认档「闸门 + 交叉 ≥2」）。
 VERIFY_MIN_CROSS = 2
 #: 校验超时（连接, 读取）：真实页面比 ``success.txt`` 类探针慢，但仍须有界。

@@ -32,6 +32,8 @@ LOG = logging.getLogger("campus")
 
 def _title_page(spec) -> FakeResponse:
     """按探测点造一个**跟随重定向之后**的 200 页面（正文含期望标题）。"""
+    if spec.mode == engine.PROBE_EXACT:
+        return FakeResponse(200, spec.expect, url=spec.url)
     body = ("<HTML><HEAD><TITLE>%s</TITLE></HEAD><BODY>%s</BODY></HTML>"
             % (spec.expect, spec.expect))
     return FakeResponse(200, body, url=spec.url)
@@ -212,17 +214,34 @@ def test_v04_verify_internet_never_raises():
 # 取证锁定：站点与标题与 2026-10-16 真机一致
 # --------------------------------------------------------------------------- #
 def test_v04_sites_match_real_forensics_20261016():
-    """锁定真机取证：闸门=百度、交叉=腾讯/网易/搜狐，标题与实测一致。"""
+    """锁定公网判据：百度闸门 + 独立厂商的精确联网检测响应。"""
     assert engine.VERIFY_GATE.url == "http://www.baidu.com/"
     assert engine.VERIFY_GATE.expect == "百度一下，你就知道"
     assert engine.VERIFY_GATE.mode == PROBE_HTML_TITLE
 
     cross = {spec.url: spec.expect for spec in engine.VERIFY_CROSS}
     assert cross == {
-        "http://www.qq.com/": "腾讯网",
-        "http://www.163.com/": "网易",
-        "http://www.sohu.com/": "搜狐",
+        "https://captive.apple.com/hotspot-detect.html": "Success",
+        "https://detectportal.firefox.com/success.txt": "success",
+        "http://www.msftncsi.com/ncsi.txt": "Microsoft NCSI",
     }, cross
+    assert {spec.url: spec.mode for spec in engine.VERIFY_CROSS} == {
+        "https://captive.apple.com/hotspot-detect.html": PROBE_HTML_TITLE,
+        "https://detectportal.firefox.com/success.txt": engine.PROBE_EXACT,
+        "http://www.msftncsi.com/ncsi.txt": engine.PROBE_EXACT,
+    }
+
+
+def test_probe_target_restrictions_do_not_turn_a_live_session_into_an_outage():
+    """One vendor probe may be blocked while two independent probes confirm Internet."""
+    session = FakeSession()
+    _route_ok(session, [engine.VERIFY_GATE] + list(engine.VERIFY_CROSS[:2]))
+    session.route(engine.VERIFY_CROSS[2].url, FakeResponse(501, "upstream policy"))
+
+    ok, detail = engine.verify_internet(session)
+
+    assert ok is True, detail
+    assert "交叉命中 2/3" not in detail
 
 
 # --------------------------------------------------------------------------- #

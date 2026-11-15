@@ -1,5 +1,10 @@
 # 校园网自动重连助手（SNNU · Windows · Clash Verge Rev）
 
+## v0.9.8 长时间断联误判修复
+
+公网验证继续保留百度闸门，并统一复用 Mozilla、Apple、Microsoft 的独立联网检测页。
+QQ/163/搜狐在部分网络中会返回 403/501，即使 Portal 在线、其他公网目标可达，也会造成重连守护误判离线并重复恢复。
+
 ## v0.9.7 无线旧会话自动恢复
 
 设置页“恢复”中新增允许重建本机校园无线会话的选项。有线验证通过、无线连续异常且普通重登后仍无法上网时，核对无线 IP、MAC 和账号后断开该无线会话，再使用本机保存的凭据重新登录。复用现有四位验证码识别和公网复核流程，每6小时最多一次，限频记录保留到下次启动。新用户默认关闭此选项，开启后纳入在线守护。
@@ -412,7 +417,7 @@ CI（`.github/workflows/ci.yml`）在 Windows 上执行「离线测试 + ruff + 
 （`trust_env=False`）的直连 HTTP 探测：
 
 - **Baidu 闸门**：`http://www.baidu.com/` 严格 `<title>` 匹配，必须 PASS；
-- **交叉站点**：`qq.com` / `163.com` / `sohu.com` 三站，**至少 2 站 PASS**；
+- **交叉站点**：Mozilla / Apple / Microsoft 独立联网检测点，**至少 2 站 PASS**；
 - 两者同时满足才判 `VERIFIED`，否则本次验证不通过。
 
 验证**绑定接口**：`verify(Ethernet)` 只走 Ethernet socket，`verify(WiFi)` 只走 Wi-Fi socket，

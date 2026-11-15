@@ -35,6 +35,8 @@ from tests.fakes import FakePathEngine, FakeResponse, FakeSession
 # --------------------------------------------------------------------------- #
 def _title_page(spec) -> FakeResponse:
     """跟随重定向后的 200 页面（正文含该探测点的期望标题）。"""
+    if spec.mode == cr.PROBE_EXACT:
+        return FakeResponse(200, spec.expect, url=spec.url)
     body = ("<HTML><HEAD><TITLE>%s</TITLE></HEAD><BODY>%s</BODY></HTML>"
             % (spec.expect, spec.expect))
     return FakeResponse(200, body, url=spec.url)
