@@ -535,6 +535,20 @@ def test_powercfg_query_parses_effective_timeout_indexes():
     assert states["mentions_standby"] is True
 
 
+def test_powercfg_query_parses_chinese_timeout_labels():
+    states = netdiag.parse_powercfg(
+        "电源设置 GUID (STANDBYIDLE)\n"
+        " 当前交流电源设置索引: 0x00000000\n"
+        " 当前直流电源设置索引: 0x00000000\n"
+        "电源设置 GUID (HIBERNATEIDLE)\n"
+        " 当前交流电源设置索引: 0x0000003c\n"
+        " 当前直流电源设置索引: 0x0000001e\n")
+    assert states["sleep_timeout_ac"] == 0
+    assert states["sleep_timeout_dc"] == 0
+    assert states["hibernate_timeout_ac"] == 60
+    assert states["hibernate_timeout_dc"] == 30
+
+
 def test_remote_section_collects_clients_ports_and_unattended_settings():
     processes = netdiag.parse_remote_processes(REMOTE_PROCESSES_JSON)
     assert [p["process_name"] for p in processes] == ["ToDesk", "SunloginClient"]

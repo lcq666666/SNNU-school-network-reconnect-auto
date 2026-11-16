@@ -920,8 +920,10 @@ class TrayApp:
             self.log.warning("双链路恢复整合层构造失败：%s", type(exc).__name__)
             return None
         self.dual_path = controller
+        restart_enabled = bool(self.get_config().get("remote_restart_enabled", False))
         self.log.info("双链路恢复整合层已接线：接口受限验证 + 恢复协调器 + UU 恢复"
-                      "（UU 自动恢复默认关闭；路由切换须先通过接口受限验证）")
+                      "（UU 自动恢复=%s；路由切换须先通过接口受限验证）",
+                      "开启" if restart_enabled else "关闭")
         return controller
 
     def _build_path_verifier(self):

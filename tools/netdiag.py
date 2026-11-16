@@ -741,9 +741,13 @@ def parse_powercfg(text: Any) -> Dict[str, Any]:
             continue
         body = section.group(0)
         for scope in ("ac", "dc"):
-            match = re.search(
-                r"current\s+%s\s+power\s+setting\s+index\s*:\s*0x([0-9a-f]+)"
-                % scope, body, re.I)
+            if scope == "ac":
+                label = (r"(?:current\s+ac\s+power\s+setting\s+index"
+                         r"|当前交流电源设置索引)")
+            else:
+                label = (r"(?:current\s+dc\s+power\s+setting\s+index"
+                         r"|当前直流电源设置索引)")
+            match = re.search(label + r"\s*:\s*0x([0-9a-f]+)", body, re.I)
             if match:
                 timeout_name = "sleep" if name == "standby" else "hibernate"
                 result["%s_timeout_%s" % (timeout_name, scope)] = int(match.group(1), 16)
