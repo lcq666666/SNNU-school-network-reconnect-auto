@@ -107,6 +107,10 @@ from campus_wifi_bringup import (build_snnu_open_profile_xml,
 from campus_update import (UPDATE_CHECK_INTERVAL_S, UPDATE_RETRY_INTERVAL_S,
                            UPDATE_FIRST_CHECK_DELAY_S, check_latest,
                            is_newer, should_notify)
+from campus_task_guard import (GUARD_RESTART_LIMIT, GUARD_STALE_SECONDS,
+                               register_task, run_guard, unregister_task,
+                               write_heartbeat)
+from campus_resilience import RecoveryPolicy
 
 # ---- V0.6：CustomTkinter 界面（缺失时回退原生 ttk，仍能启动）----
 try:
@@ -233,6 +237,15 @@ DEFAULT_CONFIG = {
     # ---- V0.4-3：确认在线后清退重启 UU 远程（方案 §3.3）----
     "remote_restart_enabled": False,  # **默认关闭**：不主动调用即零副作用
     "remote_restart_cooldown": 300,   # 两次真实清退最小间隔秒数
+    # ---- V0.11：断链恢复 SLA 与独立任务计划守护 ----
+    "recovery_probe_interval": 10,
+    "recovery_failure_threshold": 3,
+    "auth_retry_cooldown": 300,
+    "captcha_max_attempts": 3,
+    "standby_session_reset_cooldown": 21600,
+    "watchdog_enabled": True,
+    "watchdog_stale_after": 45,
+    "watchdog_restart_limit": 3,
     # ---- V0.3 P7.5-1A：三轴观测参数（可配置，范围受限）----
     # V0.7.1 阶段 A：旧默认 (8, 12, 3) 与真机实测采集 ~21.6s 矛盾 ⇒ 每轮必然
     # 超时、SNAPSHOT_UNTRUSTED 长期自锁。改为规格区间内可用的 (30, 45, 3)：
@@ -436,6 +449,33 @@ def _read_remote_app_keys(text: str) -> dict:
             "remote_restart_cooldown": max(60, min(3600, int(cooldown)))}
 
 
+def _read_recovery_keys(text: str) -> dict:
+    """Read V0.11 recovery budgets with bounded, fail-closed defaults."""
+    raw = _raw_config(text)
+
+    def integer(name, default, low, high):
+        value = raw.get(name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            value = default
+        return max(low, min(high, int(value)))
+
+    return {
+        "recovery_probe_interval": integer("recovery_probe_interval", 10, 5, 120),
+        "recovery_failure_threshold": integer("recovery_failure_threshold", 3, 1, 10),
+        "auth_retry_cooldown": integer("auth_retry_cooldown", 300, 60, 3600),
+        "captcha_max_attempts": integer("captcha_max_attempts", 3, 1, 3),
+        "standby_session_reset_cooldown": integer(
+            "standby_session_reset_cooldown", 21600, 3600, 86400),
+        "watchdog_enabled": raw.get("watchdog_enabled")
+        if isinstance(raw.get("watchdog_enabled"), bool)
+        else DEFAULT_CONFIG["watchdog_enabled"],
+        "watchdog_stale_after": integer(
+            "watchdog_stale_after", int(GUARD_STALE_SECONDS), 30, 300),
+        "watchdog_restart_limit": integer(
+            "watchdog_restart_limit", GUARD_RESTART_LIMIT, 1, 5),
+    }
+
+
 def _read_v06_keys(text: str) -> dict:
     """读取 V0.6 三键（非法值一律回退安全默认）。"""
     raw = _raw_config(text)
@@ -532,6 +572,7 @@ def load_config() -> dict:
     cfg.update(_read_remote_keys(text))
     cfg.update(_read_snapshot_keys(text))
     cfg.update(_read_remote_app_keys(text))
+    cfg.update(_read_recovery_keys(text))
     cfg.update(_read_v06_keys(text))
     cfg.update(_read_update_keys(text))
     raw = _raw_config(text)
@@ -739,6 +780,8 @@ class TrayApp:
         self._worker = None
         self._worker_lock = threading.Lock()
         self._heartbeat = 0.0
+        self._external_heartbeat_at = 0.0
+        self._guard_status = "等待守护配置"
         self._repair_busy = threading.Event()
         self._repair_pending = threading.Event()
         self._repair_override = False
@@ -2911,6 +2954,7 @@ class TrayApp:
         try:
             while not self.stop_event.is_set():
                 self._heartbeat = time.monotonic()
+                self._write_external_heartbeat()
                 try:
                     try:
                         cmd = self._commands.get(timeout=self._wait_timeout(next_probe))
@@ -2925,7 +2969,21 @@ class TrayApp:
                     self._repair_pending.clear()
                     next_probe = time.monotonic() + self._interval()
         finally:
+            self._write_external_heartbeat(active=False)
             self.log.info("网络工作线程已退出")
+
+    def _write_external_heartbeat(self, *, active=True, force=False):
+        """Publish a redacted heartbeat for the independent task guard."""
+        if not bool(self.config.get("watchdog_enabled", True)) and active:
+            return
+        now = time.time()
+        if not force and active and now - self._external_heartbeat_at < 10:
+            return
+        try:
+            write_heartbeat(active=active, version=__version__, now=now)
+            self._external_heartbeat_at = now
+        except Exception as exc:
+            self.log.warning("独立守护心跳写入失败：%s", type(exc).__name__)
 
     def _dispatch(self, cmd, next_probe: float) -> float:
         kind = cmd[0] if cmd else "probe"
@@ -3567,6 +3625,7 @@ class TrayApp:
             if first_install:
                 cfg = self.get_config()
                 cfg.update(lifeline_enabled=True, automatic_proxy_enabled=True,
+                           remote_restart_enabled=True, watchdog_enabled=True,
                            v06_auto_prompted=True)
                 if save_config(cfg):
                     self.update_config(cfg)
@@ -3576,6 +3635,8 @@ class TrayApp:
         cfg = self.get_config()
         cfg.update(lifeline_enabled=True, automatic_proxy_enabled=True,
                    v06_auto_prompted=True, lifeline_reboot_enabled=True)
+        if first_install:
+            cfg.update(remote_restart_enabled=True, watchdog_enabled=True)
         if save_config(cfg):
             self.update_config(cfg)
         try:
@@ -3589,6 +3650,13 @@ class TrayApp:
                 self.log.warning("助手登录后自启未完成：%s", result.detail)
             else:
                 self.log.info("启动保护检查：%s", result.detail)
+            if self.config.get("watchdog_enabled", True):
+                guard = register_task(executable=Path(sys.executable), frozen=True)
+                self._guard_status = guard.detail
+                if not guard.ok:
+                    self.log.warning("独立任务计划守护未启用：%s", guard.detail)
+                else:
+                    self.log.info("独立任务计划守护：%s", guard.detail)
         except Exception as exc:
             self._automatic_setup_message = "启动保护检查未完成，将在后台重试"
             self.log.warning("启动保护配置失败：%s", type(exc).__name__)
@@ -3756,7 +3824,12 @@ class TrayApp:
         now = time.monotonic()
         if now < self._lifeline_next:
             return
-        self._lifeline_next = now + 15
+        try:
+            interval = max(5, min(120, int(
+                self.get_config().get("recovery_probe_interval", 10))))
+        except (TypeError, ValueError):
+            interval = 10
+        self._lifeline_next = now + interval
         self._lifeline_busy.set()
         self._repair_busy.set()
 
@@ -3857,7 +3930,8 @@ class TrayApp:
             # a concurrent-device limit; authentication is attempted only when
             # the status page actually says this session needs it.
             adapters.login = lambda session, account, password, yys, port, log: engine.portal_login_detailed(
-                session, account, password, yys, port, log)
+                session, account, password, yys, port, log,
+                captcha_max_attempts=cfg.get("captcha_max_attempts", 3))
             with direct_session() as session:
                 result = repair_service(
                     session, RepairOptions.from_mapping(cfg), time.monotonic,
@@ -3957,6 +4031,15 @@ class TrayApp:
                         standby_repair=active(standby_repair))
                     self._lifeline = RecoveryController(
                         data_directory() / "recovery.json", ops,
+                        policy=RecoveryPolicy(
+                            confirmation_delay=float(interval * max(1, int(
+                                self.get_config().get("recovery_failure_threshold", 3)))),
+                            network_repair_delay=15.0,
+                            repair_retry_delay=float(max(60, min(3600, int(
+                                self.get_config().get("auth_retry_cooldown", 300))))),
+                            uu_observe_delay=10.0,
+                            uu_restart_delay=15.0,
+                            uu_confirmation_delay=30.0),
                         log=lambda message: self.log.info("[三层恢复] %s", message))
                 self._lifeline.tick(allow_reboot=bool(
                     self.get_config().get("lifeline_reboot_enabled", False)))
@@ -4346,6 +4429,15 @@ class TrayApp:
                     return
         if set_autostart(target):
             self._autostart_enabled = target
+            if getattr(sys, "frozen", False):
+                try:
+                    guard = (register_task(executable=Path(sys.executable), frozen=True)
+                             if target else unregister_task())
+                    self._guard_status = guard.detail
+                    if not guard.ok:
+                        self.log.warning("独立任务计划守护状态未更新：%s", guard.detail)
+                except Exception as exc:
+                    self.log.warning("独立任务计划守护状态更新失败：%s", type(exc).__name__)
             self.notify("开机自启已%s" % ("开启" if target else "关闭"),
                         "登录 Windows 后自动启动托盘助手" if target else "不再自动启动")
         else:
@@ -4379,6 +4471,7 @@ class TrayApp:
 
     def on_quit(self, icon=None, item=None):
         self.log.info("用户退出托盘助手")
+        self._write_external_heartbeat(active=False, force=True)
         controller = getattr(self, "_lifeline", None)
         if controller is not None:
             try:
@@ -5096,6 +5189,7 @@ def _load_check(report: Path) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument(BACKGROUND_FLAG, action="store_true", help="在托盘后台启动")
+    parser.add_argument("--guard", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--load-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--startup-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--update-receipt", type=Path, help=argparse.SUPPRESS)
@@ -5111,6 +5205,8 @@ def main(argv=None) -> int:
         return _startup_check(args.startup_check)
 
     log = setup_logging(False)
+    if args.guard:
+        return run_guard(log=lambda message: log.info("[独立守护] %s", message))
     instance = engine.claim_single_instance(log)
     if not instance.ok:
         if not args.background:

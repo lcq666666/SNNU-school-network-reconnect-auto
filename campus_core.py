@@ -54,7 +54,7 @@ __all__ = [
 # 版本与取值范围
 # --------------------------------------------------------------------------- #
 #: 应用版本（唯一来源；``pyproject.toml`` 与打包版本资源均应与之一致，F22）。
-__version__ = "0.10.5"
+__version__ = "0.11.0"
 
 SCHEMA_VERSION = 1
 
@@ -720,6 +720,10 @@ def validate_config(raw: Any) -> ConfigLoadResult:
         "remote_probe_interval",
         # V0.4-3：确认在线后清退重启 UU 远程（默认关闭，方案 §3.3）。
         "remote_restart_enabled", "remote_restart_cooldown",
+        "recovery_probe_interval", "recovery_failure_threshold",
+        "auth_retry_cooldown", "captcha_max_attempts",
+        "standby_session_reset_cooldown", "watchdog_enabled",
+        "watchdog_stale_after", "watchdog_restart_limit",
         "snapshot_max_age", "snapshot_timeout", "snapshot_interval",
         "v06_auto_prompted", "clash_heal_enabled", "uu_escalation_enabled",
         "update_check_enabled", "update_notified_tag", "update_dismissed_tag",

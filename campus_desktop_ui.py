@@ -994,7 +994,9 @@ def render_dashboard(app, state):
     refs["buttons"][-1].configure(text=guard_text)
     startup = getattr(app, "_autostart_enabled", None)
     refs["autostart_button"].configure(text="关闭开机运行" if startup else "开启开机运行")
-    refs["setup_status"].configure(text=getattr(app, "_automatic_setup_message", "等待后台检查"))
+    setup = getattr(app, "_automatic_setup_message", "等待后台检查")
+    guard = getattr(app, "_guard_status", "等待守护配置")
+    refs["setup_status"].configure(text="%s\n独立任务计划守护：%s" % (setup, guard))
     # The guard switch lives on the settings page; do not repeat its state here.
     report = getattr(app, "readiness_report", None)
     reboot = "已启用" if cfg.get("lifeline_reboot_enabled") else "未启用"

@@ -30,14 +30,33 @@ class RecoveryOps:
     standby_repair: Callable | None = None
 
 
+@dataclass(frozen=True)
+class RecoveryPolicy:
+    """Timing budget for one bounded recovery pipeline.
+
+    The legacy defaults preserve the older offline controller contract.  The
+    packaged tray supplies the V0.11 values so continuous failure confirmation,
+    authentication and UU verification fit the roughly 60 second target.
+    """
+
+    confirmation_delay: float = 30.0
+    network_repair_delay: float = 60.0
+    repair_retry_delay: float = 180.0
+    uu_observe_delay: float = 30.0
+    uu_restart_delay: float = 30.0
+    uu_confirmation_delay: float = 60.0
+
+
 class RecoveryController:
     """Own all recovery side effects while enabled, independently of snapshots."""
 
-    def __init__(self, path: Path, ops: RecoveryOps, *, clock=time.time, log=None):
+    def __init__(self, path: Path, ops: RecoveryOps, *, clock=time.time, log=None,
+                 policy: RecoveryPolicy | None = None):
         self.path = Path(path)
         self.ops = ops
         self.clock = clock
         self.log = log or (lambda message: None)
+        self.policy = policy or RecoveryPolicy()
         self.state = {"stage": "healthy", "outage_at": None, "next_action": 0,
                       "last_reboot": None, "proxy_before": None,
                       "reboot_pending": False}
@@ -108,7 +127,7 @@ class RecoveryController:
             # fault.  Do not reconnect Wi-Fi or re-authenticate the portal.
             if self.state["outage_at"] is None:
                 self.state.update(stage="uu_observe", outage_at=now,
-                                  next_action=now + 30)
+                                   next_action=now + self.policy.uu_observe_delay)
                 self.save()
                 self.detail = "网络已恢复，UU 外连未建立，等待稳定复核"
                 return
@@ -126,12 +145,14 @@ class RecoveryController:
             if self.state["stage"] in ("confirming", "network_repair", "uu_observe"):
                 # The first verified network result after a network outage is
                 # the hand-off point to the final UU-only recovery step.
-                self.state.update(stage="uu_restart", next_action=now + 30)
+                self.state.update(stage="uu_restart",
+                                  next_action=now + self.policy.uu_restart_delay)
                 self.save()
             self.detail = "网络已恢复，但 UU 外连未建立，阶段 %s" % self.state["stage"]
             if self.state["stage"] != "uu_restart" or now < self.state["next_action"]:
                 return
-            self.state.update(stage="uu_wait", next_action=now + 60)
+            self.state.update(stage="uu_wait",
+                              next_action=now + self.policy.uu_confirmation_delay)
             self.save()
             self.log("网络恢复后 UU 兜底：网络已确认恢复，UU 仍未建立外连，才重启 UU")
             attempted = self.ops.restart_uu()
@@ -140,16 +161,18 @@ class RecoveryController:
                 # restart.  Keep observing the already healthy network and
                 # retry after the controller's normal interval instead of
                 # getting stuck in ``uu_wait`` until the next outage.
-                self.state.update(stage="uu_observe", next_action=now + 60)
+                self.state.update(stage="uu_observe",
+                                  next_action=now + self.policy.uu_confirmation_delay)
                 self.detail = "网络已恢复，UU 兜底暂未执行，等待下一轮复核"
-            self.state["next_action"] = max(now, self.clock()) + 60
+            self.state["next_action"] = max(now, self.clock()) + self.policy.uu_confirmation_delay
             self.save()
             return
 
         # A real network outage starts or continues the network-only recovery
         # path.  The UU state remains unknown until the network comes back.
         if self.state["outage_at"] is None:
-            self.state.update(stage="confirming", outage_at=now, next_action=now + 30)
+            self.state.update(stage="confirming", outage_at=now,
+                              next_action=now + self.policy.confirmation_delay)
             self.save()
         elif self.state["stage"] in ("uu_observe", "uu_restart", "uu_wait"):
             self.state.update(stage="confirming", next_action=now)
@@ -159,7 +182,8 @@ class RecoveryController:
             return
         stage = self.state["stage"]
         if stage == "confirming":
-            self.state.update(stage="network_repair", next_action=now + 60)
+            self.state.update(stage="network_repair",
+                              next_action=now + self.policy.network_repair_delay)
             self.save()
             self.log("第一层恢复：只尝试常规网络修复，不重启 UU")
             try:
@@ -167,11 +191,12 @@ class RecoveryController:
                 _ok, self.detail = action()
             except Exception as exc:
                 self.log("常规网络修复未完成（%s），等待第二层复核" % type(exc).__name__)
-            self.state["next_action"] = max(now, self.clock()) + 60
+            self.state["next_action"] = max(now, self.clock()) + self.policy.network_repair_delay
             self.save()
             return
         if stage == "network_repair":
-            self.state.update(stage="network_repair", next_action=now + 180)
+            self.state.update(stage="network_repair",
+                              next_action=now + self.policy.repair_retry_delay)
             self.save()
             # The reboot decision is made before another repair attempt, after 15 minutes.
             elapsed = now - self.state["outage_at"]
@@ -203,7 +228,9 @@ class RecoveryController:
             self.log("网络重连完成：%s" % ("已恢复" if ok else "等待后续验证"))
         finally:
             self.recover_proxy()
-        self.state["next_action"] = max(now + 180, self.clock() + 180)
+        self.state["next_action"] = max(
+            now + self.policy.repair_retry_delay,
+            self.clock() + self.policy.repair_retry_delay)
         self.save()
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 import threading
+from collections import Counter
+import io
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
@@ -12,6 +14,8 @@ from campus_core import (E_AUTH_CAPTCHA, E_AUTH_REJECTED, LoginOutcome,
 _OCR = None
 _OCR_LOCK = threading.Lock()
 _CAPTCHA_FIELD = re.compile(r"captcha|(?:check|verify|valid(?:ate)?|auth|safe|v)?code|rand|验证码", re.I)
+CAPTCHA_MAX_ATTEMPTS = 3
+CAPTCHA_CODE_RE = re.compile(r"^[0-9]{4}$")
 
 
 class LoginForm(HTMLParser):
@@ -55,7 +59,46 @@ def captcha_form(body, page_url):
     return action, image, fields[0]["name"], hidden
 
 
+def _valid_code(value):
+    value = str(value or "").strip()
+    return value if CAPTCHA_CODE_RE.fullmatch(value) else None
+
+
+def _image_variants(image):
+    """Return bounded local preprocessing variants for noisy numeric images."""
+    variants = [image]
+    try:
+        from PIL import Image, ImageFilter, ImageOps
+        source = Image.open(io.BytesIO(image)).convert("L")
+        width, height = source.size
+        if width <= 0 or height <= 0 or width > 1200 or height > 600:
+            return variants
+        scale = 3 if width < 180 else 2
+        enlarged = source.resize((width * scale, height * scale), Image.Resampling.LANCZOS)
+        variants.append(_png_bytes(ImageOps.autocontrast(enlarged)))
+        variants.append(_png_bytes(ImageOps.invert(enlarged).filter(ImageFilter.MedianFilter(3))))
+        threshold = enlarged.point(lambda value: 255 if value > 160 else 0)
+        variants.append(_png_bytes(threshold))
+    except Exception:
+        # The unmodified image remains a valid fail-closed input if optional
+        # image preprocessing is unavailable.
+        pass
+    return variants
+
+
+def _png_bytes(image):
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 def recognize_digits(image):
+    """Recognize a four-digit challenge using bounded local consensus.
+
+    A single valid result is accepted for compatibility with simple Portal
+    images; when preprocessing produces multiple valid results, the most
+    frequent result wins and ties fail closed instead of submitting a guess.
+    """
     global _OCR
     if not image or len(image) > 1024 * 1024:
         raise ValueError("验证码图片大小异常")
@@ -63,10 +106,21 @@ def recognize_digits(image):
         if _OCR is None:
             import ddddocr
             _OCR = ddddocr.DdddOcr(show_ad=False, use_gpu=False)
-        value = _OCR.classification(image).strip()
-    if not re.fullmatch(r"[0-9A-Za-z]{4}", value):
-        raise ValueError("验证码识别结果不是有效四位字符")
-    return value
+        candidates = []
+        for variant in _image_variants(image):
+            try:
+                value = _valid_code(_OCR.classification(variant))
+            except Exception:
+                value = None
+            if value is not None:
+                candidates.append(value)
+    if not candidates:
+        raise ValueError("验证码识别结果不是有效四位数字")
+    counts = Counter(candidates)
+    top = counts.most_common()
+    if len(top) > 1 and top[0][1] == top[1][1]:
+        raise ValueError("验证码识别结果不一致")
+    return top[0][0]
 
 
 def login_with_captcha(session, page_body, page_url, payload, headers,
@@ -138,5 +192,5 @@ def login_with_captcha(session, page_body, page_url, payload, headers,
                 return LoginOutcome(
                     False, "验证码自动认证未完成（%s），等待重试" % type(exc).__name__,
                     status=PortalStatus.NEEDS_USER, error_code=E_AUTH_CAPTCHA)
-    return LoginOutcome(False, "验证码连续两次未通过，等待冷却重试",
+    return LoginOutcome(False, "验证码连续 %d 次未通过，等待冷却重试" % max_attempts,
                         status=PortalStatus.NEEDS_USER, error_code=E_AUTH_CAPTCHA)

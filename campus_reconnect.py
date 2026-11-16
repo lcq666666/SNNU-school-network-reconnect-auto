@@ -1231,19 +1231,22 @@ def _interpret_auth_response(session: requests.Session, base: str, resp,
 
 
 def portal_login(session: requests.Session, account: str, password: str,
-                 yys: str, port: int, log: logging.Logger):
+                 yys: str, port: int, log: logging.Logger, *,
+                 captcha_max_attempts: int = 3):
     """按浏览器真实流程登录（F06/F07）。
 
     返回 :class:`LoginOutcome`（可解包为 ``(ok, detail)``）。判定要求：
     允许的状态码 + 可信目标 + 状态页账号字段**完整比较**；区分「已有会话」
     与本次认证成功；验证码页 ⇒ 需人工处理。
     """
-    return portal_login_detailed(session, account, password, yys, port, log)
+    return portal_login_detailed(session, account, password, yys, port, log,
+                                 captcha_max_attempts=captcha_max_attempts)
 
 
 def portal_login_detailed(session: requests.Session, account: str, password: str,
                           yys: str, port: int, log: logging.Logger, *,
-                          force_login: bool = False) -> LoginOutcome:
+                          force_login: bool = False,
+                          captcha_max_attempts: int = 3) -> LoginOutcome:
     base = portal_base(port)
     # 1) 打开登录页建立会话
     try:
@@ -1271,10 +1274,14 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
                "Accept-Language": "zh-CN,zh;q=0.9"}
     from campus_captcha import login_with_captcha
     initial_body = decode_body(login_page) if login_page.status_code == 200 else ""
+    try:
+        captcha_attempts = max(1, min(3, int(captcha_max_attempts)))
+    except (TypeError, ValueError):
+        captcha_attempts = 3
     captcha = login_with_captcha(
         session, initial_body or "", base + LOGIN_JSP, payload, headers,
         lambda response: _interpret_auth_response(session, base, response, log),
-        decode=decode_body)
+        decode=decode_body, max_attempts=captcha_attempts)
     if captcha is not None:
         return captcha
     try:
