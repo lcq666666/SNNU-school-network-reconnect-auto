@@ -66,25 +66,36 @@ def _read_power_values(run: Callable, scheme: str) -> Optional[dict]:
     lines = (result.stdout or "").splitlines()
     values = {}
     current_setting = None
+    seen_scopes = set()
     for raw in lines:
         line = raw.strip().lower()
-        for _, (_, setting, _) in POWER_GROUPS.items():
-            if setting.lower() in line:
-                current_setting = setting.lower()
-                break
-        if current_setting is None or "current ac power setting index" not in line and \
-                "current dc power setting index" not in line:
+        # The English aliases normally appear in parentheses even on a
+        # Chinese Windows installation.  Accept localized labels as well.
+        if "standbyidle" in line or "睡眠" in line:
+            current_setting = "standbyidle"
+            seen_scopes.discard(current_setting)
+        elif "hibernateidle" in line or "休眠" in line:
+            current_setting = "hibernateidle"
+            seen_scopes.discard(current_setting)
+        if current_setting is None:
             continue
-        value = _parse_number(raw)
+        # ``powercfg /query`` localizes the AC/DC label.  The effective value
+        # is still the hexadecimal index; use the label when present and the
+        # order within a setting block as a locale-independent fallback.
+        value = _parse_number(raw) if "0x" in line else None
         if value is not None:
-            scope = "ac" if "current ac" in line else "dc"
-            key = next((name for name, (_, setting, _) in POWER_GROUPS.items()
-                        if setting.lower() == current_setting and name.endswith("_" + scope)), None)
+            if "current ac" in line or "交流" in line or "ac" in line:
+                scope = "ac"
+            elif "current dc" in line or "直流" in line or "dc" in line:
+                scope = "dc"
+            else:
+                scope = "ac" if (current_setting, "ac") not in seen_scopes else "dc"
+            key = ("standby" if current_setting == "standbyidle" else "hibernate") \
+                + "_" + scope
             if key is not None:
                 values[key] = value
-            # Keep the setting heading for the following DC index; powercfg
-            # prints AC before DC in each setting block.
-            if scope == "dc":
+            seen_scopes.add((current_setting, scope))
+            if (current_setting, "ac") in seen_scopes and (current_setting, "dc") in seen_scopes:
                 current_setting = None
     # powercfg /query emits the setting name and both AC/DC indexes.  If a
     # localized output cannot be parsed, fail closed and leave the plan alone.

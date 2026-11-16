@@ -66,6 +66,27 @@ def test_ocr_failure_never_posts_credentials():
     assert session.posts() == []
 
 
+def test_ocr_failure_refreshes_challenge_before_retry():
+    session = FakeSession()
+    session.route(BASE + "login.jsp", [FakeResponse(200, FORM)])
+    session.route(BASE + "captcha.jpg", [FakeResponse(200, "bad"),
+                                           FakeResponse(200, "good")])
+    session.route(BASE + "login", FakeResponse(200, "当前登录账号：123456"))
+    attempts = iter((ValueError("temporary OCR failure"), "1234"))
+
+    def recognize(_image):
+        value = next(attempts)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    result = captcha.login_with_captcha(
+        session, FORM, BASE + "login.jsp", {"account": "123456"}, {},
+        lambda response: (response.text, None), recognize=recognize)
+    assert result.ok
+    assert len(session.posts()) == 1
+
+
 def test_captcha_attempts_bounded_to_two():
     session = FakeSession()
     session.route(BASE + "captcha.jpg", FakeResponse(200, "sample"))

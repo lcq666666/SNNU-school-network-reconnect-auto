@@ -112,6 +112,17 @@ class RecoveryController:
                 self.save()
                 self.detail = "网络已恢复，UU 外连未建立，等待稳定复核"
                 return
+            if self.state["stage"] == "uu_wait":
+                # A launch attempt is not proof that UU recovered.  Once the
+                # confirmation window expires, return to the restart gate so
+                # a still-missing or still-disconnected client gets another
+                # bounded attempt.  The shared RestartGuard still enforces
+                # the five-minute cooldown between real attempts.
+                if now < self.state["next_action"]:
+                    self.detail = "网络已恢复，但 UU 正在等待启动确认"
+                    return
+                self.state.update(stage="uu_restart", next_action=now)
+                self.save()
             if self.state["stage"] in ("confirming", "network_repair", "uu_observe"):
                 # The first verified network result after a network outage is
                 # the hand-off point to the final UU-only recovery step.

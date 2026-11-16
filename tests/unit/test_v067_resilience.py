@@ -99,6 +99,21 @@ def test_healthy_network_with_uu_missing_recovers_uu(tmp_path):
     assert controller.state["stage"] == "healthy"
 
 
+def test_uu_fallback_retries_after_launch_confirmation_timeout(tmp_path):
+    controller, calls, _status = make_controller(tmp_path, online=True, uu=False)
+    controller.tick(1000)
+    controller.tick(1031)
+    controller.tick(1062)
+    assert calls == ["uu"]
+    # The first launch did not make UU healthy.  After the confirmation wait,
+    # the controller must re-enter the UU restart gate instead of staying in
+    # uu_wait forever.
+    controller.tick(1121)
+    assert calls == ["uu"]
+    controller.tick(1122)
+    assert calls == ["uu", "uu"]
+
+
 def test_network_outage_never_restarts_uu_even_after_second_layer(tmp_path):
     controller, calls, _ = make_controller(tmp_path)
     for stamp in (1000, 1031, 1092, 1273):

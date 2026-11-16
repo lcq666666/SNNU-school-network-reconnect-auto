@@ -71,7 +71,12 @@ def recognize_digits(image):
 
 def login_with_captcha(session, page_body, page_url, payload, headers,
                        interpret, *, recognize=None, decode=None, max_attempts=2):
-    """Return None for ordinary forms. Recognition failures never submit guesses."""
+    """Return None for ordinary forms; retry transient challenge failures safely.
+
+    A failed OCR/image fetch must not submit a guess, but it also must not end
+    the recovery attempt immediately. Refreshing the login page in the same
+    session obtains a new challenge while preserving the Portal cookies.
+    """
     decode = decode or (lambda response: response.text)
     recognize = recognize or recognize_digits
     form = captcha_form(page_body, page_url)
@@ -117,7 +122,21 @@ def login_with_captcha(session, page_body, page_url, payload, headers,
                     break
         except Exception as exc:
             # Never include OCR output, credentials, cookies or HTML in diagnostics.
-            return LoginOutcome(False, "验证码自动认证未完成（%s），等待重试" % type(exc).__name__,
-                                status=PortalStatus.NEEDS_USER, error_code=E_AUTH_CAPTCHA)
+            # A malformed/cross-origin form remains fail-closed; ordinary image,
+            # OCR, and transport failures get one bounded same-session retry.
+            if attempt + 1 >= max_attempts:
+                return LoginOutcome(
+                    False, "验证码自动认证未完成（%s），等待重试" % type(exc).__name__,
+                    status=PortalStatus.NEEDS_USER, error_code=E_AUTH_CAPTCHA)
+            try:
+                page = session.get(page_url, timeout=(3, 5), allow_redirects=False)
+                try:
+                    form = captcha_form(decode(page), page_url)
+                finally:
+                    page.close()
+            except Exception:
+                return LoginOutcome(
+                    False, "验证码自动认证未完成（%s），等待重试" % type(exc).__name__,
+                    status=PortalStatus.NEEDS_USER, error_code=E_AUTH_CAPTCHA)
     return LoginOutcome(False, "验证码连续两次未通过，等待冷却重试",
                         status=PortalStatus.NEEDS_USER, error_code=E_AUTH_CAPTCHA)

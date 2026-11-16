@@ -13,6 +13,15 @@ Power Setting GUID: 9d7815a6-7ee4-497e-8888-515a05f02364  (HIBERNATEIDLE)
   Current DC Power Setting Index: 0x0000001e
 """
 
+POWER_ZH = """
+电源设置 GUID: 29f6c1db-86da-48c5-9fdb-f2b67b1f44e7  (STANDBYIDLE)
+  当前交流电源设置索引: 0x0000001e
+  当前直流电源设置索引: 0x0000000f
+电源设置 GUID: 9d7815a6-7ee4-497e-8888-515a05f02364  (HIBERNATEIDLE)
+  当前交流电源设置索引: 0x0000003c
+  当前直流电源设置索引: 0x0000001e
+"""
+
 
 class Runner:
     def __init__(self):
@@ -85,6 +94,21 @@ def test_power_guard_saves_old_values_and_restores(monkeypatch, tmp_path):
     assert restore_power(backup_path=backup, run=runner)
     assert not backup.exists()
     assert any(call[1] == "/setactive" for call in runner.calls)
+
+
+def test_power_guard_parses_chinese_powercfg_labels(monkeypatch, tmp_path):
+    import campus_windows_guard as guard
+    monkeypatch.setattr(guard.os, "name", "nt")
+
+    class ChineseRunner(Runner):
+        def __call__(self, args):
+            result = super().__call__(args)
+            if args[1] == "/query":
+                result.stdout = POWER_ZH
+            return result
+
+    result = configure_power(backup_path=tmp_path / "power.json", run=ChineseRunner())
+    assert result.power and result.changed
 
 
 def test_startup_guard_is_idempotent_and_does_not_need_password(monkeypatch, tmp_path):
