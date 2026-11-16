@@ -99,9 +99,17 @@ def cycle_system_proxy(journal_path, *, snapshot=None, disable=None, restore=Non
 
 
 def uu_connected():
-    """External established TCP is evidence of connectivity, not a remote session."""
+    """Whether the UU user app has an established external TCP connection.
+
+    The service child can remain alive after the remote desktop UI has exited.
+    It must not make UU look healthy by itself.  Enumerating then filtering
+    avoids PowerShell's non-zero exit code when ``-Name`` includes a process
+    that is absent, which otherwise turns a normal missing-app state into
+    ``None`` and prevents recovery from starting the app.
+    """
     from tools.netdiag import PowerShellRunner
-    script = ("Get-Process -Name GameViewer,GameViewerServer -ErrorAction SilentlyContinue "
+    script = ("Get-Process -ErrorAction SilentlyContinue "
+              "| Where-Object { $_.ProcessName -in @('GameViewer', 'GameViewerLauncher') } "
               "| ForEach-Object { Get-NetTCPConnection -OwningProcess $_.Id "
               "-State Established -ErrorAction SilentlyContinue } "
               "| Select-Object RemoteAddress | ConvertTo-Json -Compress")
