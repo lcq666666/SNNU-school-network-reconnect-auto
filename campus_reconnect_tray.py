@@ -2741,6 +2741,7 @@ class TrayApp:
             self.session, options, time.monotonic, self._repair_adapters(),
             get_credentials, cancelled=self._cancelled,
             sleep=self.stop_event.wait, log=self.log)
+        result = self._recover_authenticated_degraded_wifi(result)
         self._last_result = result
         if result.port is not None:
             self.state["port"] = result.port
@@ -3728,7 +3729,7 @@ class TrayApp:
             self.log.warning("[代理守护] 连续三次代理探测失败：保留客户端，不自动停止或拉起窗口")
         return False
 
-    def _repair_standby_wifi(self, wifi):
+    def _repair_standby_wifi(self, wifi, *, standby=True):
         from campus_network import NetworkObserver
         from campus_snnu import SnnuBackupLink
         from tools.netdiag import PowerShellRunner
@@ -3749,13 +3750,18 @@ class TrayApp:
                 sleep=self.stop_event.wait, log=self.log.info)
             result = link.run()
         if result.ok:
-            self._standby_auth_notified = False
-            self.snapshot_source().invalidate("备用 Wi-Fi 维护完成，重新采集并验证")
-        elif (not cfg.get("standby_session_reset_enabled", False)
+            if standby:
+                self._standby_auth_notified = False
+            label = "备用" if standby else "活动"
+            self.snapshot_source().invalidate("%s Wi-Fi 认证完成，重新采集并验证" % label)
+        elif (standby and not cfg.get("standby_session_reset_enabled", False)
               and not getattr(self, "_standby_auth_notified", False)):
             self._standby_auth_notified = True
             self.notify("无线备用连接待恢复", result.detail or "校园认证未完成，请检查账号或打开登录页")
         return result
+
+    def _repair_active_wifi(self, wifi):
+        return self._repair_standby_wifi(wifi, standby=False)
 
     def _reset_standby_wifi(self, wifi):
         from campus_network import WindowsProbeEngine, _interface_dns
@@ -3817,6 +3823,143 @@ class TrayApp:
                 journal=data_directory() / "wireless-session-reset.json",
                 primary_ready=primary_ready, relogin=lambda: self._repair_standby_wifi(wifi),
                 enabled=allowed(), cancelled=lambda: not allowed(), log=self.log.info)
+
+    def _recover_authenticated_degraded_wifi(self, result):
+        from campus_session_reset import is_confirmed_degraded_auth
+
+        if not is_confirmed_degraded_auth(result):
+            self._session_reset_disabled_logged = False
+            return result
+        if self._cancelled():
+            return result
+        if not self.get_config().get("standby_session_reset_enabled", False):
+            if not getattr(self, "_session_reset_disabled_logged", False):
+                self.log.info("[无线会话恢复] 本机旧会话重建未启用，保留现有会话；"
+                              "可在设置 > 恢复中开启")
+                self._session_reset_disabled_logged = True
+            return result
+        self._session_reset_disabled_logged = False
+        reset = self._reset_degraded_wifi_session(result)
+        if reset is None:
+            return result
+        repaired = getattr(reset, "repair", None)
+        if repaired is not None:
+            return repaired
+        from dataclasses import replace
+        detail = getattr(reset, "detail", "") or "本机无线会话重建未能完成"
+        return replace(result, detail="%s；无线会话重建：%s" % (result.detail, detail))
+
+    def _reset_degraded_wifi_session(self, repair_result):
+        from campus_network import WindowsProbeEngine, _interface_dns
+        from campus_session_reset import (has_confirmed_internet_failure,
+                                          is_confirmed_degraded_auth,
+                                          reset_wireless_session)
+        from campus_dual_path import path_request_from_snapshot
+        from tools import netdiag
+
+        if not is_confirmed_degraded_auth(repair_result):
+            return None
+
+        def allowed():
+            cfg = self.get_config()
+            return (not self._cancelled()
+                    and cfg.get("standby_session_reset_enabled", False))
+
+        if not allowed():
+            return None
+        target_ssid = (self.get_config().get("ssid") or "SNNU").strip()
+
+        def current_wifi(observation, expected):
+            if not getattr(observation, "trusted", False):
+                return None
+            snapshot = getattr(observation, "snapshot", None)
+            wifi = getattr(snapshot, "wifi", None)
+            egress = getattr(getattr(snapshot, "system", None), "egress", None)
+            eth = getattr(snapshot, "ethernet", None)
+            egress_index = getattr(egress, "if_index", None)
+            if (wifi is None or wifi.if_index != expected.if_index
+                    or wifi.source_ip != expected.source_ip
+                    or (egress_index is not None and egress_index != wifi.if_index)
+                    or (egress_index is None and eth is not None
+                        and eth.state is HealthState.HEALTHY)):
+                return None
+            if engine.wifi_state(wifi.interface)[0] != target_ssid:
+                return None
+            return snapshot, wifi
+
+        try:
+            initial = self.snapshot_source().observe(time.monotonic())
+            if not getattr(initial, "trusted", False):
+                self.log.info("[无线会话恢复] 网络快照不可信，保留现有会话")
+                return None
+            snapshot = getattr(initial, "snapshot", None)
+            wifi = getattr(snapshot, "wifi", None)
+            if wifi is None:
+                return None
+            selected = current_wifi(initial, wifi)
+            if selected is None:
+                self.log.info("[无线会话恢复] Wi-Fi 不是已确认的活动出口，保留现有会话")
+                return None
+            snapshot, wifi = selected
+            request = path_request_from_snapshot(snapshot, "wifi")
+            if request is None:
+                self.log.info("[无线会话恢复] 缺少接口绑定所需信息，保留现有会话")
+                return None
+            first = self._build_path_verifier().verify(request)
+            if not has_confirmed_internet_failure(first):
+                self.log.info("[无线会话恢复] 首轮多目标失败证据不足，保留现有会话")
+                return None
+
+            report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
+            adapter = next((item for item in report.adapters
+                            if item.if_index == wifi.if_index
+                            and item.name == wifi.interface), None)
+            if (adapter is None or adapter.media != "wifi" or adapter.virtual is True
+                    or engine._wifi_source_ip(report, wifi.if_index) != wifi.source_ip):
+                self.log.info("[无线会话恢复] 无法确认当前物理 Wi-Fi 与地址，保留现有会话")
+                return None
+
+            credentials = get_credentials()
+            if not credentials:
+                return None
+            account = credentials[0]
+            del credentials
+
+            def failure_still_confirmed():
+                if not allowed():
+                    return False
+                fresh = self.snapshot_source().observe(time.monotonic())
+                current = current_wifi(fresh, wifi)
+                if current is None:
+                    return False
+                fresh_snapshot, fresh_wifi = current
+                if (fresh_wifi.if_index != wifi.if_index
+                        or fresh_wifi.source_ip != wifi.source_ip):
+                    return False
+                fresh_request = path_request_from_snapshot(fresh_snapshot, "wifi")
+                if fresh_request is None:
+                    return False
+                second = self._build_path_verifier().verify(fresh_request)
+                return has_confirmed_internet_failure(second)
+
+            with direct_session() as session:
+                transport = WindowsProbeEngine(timeout=3).for_interface(
+                    wifi.if_index, wifi.source_ip,
+                    _interface_dns(report, wifi.if_index))
+                if (not transport.interface_bound
+                        or not transport.bind_session(session)):
+                    self.log.info("[无线会话恢复] Portal 会话未绑定到当前 Wi-Fi，保留现有会话")
+                    return None
+                return reset_wireless_session(
+                    session=session, wifi=wifi, mac=adapter.mac, account=account,
+                    journal=data_directory() / "wireless-session-reset.json",
+                    primary_ready=failure_still_confirmed,
+                    relogin=lambda: self._repair_active_wifi(wifi),
+                    enabled=allowed(), cancelled=lambda: not allowed(),
+                    log=self.log.info)
+        except Exception as exc:
+            self.log.warning("[无线会话恢复] 本轮安全检查未完成：%s", type(exc).__name__)
+            return None
 
     def _lifeline_tick(self):
         if self._lifeline_busy.is_set() or self._repair_busy.is_set():
@@ -3937,6 +4080,7 @@ class TrayApp:
                     session, RepairOptions.from_mapping(cfg), time.monotonic,
                     adapters, get_credentials,
                     cancelled=self._cancelled, sleep=self.stop_event.wait, log=self.log)
+            result = self._recover_authenticated_degraded_wifi(result)
             self._last_result = result
             error_code = str(getattr(result, "error_code", "") or "").upper()
             detail_upper = str(getattr(result, "detail", "") or "").upper()
@@ -4791,7 +4935,7 @@ class TrayApp:
         ttk.Checkbutton(recover, text="无线持续无法上网时，允许断开本机校园无线会话后重新登录",
                         variable=v_session_reset, command=save_lifeline).grid(
                             row=12, column=0, sticky="w", pady=8)
-        ttk.Label(recover, text="有线验证通过、普通重登失败后才尝试，每6小时最多一次。",
+        ttk.Label(recover, text="仅当本账号已认证但公网仍异常，且两轮 Wi-Fi 绑定多目标探测均确认失败时，核对本机账号/IP/MAC 后重建；每6小时最多一次。",
                   wraplength=560).grid(row=13, column=0, sticky="w")
         ttk.Label(recover, text="远程保障与切回策略",
                   font=("Microsoft YaHei", 10, "bold")).grid(

@@ -17,6 +17,25 @@ _LOCK = threading.Lock()
 RESET_INTERVAL = 6 * 3600
 
 
+def is_confirmed_degraded_auth(result):
+    """Only reset after Portal auth is confirmed while public access still fails."""
+    status = getattr(result, "status", None)
+    return (getattr(status, "value", status) == "AUTHENTICATED_DEGRADED"
+            and getattr(result, "auth_ok", None) is True
+            and getattr(result, "network_ok", None) is False)
+
+
+def has_confirmed_internet_failure(verification):
+    """Require a reliable failed gate and at least two failed cross targets."""
+    if (getattr(verification, "reliability", None) != "ok"
+            or getattr(verification, "allows_recovery", None) is not False):
+        return False
+    gate = getattr(verification, "gate_result", None)
+    cross = tuple(getattr(verification, "cross_results", ()) or ())
+    return (getattr(gate, "ok", None) is False and len(cross) >= 2
+            and sum(getattr(item, "ok", None) is False for item in cross) >= 2)
+
+
 class _Page(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -112,6 +131,8 @@ def reset_wireless_session(*, session, wifi, mac, account, journal, primary_read
                 log("无线会话恢复记录无法读取，保留现有会话")
                 return None
             if now - last < RESET_INTERVAL:
+                remaining = int(max(0, RESET_INTERVAL - (now - last)))
+                log("无线旧会话重建处于 6 小时冷却，还需 %d 秒" % remaining)
                 return None
         adapter = session.get_adapter("http://202.117.144.205/")
         transport = getattr(adapter, "transport", None)
