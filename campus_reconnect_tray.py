@@ -106,7 +106,7 @@ from campus_wifi_bringup import (build_snnu_open_profile_xml,
                                  run_bringup as wifi_run_bringup)
 from campus_update import (UPDATE_CHECK_INTERVAL_S, UPDATE_RETRY_INTERVAL_S,
                            UPDATE_FIRST_CHECK_DELAY_S, check_latest,
-                           is_newer, should_notify)
+                           is_newer, should_notify, update_status)
 from campus_task_guard import (GUARD_RESTART_LIMIT, GUARD_STALE_SECONDS,
                                register_task, run_guard, unregister_task,
                                write_heartbeat)
@@ -143,6 +143,18 @@ RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "CampusReconnectTray"
 BACKGROUND_FLAG = "--background"
 PYTHONW = str(Path(sys.executable).with_name("pythonw.exe"))
+
+
+def _portal_result_blocks_computer_reboot(result):
+    status = getattr(result, "status", None)
+    status = getattr(status, "value", status)
+    error_code = str(getattr(result, "error_code", "") or "").upper()
+    return (bool(getattr(result, "needs_user", False))
+            or status == "AUTHENTICATED_DEGRADED"
+            or error_code in (E_AUTH_REJECTED, E_AUTH_CAPTCHA,
+                              "E_SNNU_AUTH_FAILED"))
+
+
 CLASH_SERVER_DEFAULT = "127.0.0.1:7897"   # 仅在用户显式确认时作为**建议值**展示
 APP_NAME = "校园网自动重连助手"
 UI_POLL_MS = 120
@@ -3569,7 +3581,13 @@ class TrayApp:
         self._update_info = info
         if not should_notify(info, __version__,
                              self.config.get("update_notified_tag")):
-            self.log.info("[更新] 检查完成：当前已是 %s", info.tag)
+            state = update_status(info, __version__,
+                                  self.config.get("update_notified_tag"))
+            if state == "available_already_notified":
+                self.log.info("[更新] 检查完成：线上版本 %s 可用，本机仍为 v%s（已提醒过）",
+                              info.tag, __version__)
+            else:
+                self.log.info("[更新] 检查完成：本机已是 %s", info.tag)
             return
         self.log.info("[更新] 发现新版本 %s（当前 v%s）",
                       info.tag, __version__)
@@ -4148,11 +4166,17 @@ class TrayApp:
             guard.mark()
             return True
 
+        def reboot_ready():
+            if _portal_result_blocks_computer_reboot(self._last_result):
+                self.log.info("[三层恢复] 最近一次 Portal 结果表示需重新认证或人工处理，保留电脑并继续恢复")
+                return False
+            from campus_boot import autologon_ready
+            return bool(get_autostart() and autologon_ready())
+
         def run():
             try:
                 from campus_resilience import RecoveryController, RecoveryOps
                 import campus_resilience_windows as native
-                from campus_boot import autologon_ready
                 if self._lifeline is None:
                     self._uu_available = native.uu_available() if self._automatic_setup_armed else True
                     def uu_ok():
@@ -4169,7 +4193,7 @@ class TrayApp:
                         proxy_snapshot=native.proxy_snapshot,
                         proxy_disable=active(native.proxy_disable),
                         proxy_restore=native.proxy_restore, repair=active(repair),
-                        reboot_ready=lambda: get_autostart() and autologon_ready(),
+                        reboot_ready=reboot_ready,
                         reboot=active(native.schedule_reboot), cancel_reboot=native.cancel_reboot,
                         network_repair=active(network_repair),
                         standby_repair=active(standby_repair))

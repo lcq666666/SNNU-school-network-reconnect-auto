@@ -1305,7 +1305,7 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
         challenge = login_with_captcha(
             session, body, base + LOGIN_JSP, payload, headers,
             lambda response: _interpret_auth_response(session, base, response, log),
-            decode=decode_body, max_attempts=1)
+            decode=decode_body, max_attempts=captcha_attempts)
         if challenge is not None:
             return challenge
 

@@ -40,7 +40,10 @@ def test_form_rejects_cross_origin_image_and_action():
 
 def test_stale_online_session_accepts_challenge_after_initial_post(monkeypatch):
     session = FakeSession()
-    session.route(BASE + "login.jsp", FakeResponse(302, "", headers={"Location": "userstatus.jsp"}))
+    session.route(BASE + "login.jsp", [
+        FakeResponse(302, "", headers={"Location": "userstatus.jsp"}),
+        FakeResponse(200, FORM),
+    ])
     session.route(BASE + "userstatus.jsp", FakeResponse(200, "当前登录账号：123456"))
     session.route(BASE + "captcha.jpg", FakeResponse(200, "sample"))
     session.route(BASE + "login", [FakeResponse(200, FORM), FakeResponse(200, "当前登录账号：123456")])
@@ -52,6 +55,50 @@ def test_stale_online_session_accepts_challenge_after_initial_post(monkeypatch):
     assert not result.already_authenticated
     assert len(session.posts()) == 2
     assert session.posts()[1]["kwargs"]["data"]["verifycode"] == "1234"
+
+
+def test_delayed_captcha_uses_configured_retries_after_first_post(monkeypatch):
+    session = FakeSession()
+    session.route(BASE + "login.jsp", [
+        FakeResponse(302, "", headers={"Location": "userstatus.jsp"}),
+        FakeResponse(200, FORM),
+    ])
+    session.route(BASE + "userstatus.jsp", FakeResponse(200, "当前登录账号：其他账号"))
+    session.route(BASE + "captcha.jpg", [FakeResponse(200, "first"),
+                                           FakeResponse(200, "second")])
+    session.route(BASE + "login", [FakeResponse(200, FORM),
+                                    FakeResponse(200, "验证码错误"),
+                                    FakeResponse(200, "当前登录账号：123456")])
+    monkeypatch.setattr(captcha, "recognize_digits", lambda image: "1234")
+
+    result = engine.portal_login_detailed(
+        session, "123456", "test-password", "mobile", 8601,
+        logging.getLogger("campus"), force_login=True,
+        captcha_max_attempts=2)
+
+    assert result.ok
+    assert len(session.posts()) == 3
+    assert session.posts()[1]["kwargs"]["data"]["verifycode"] == "1234"
+    assert session.posts()[2]["kwargs"]["data"]["verifycode"] == "1234"
+
+
+def test_delayed_captcha_stops_after_configured_limit(monkeypatch):
+    session = FakeSession()
+    session.route(BASE + "login.jsp", FakeResponse(302, "", headers={"Location": "userstatus.jsp"}))
+    session.route(BASE + "userstatus.jsp", FakeResponse(200, "当前登录账号：其他账号"))
+    session.route(BASE + "captcha.jpg", [FakeResponse(200, "first"),
+                                           FakeResponse(200, "second")])
+    session.route(BASE + "login", [FakeResponse(200, FORM),
+                                    FakeResponse(200, "验证码错误")])
+    monkeypatch.setattr(captcha, "recognize_digits", lambda image: "1234")
+
+    result = engine.portal_login_detailed(
+        session, "123456", "test-password", "mobile", 8601,
+        logging.getLogger("campus"), force_login=True,
+        captcha_max_attempts=2)
+
+    assert result.error_code == E_AUTH_CAPTCHA
+    assert len(session.posts()) == 2
 
 
 def test_ocr_failure_never_posts_credentials():

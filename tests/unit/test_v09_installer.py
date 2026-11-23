@@ -21,6 +21,12 @@ def test_installer_uses_onedir_runtime_outside_temp_and_requires_windows_10(proj
     assert r"..\dist\{#MyAppExeName}" not in text
 
 
+def test_installer_version_fallback_matches_current_core_version(project_root):
+    from campus_core import __version__
+    text = (project_root / "installer" / "CampusReconnect.iss").read_text(encoding="utf-8")
+    assert '#define MyAppVersion "%s"' % __version__ in text
+
+
 def test_build_finds_per_user_inno_setup_installation(tmp_path, monkeypatch):
     from tools import build_installer
 

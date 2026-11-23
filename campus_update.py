@@ -88,6 +88,17 @@ def should_notify(info, current_version, notified_tag) -> bool:
     return info.tag != (notified_tag or "")
 
 
+def update_status(info, current_version, notified_tag=None):
+    """Classify an update independently from notification de-duplication."""
+    if info is None:
+        return "unknown"
+    if not is_newer(info.tag, current_version):
+        return "current"
+    if info.tag == (notified_tag or ""):
+        return "available_already_notified"
+    return "available"
+
+
 def _check_api_latest(session, repo: str = UPDATE_REPO
                  ) -> "tuple[UpdateInfo | None, str]":
     """查询 GitHub 最新 Release；成功返回 ``(UpdateInfo, "")``。

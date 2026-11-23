@@ -129,6 +129,12 @@ def test_should_notify_only_once_per_tag():
     assert upd.should_notify(None, "0.6.0", None) is False
 
 
+def test_update_status_distinguishes_already_notified_release_from_current():
+    assert upd.update_status(_info("v0.6.1"), "0.6.0", "v0.6.1") == "available_already_notified"
+    assert upd.update_status(_info("v0.6.0"), "0.6.0", "v0.6.0") == "current"
+    assert upd.update_status(_info("v0.6.1"), "0.6.0", None) == "available"
+
+
 # ---------- 2. check_latest：成功 / 404 / 超时 / 缺 tag ----------
 
 def test_check_latest_success():
@@ -236,6 +242,20 @@ def test_on_update_checked_same_version_is_silent(monkeypatch):
     assert notified == []
     assert app.config["update_notified_tag"] is None
     assert app._update_info.tag == _current_tag()
+
+
+def test_already_notified_newer_release_is_not_logged_as_current(monkeypatch, caplog):
+    newer = _newer_tag()
+    app, _saved, notified = _patched_app(
+        monkeypatch, update_notified_tag=newer, update_dismissed_tag=newer)
+
+    with caplog.at_level("INFO", logger=LOG.name):
+        app._on_update_checked(_info(newer), "")
+
+    assert notified == []
+    assert app._update_status_text().find(newer) >= 0
+    assert "本机仍为 v%s" % CURRENT_VERSION in caplog.text
+    assert "本机已是 %s" % newer not in caplog.text
 
 
 def test_on_update_checked_failure_is_silent(monkeypatch):
