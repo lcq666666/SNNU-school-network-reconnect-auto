@@ -204,6 +204,17 @@ def test_session_reset_consent_survives_config_round_trip(monkeypatch, tmp_path,
     assert tray.load_config()["standby_session_reset_enabled"] is expected
 
 
+@pytest.mark.parametrize("existing_config", [False, True])
+def test_session_reset_defaults_on_when_setting_is_absent(monkeypatch, tmp_path, existing_config):
+    import campus_reconnect_tray as tray
+
+    path = tmp_path / "tray_config.json"
+    monkeypatch.setattr(tray, "CONFIG_FILE", path)
+    if existing_config:
+        assert tray.save_config({"ssid": "SNNU"})
+    assert tray.load_config()["standby_session_reset_enabled"] is True
+
+
 def test_journal_write_failure_cannot_disconnect(monkeypatch, tmp_path):
     import campus_session_reset as reset_module
     reset, session, args, calls = setup_reset(monkeypatch, tmp_path)

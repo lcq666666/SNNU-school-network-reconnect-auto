@@ -274,7 +274,7 @@ DEFAULT_CONFIG = {
     "lifeline_enabled": False,
     "automatic_proxy_enabled": True,
     "lifeline_reboot_enabled": False,
-    "standby_session_reset_enabled": False,
+    "standby_session_reset_enabled": True,
     "lock_after_autologon": True,
     "autologon_prompted": False,
     "update_check_enabled": True,  # 启动 15 秒后首次检查，失败 5 分钟重试
@@ -589,8 +589,10 @@ def load_config() -> dict:
     cfg.update(_read_update_keys(text))
     raw = _raw_config(text)
     for key in ("lifeline_enabled", "lifeline_reboot_enabled", "lock_after_autologon",
-                "automatic_proxy_enabled", "autologon_prompted", "standby_session_reset_enabled"):
+                "automatic_proxy_enabled", "autologon_prompted"):
         cfg[key] = raw.get(key) if isinstance(raw.get(key), bool) else DEFAULT_CONFIG[key]
+    key = "standby_session_reset_enabled"
+    cfg[key] = raw.get(key, DEFAULT_CONFIG[key]) is True
     if not result.ok:
         logger = logging.getLogger("campus")
         for issue in result.issues:
