@@ -38,6 +38,22 @@ def test_form_rejects_cross_origin_image_and_action():
                              BASE + "login.jsp")
 
 
+def test_captcha_form_ignores_unrelated_form():
+    extra = "<form action='search'><input type='hidden' name='nonce' value='unrelated'></form>"
+    result = captcha.captcha_form(FORM + extra, BASE + "login.jsp")
+    assert result == (BASE + "login", BASE + "captcha.jpg", "verifycode", {"nonce": "opaque"})
+
+
+def test_ambiguous_challenge_never_posts_and_reports_form_issue():
+    session = FakeSession()
+    result = captcha.login_with_captcha(
+        session, FORM + FORM, BASE + "login.jsp", {"account": "123456"}, {},
+        lambda response: (response.text, None))
+    assert result.error_code == E_AUTH_CAPTCHA
+    assert "表单" in result.detail
+    assert not session.posts()
+
+
 def test_stale_online_session_accepts_challenge_after_initial_post(monkeypatch):
     session = FakeSession()
     session.route(BASE + "login.jsp", [
@@ -111,6 +127,7 @@ def test_ocr_failure_never_posts_credentials():
         lambda response: (response.text, None), recognize=fail)
     assert result.error_code == E_AUTH_CAPTCHA
     assert session.posts() == []
+    assert "验证码图片识别失败" in result.detail
 
 
 def test_ocr_failure_refreshes_challenge_before_retry():

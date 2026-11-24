@@ -49,3 +49,17 @@ def test_uu_probe_keeps_command_failure_unknown(monkeypatch):
 
     monkeypatch.setattr(netdiag, "PowerShellRunner", Runner)
     assert native.uu_connected() is None
+
+
+def test_uu_discovery_rechecks_initial_absence(monkeypatch):
+    from campus_reconnect_tray import TrayApp
+    from types import SimpleNamespace
+
+    results = iter((False, True))
+    monkeypatch.setattr(native, "uu_available", lambda: next(results))
+    monkeypatch.setattr(native, "uu_connected", lambda: False)
+    app = SimpleNamespace()
+    assert TrayApp._observe_lifeline_uu(app, now=100) is True
+    assert TrayApp._observe_lifeline_uu(app, now=120) is True
+    assert TrayApp._observe_lifeline_uu(app, now=160) is False
+    assert app._uu_available is True

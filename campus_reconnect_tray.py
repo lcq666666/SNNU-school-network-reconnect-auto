@@ -63,10 +63,10 @@ except ImportError:  # Linux 离线测试：winreg 只在 Windows 存在
     winreg = None  # type: ignore[assignment]
 from PIL import Image, ImageDraw
 
-from campus_core import (E_AUTH_CAPTCHA, E_AUTH_REJECTED, E_CRED_BACKEND,
+from campus_core import (E_AUTH_CAPTCHA, E_AUTH_DEVICE_LIMIT, E_AUTH_REJECTED, E_CRED_BACKEND,
                          E_CRED_MISSING, SCHEMA_VERSION,
                          CredentialClear, CredentialLoad, CredentialSave,
-                         ProxyApplyResult, RepairAdapters, RepairOptions,
+                         ProxyApplyResult, RepairAdapters, RepairOptions, RepairResult,
                          TimerTable, __version__, repair_service,
                          load_config_text)
 import campus_reconnect as engine
@@ -2984,7 +2984,8 @@ class TrayApp:
                     self._repair_pending.clear()
                     next_probe = time.monotonic() + self._interval()
         finally:
-            self._write_external_heartbeat(active=False)
+            if self.stop_event.is_set():
+                self._write_external_heartbeat(active=False)
             self.log.info("网络工作线程已退出")
 
     def _write_external_heartbeat(self, *, active=True, force=False):
@@ -3751,15 +3752,21 @@ class TrayApp:
 
     def _repair_standby_wifi(self, wifi, *, standby=True):
         from campus_network import NetworkObserver
-        from campus_snnu import SnnuBackupLink
+        from campus_snnu import BackupLinkResult, SnnuBackupLink
         from tools.netdiag import PowerShellRunner
 
         cfg = self.get_config()
+        if time.monotonic() < getattr(self, "_device_limit_retry_at", 0):
+            detail = "Portal 报告在线设备数已达上限，等待设备名额释放"
+            return BackupLinkResult(error=E_AUTH_DEVICE_LIMIT, detail=detail,
+                                    repair=RepairResult(error_code=E_AUTH_DEVICE_LIMIT,
+                                                        detail=detail, needs_user=True))
         observer = NetworkObserver(PowerShellRunner(timeout=5))
         with direct_session() as session:
             link = SnnuBackupLink(
                 ops=engine._snnu_ops(session, observer, self.log, wifi.interface,
-                                     require_web=True, force_login=True,
+                                     require_web=True,
+                                     captcha_max_attempts=cfg.get("captcha_max_attempts", 3),
                                      cancelled=self._cancelled,
                                      sleep=self.stop_event.wait), session=session,
                 target_ssid=cfg.get("ssid") or "SNNU", interface=wifi.interface,
@@ -3769,7 +3776,16 @@ class TrayApp:
                 account_format=cfg.get("account_format", "plain"),
                 sleep=self.stop_event.wait, log=self.log.info)
             result = link.run()
+        if getattr(getattr(result, "repair", None), "error_code", None) == E_AUTH_DEVICE_LIMIT:
+            self._device_limit_retry_at = time.monotonic() + 900
         if result.ok:
+            from campus_session_reset import finish_interrupted_login
+            try:
+                if finish_interrupted_login(
+                        data_directory() / "wireless-session-reset.json", if_index=wifi.if_index):
+                    self.log.info("已补完上次中断的无线会话登录")
+            except OSError as exc:
+                self.log.warning("无法更新无线会话恢复记录：%s", type(exc).__name__)
             if standby:
                 self._standby_auth_notified = False
             label = "备用" if standby else "活动"
@@ -3782,6 +3798,24 @@ class TrayApp:
 
     def _repair_active_wifi(self, wifi):
         return self._repair_standby_wifi(wifi, standby=False)
+
+    def _repair_lifeline_wifi(self):
+        from campus_network import resolve_roles
+        from tools import netdiag
+
+        config = self.get_config()
+        report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
+        wifi = resolve_roles(report, engine._load_adapters_config())["wifi"]
+        if (wifi is None or wifi.virtual is True or wifi.media != "wifi"
+                or (config.get("interface") and config["interface"] != wifi.name)):
+            return RepairResult(error_code="E_SNNU_AUTH_PATH_UNCONFIRMED",
+                                detail="未确认目标无线网卡，等待重新探测", retryable=True)
+        from types import SimpleNamespace
+        result = self._repair_active_wifi(SimpleNamespace(
+            interface=wifi.name, if_index=wifi.if_index,
+            source_ip=engine._wifi_source_ip(report, wifi.if_index)))
+        return result.repair or RepairResult(error_code=result.error, detail=result.detail,
+                                            retryable=True)
 
     def _reset_standby_wifi(self, wifi):
         from campus_network import WindowsProbeEngine, _interface_dns
@@ -3870,7 +3904,7 @@ class TrayApp:
         return replace(result, detail="%s；无线会话重建：%s" % (result.detail, detail))
 
     def _reset_degraded_wifi_session(self, repair_result):
-        from campus_network import WindowsProbeEngine, _interface_dns
+        from campus_network import NetworkObserver, WindowsProbeEngine, _interface_dns
         from campus_session_reset import (has_confirmed_internet_failure,
                                           is_confirmed_degraded_auth,
                                           reset_wireless_session)
@@ -3888,8 +3922,9 @@ class TrayApp:
         if not allowed():
             return None
         target_ssid = (self.get_config().get("ssid") or "SNNU").strip()
+        observer = NetworkObserver(netdiag.PowerShellRunner(timeout=5))
 
-        def current_wifi(observation, expected):
+        def current_wifi(observation, expected, report):
             if not getattr(observation, "trusted", False):
                 return None
             snapshot = getattr(observation, "snapshot", None)
@@ -3897,9 +3932,14 @@ class TrayApp:
             egress = getattr(getattr(snapshot, "system", None), "egress", None)
             eth = getattr(snapshot, "ethernet", None)
             egress_index = getattr(egress, "if_index", None)
+            tunnel_egress = any(item.if_index == egress_index and item.virtual is True
+                                for item in report.adapters)
+            portal_route = observer.route_lookup("202.117.144.205")
             if (wifi is None or wifi.if_index != expected.if_index
                     or wifi.source_ip != expected.source_ip
-                    or (egress_index is not None and egress_index != wifi.if_index)
+                    or getattr(portal_route, "if_index", None) != wifi.if_index
+                    or (egress_index is not None and egress_index != wifi.if_index
+                        and not tunnel_egress)
                     or (egress_index is None and eth is not None
                         and eth.state is HealthState.HEALTHY)):
                 return None
@@ -3916,7 +3956,8 @@ class TrayApp:
             wifi = getattr(snapshot, "wifi", None)
             if wifi is None:
                 return None
-            selected = current_wifi(initial, wifi)
+            report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
+            selected = current_wifi(initial, wifi, report)
             if selected is None:
                 self.log.info("[无线会话恢复] Wi-Fi 不是已确认的活动出口，保留现有会话")
                 return None
@@ -3930,7 +3971,6 @@ class TrayApp:
                 self.log.info("[无线会话恢复] 首轮多目标失败证据不足，保留现有会话")
                 return None
 
-            report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
             adapter = next((item for item in report.adapters
                             if item.if_index == wifi.if_index
                             and item.name == wifi.interface), None)
@@ -3949,12 +3989,14 @@ class TrayApp:
                 if not allowed():
                     return False
                 fresh = self.snapshot_source().observe(time.monotonic())
-                current = current_wifi(fresh, wifi)
+                current_report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
+                current = current_wifi(fresh, wifi, current_report)
                 if current is None:
                     return False
                 fresh_snapshot, fresh_wifi = current
                 if (fresh_wifi.if_index != wifi.if_index
-                        or fresh_wifi.source_ip != wifi.source_ip):
+                        or fresh_wifi.source_ip != wifi.source_ip
+                        or engine._wifi_source_ip(current_report, wifi.if_index) != wifi.source_ip):
                     return False
                 fresh_request = path_request_from_snapshot(fresh_snapshot, "wifi")
                 if fresh_request is None:
@@ -3982,8 +4024,8 @@ class TrayApp:
             return None
 
     def _verify_lifeline_paths(self, primary, alternate):
-        """Use a verified physical path, or report uncertainty without repairing."""
-        verifier = self._build_path_verifier()
+        """Confirm the Windows route separately from physical link evidence."""
+        verifier = self._build_path_verifier() if primary is not None or alternate is not None else None
         failed = False
         partially_online = False
         for request in (primary, alternate):
@@ -3998,9 +4040,8 @@ class TrayApp:
                 self.log.info("[三层恢复] %s 接口探测不可信：%s", request.role, result.reason)
                 continue
             if result.allows_recovery:
-                if self._automatic_setup_armed:
-                    self._guard_proxy_health()
-                return True
+                partially_online = True
+                continue
             gate_error = getattr(result.gate_result, "error", None)
             if (not result.captive_portal and gate_error in {"dns", "connection", "timeout"}
                     and sum(item.ok is True for item in result.cross_results) >= 2):
@@ -4009,16 +4050,27 @@ class TrayApp:
                 continue
             self.log.info("[三层恢复] %s 接口验证未通过：%s", request.role, result.reason)
             failed = True
+        with direct_session() as session:
+            system_ok, _ = verify_internet(session, timeout=(2, 2))
+        if system_ok:
+            if self._automatic_setup_armed:
+                self._guard_proxy_health()
+            return True
         if failed and not partially_online:
-            # The system route can go through TUN. Its success vetoes disruptive
-            # recovery, but cannot authorize operations on a physical interface.
-            with direct_session() as session:
-                system_ok, _ = verify_internet(session, timeout=(2, 2), stop_on_failed_gate=True)
-            if system_ok:
-                self.log.info("[三层恢复] Windows 当前出口可上网，物理接口结果待复核")
-                return None
             return False
         return None
+
+    def _observe_lifeline_uu(self, now=None):
+        import campus_resilience_windows as native
+
+        now = time.monotonic() if now is None else now
+        available = getattr(self, "_uu_available", None)
+        if available is not True and now >= getattr(self, "_uu_discovery_at", 0):
+            available = self._uu_available = native.uu_available()
+            self._uu_discovery_at = now + (15 if available is None else 60)
+        if available is not True:
+            return True if available is False else None
+        return native.uu_connected()
 
     def _lifeline_tick(self):
         if self._lifeline_busy.is_set() or self._repair_busy.is_set():
@@ -4074,7 +4126,6 @@ class TrayApp:
                     self.log.info("[三层恢复] 活动接口快照暂不可用：%s", type(exc).__name__)
             if not any(requests.values()):
                 self.log.info("[三层恢复] 缺少活动接口事实，暂不执行网络修复")
-                return None
             return self._verify_lifeline_paths(requests.get(role), requests.get(other))
         def standby_repair():
             from campus_resilience import StandbyWifiGuard
@@ -4091,28 +4142,14 @@ class TrayApp:
                 self.notify("无线备用连接待恢复", result.detail or "无线公网未恢复，将继续检查")
 
         def repair():
-            cfg = self.get_config()
-            cfg.update(reconnect_wifi=True, browser_fallback=False)
-            adapters = self._repair_adapters()
-            adapters.probe_online = lambda session: verify_internet(session, stop_on_failed_gate=True)
-            # Reuse an already valid Portal session.  Forcing a POST on every
-            # second-layer retry can evict another device when the account has
-            # a concurrent-device limit; authentication is attempted only when
-            # the status page actually says this session needs it.
-            adapters.login = lambda session, account, password, yys, port, log: engine.portal_login_detailed(
-                session, account, password, yys, port, log,
-                captcha_max_attempts=cfg.get("captcha_max_attempts", 3))
-            with direct_session() as session:
-                result = repair_service(
-                    session, RepairOptions.from_mapping(cfg), time.monotonic,
-                    adapters, get_credentials,
-                    cancelled=self._cancelled, sleep=self.stop_event.wait, log=self.log)
+            result = self._repair_lifeline_wifi()
             result = self._recover_authenticated_degraded_wifi(result)
             self._last_result = result
             error_code = str(getattr(result, "error_code", "") or "").upper()
             detail_upper = str(getattr(result, "detail", "") or "").upper()
             if (getattr(result, "needs_user", False)
-                    or error_code in (E_AUTH_REJECTED, E_AUTH_CAPTCHA, "E_SNNU_AUTH_FAILED")
+                    or error_code in (E_AUTH_REJECTED, E_AUTH_CAPTCHA, E_AUTH_DEVICE_LIMIT,
+                                      "E_SNNU_AUTH_FAILED")
                     or "E_SNNU_AUTH_FAILED" in detail_upper):
                 if not self._lifeline_auth_notified:
                     self._lifeline_auth_notified = True
@@ -4191,17 +4228,8 @@ class TrayApp:
                 from campus_resilience import RecoveryController, RecoveryOps
                 import campus_resilience_windows as native
                 if self._lifeline is None:
-                    self._uu_available = native.uu_available() if self._automatic_setup_armed else True
-                    def uu_ok():
-                        if self._uu_available is False:
-                            return True
-                        if self._uu_available is None:
-                            self._uu_available = native.uu_available()
-                            if self._uu_available is None:
-                                return None
-                        return native.uu_connected()
                     ops = RecoveryOps(
-                        network_ok=network_ok, uu_ok=uu_ok,
+                        network_ok=network_ok, uu_ok=lambda: TrayApp._observe_lifeline_uu(self),
                         restart_uu=active(restart_uu_after_network),
                         proxy_snapshot=native.proxy_snapshot,
                         proxy_disable=active(native.proxy_disable),
@@ -4220,12 +4248,16 @@ class TrayApp:
                                 self.get_config().get("auth_retry_cooldown", 300))))),
                             uu_observe_delay=10.0,
                             uu_restart_delay=15.0,
-                            uu_confirmation_delay=30.0),
+                            uu_confirmation_delay=30.0,
+                            manage_system_proxy=False,
+                            reboot_countdown=60.0),
                         log=lambda message: self.log.info("[三层恢复] %s", message))
                 self._lifeline.tick(allow_reboot=bool(
                     self.get_config().get("lifeline_reboot_enabled", False)))
                 self._lifeline_observed_at = time.monotonic()
-                self._last_system_probe = (self._lifeline.last_network is True, "三层恢复独立公网校验")
+                system_ok = self._lifeline.last_network
+                self._last_system_probe = ((system_ok, "三层恢复独立公网校验")
+                                           if system_ok is not None else None)
                 healthy = self._lifeline.last_network is True and self._lifeline.last_uu is True
                 if healthy:
                     self._lifeline_auth_notified = False

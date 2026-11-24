@@ -153,7 +153,8 @@ def reset_wireless_session(*, session, wifi, mac, account, journal, primary_read
             return None
         if cancelled():
             return None
-        atomic_json(journal, {"last_attempt": now, "stage": "reserved"})
+        record = {"last_attempt": now, "stage": "reserved", "if_index": wifi.if_index}
+        atomic_json(journal, record)
         log("无线旧会话公网未恢复，已核对本机身份，开始重建无线会话")
         try:
             response = session.get(base + "/snnuportal/logoff", timeout=(3, 8),
@@ -164,8 +165,26 @@ def reset_wireless_session(*, session, wifi, mac, account, journal, primary_read
         # Logoff may have succeeded even if the response was lost. Always try to
         # restore login; the existing pipeline checks cancellation before POST.
         result = relogin()
-        atomic_json(journal, {"last_attempt": now, "stage": "finished",
-                              "restored": bool(getattr(result, "ok", False))})
+        if getattr(result, "ok", False):
+            atomic_json(journal, dict(record, stage="finished", restored=True))
         return result
+    finally:
+        _LOCK.release()
+
+
+def finish_interrupted_login(journal, *, if_index):
+    """Close a reservation after a later verified login on that wireless interface."""
+    if not _LOCK.acquire(blocking=False):
+        return False
+    try:
+        try:
+            record = json.loads(journal.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if (not isinstance(record, dict) or record.get("stage") != "reserved"
+                or record.get("if_index") != if_index):
+            return False
+        atomic_json(journal, dict(record, stage="finished", restored=True))
+        return True
     finally:
         _LOCK.release()

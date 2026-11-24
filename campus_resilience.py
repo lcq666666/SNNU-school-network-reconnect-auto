@@ -45,6 +45,8 @@ class RecoveryPolicy:
     uu_observe_delay: float = 30.0
     uu_restart_delay: float = 30.0
     uu_confirmation_delay: float = 60.0
+    manage_system_proxy: bool = True
+    reboot_countdown: float = 0.0
 
 
 class RecoveryController:
@@ -69,6 +71,7 @@ class RecoveryController:
         self.detail = "等待网络与 UU 连接检查"
         self.last_network = None
         self.last_uu = None
+        self._reboot_at = None
         self.lock = threading.RLock()
 
     def save(self):
@@ -88,6 +91,7 @@ class RecoveryController:
 
     def cancel_pending(self):
         with self.lock:
+            self._reboot_at = None
             if self.state["reboot_pending"]:
                 self.ops.cancel_reboot()
                 self.state["reboot_pending"] = False
@@ -101,6 +105,19 @@ class RecoveryController:
         network = self.ops.network_ok()
         if self.state["reboot_pending"] and network is not False:
             self.cancel_pending()
+        if self._reboot_at is not None:
+            if network is not False or not allow_reboot or not self.ops.reboot_ready():
+                self.cancel_pending()
+                self.log("整机重启倒计时已取消")
+            else:
+                now = max(now, self.clock())
+                self.last_network, self.last_uu = False, None
+                if now < self._reboot_at:
+                    self.detail = "持续断网，正在重新确认整机重启条件"
+                else:
+                    self._reboot_at = None
+                    self._execute_reboot(now, legacy_pending=False)
+                return
         # UU is only meaningful after the active network has been verified.  A
         # network outage must not be mislabeled as a UU outage and must not
         # trigger a remote-client restart.
@@ -112,9 +129,15 @@ class RecoveryController:
             except Exception as exc:
                 self.log("备用链路维护未完成（%s），下轮继续检查" % type(exc).__name__)
         if network is None:
+            if self.state["outage_at"] is not None:
+                self.state.update(stage="healthy", outage_at=None, next_action=0)
+                self.save()
             self.detail = "网络状态采集失败，等待复核"
             return
         if network is True and uu is None:
+            if self.state["outage_at"] is not None:
+                self.state.update(outage_at=None)
+                self.save()
             self.detail = "网络已确认，UU 状态采集失败，等待复核"
             return
         if network is True and uu is True:
@@ -127,8 +150,11 @@ class RecoveryController:
         if network is True and uu is False:
             # A healthy network with a missing UU connection is a separate
             # fault.  Do not reconnect Wi-Fi or re-authenticate the portal.
-            if self.state["outage_at"] is None:
-                self.state.update(stage="uu_observe", outage_at=now,
+            if self.state["outage_at"] is not None:
+                self.state["outage_at"] = None
+                self.save()
+            if self.state["stage"] == "healthy":
+                self.state.update(stage="uu_observe",
                                    next_action=now + self.policy.uu_observe_delay)
                 self.save()
                 self.detail = "网络已恢复，UU 外连未建立，等待稳定复核"
@@ -172,12 +198,10 @@ class RecoveryController:
 
         # A real network outage starts or continues the network-only recovery
         # path.  The UU state remains unknown until the network comes back.
-        if self.state["outage_at"] is None:
+        if (self.state["outage_at"] is None
+                or self.state["stage"] in ("uu_observe", "uu_restart", "uu_wait")):
             self.state.update(stage="confirming", outage_at=now,
                               next_action=now + self.policy.confirmation_delay)
-            self.save()
-        elif self.state["stage"] in ("uu_observe", "uu_restart", "uu_wait"):
-            self.state.update(stage="confirming", next_action=now)
             self.save()
         self.detail = "网络或 UU 连接未恢复，阶段 %s" % self.state["stage"]
         if now < self.state["next_action"]:
@@ -222,31 +246,43 @@ class RecoveryController:
                 if not self.ops.reboot_ready():
                     self.log("Portal 登录仍需处理或 Windows 重启条件未满足，继续按恢复周期重试")
                     return
-                self.log("第三层恢复：最后一轮校园网恢复仍失败，60 秒后重启电脑")
-                previous = self.state.copy()
-                self.state.update(last_reboot=now, reboot_pending=True,
-                                  stage="network_repair", next_action=now + 120)
-                self.save()
-                try:
-                    self.ops.reboot()
-                except Exception:
-                    self.state = previous
-                    self.save()
-                    raise
+                if self.policy.reboot_countdown > 0:
+                    self._reboot_at = max(now, self.clock()) + self.policy.reboot_countdown
+                    self.detail = "校园网持续断开，已开始整机重启复核倒计时"
+                    self.log(self.detail)
+                else:
+                    self._execute_reboot(now, legacy_pending=True)
                 return
             self._repair(now)
 
-    def _repair(self, now):
-        self.log("第二层恢复：备份代理、关闭代理、重连认证、恢复代理；不重启 UU")
-        self.state["proxy_before"] = self.ops.proxy_snapshot()
+    def _execute_reboot(self, now, *, legacy_pending):
+        self.log("第三层恢复：最后一轮校园网恢复仍失败，申请 Windows 重启")
+        previous = self.state.copy()
+        self.state.update(last_reboot=now, reboot_pending=legacy_pending,
+                          stage="network_repair", next_action=now + 120)
         self.save()
         try:
-            self.ops.proxy_disable()
+            self.ops.reboot()
+        except Exception:
+            self.state = previous
+            self.save()
+            raise
+
+    def _repair(self, now):
+        change_proxy = self.policy.manage_system_proxy
+        self.log("第二层恢复：校园网重连和认证")
+        if change_proxy:
+            self.state["proxy_before"] = self.ops.proxy_snapshot()
+            self.save()
+        try:
+            if change_proxy:
+                self.ops.proxy_disable()
             ok, detail = self.ops.repair()
             self.detail = detail
             self.log("网络重连完成：%s" % ("已恢复" if ok else "等待后续验证"))
         finally:
-            self.recover_proxy()
+            if change_proxy:
+                self.recover_proxy()
         self.state["next_action"] = max(
             now + self.policy.repair_retry_delay,
             self.clock() + self.policy.repair_retry_delay)

@@ -300,6 +300,16 @@ def test_v04_restart_reports_launch_failure_honestly():
     assert result.detail and "失败" in result.detail
 
 
+@pytest.mark.parametrize("launch_spawns,action", [(True, "partial_recovery"), (False, "unconfirmed")])
+def test_automatic_restart_attempts_to_restore_uu_after_partial_cleanup(launch_spawns, action):
+    ops = _restart_ops(kill_results=[True, False], launch_spawns=launch_spawns)
+    status = cra.discover(ops)
+    result = cra.restart_user_app(ops, status=status, recover_partial=True)
+    assert ops.launched
+    assert result.killed == [100]
+    assert result.action == action
+
+
 def test_v04_restart_swallows_kill_exception_and_reports():
     """清退调用抛异常 ⇒ 记失败结果，绝不向上抛（不炸掉调用方线程）。"""
     ops = _restart_ops(kill_results=OSError("access denied"))

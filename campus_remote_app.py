@@ -440,6 +440,7 @@ class RestartGuard:
 def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
                      guard: Optional[RestartGuard] = None,
                      now: Optional[float] = None,
+                     recover_partial: bool = False,
                      sleep: Optional[Callable[[float], None]] = None) -> RestartResult:
     """清退并重启 UU 远程**用户态**进程（方案 §3.2/§3.3）。
 
@@ -474,25 +475,31 @@ def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
             detail="未找到重启命令（自启项与启动器路径均缺失）：未做任何改动")
 
     killed: List[int] = []
-    for proc in pending:
+    failed_cleanup = None
+    for index, proc in enumerate(pending):
         try:
             success = bool(ops.kill(proc.pid))
         except Exception:                                 # noqa: BLE001 - 能力不可信
             success = False
         if not success:
-            return RestartResult(
-                ok=False, action="failed", killed=killed,
-                detail="清退 %s（PID %d）失败：已中止，未启动新实例"
-                       % (proc.name, proc.pid))
+            if not killed or not recover_partial:
+                return RestartResult(
+                    ok=False, action="failed", killed=killed,
+                    detail="清退 %s（PID %d）失败：已中止，未启动新实例"
+                           % (proc.name, proc.pid))
+            failed_cleanup = proc
+            break
         killed.append(proc.pid)
 
     sleeper = sleep if sleep is not None else _SLEEP
-    outcome = _launch_and_confirm(ops, command, sleeper)
+    remaining_pids = {proc.pid for proc in pending[index:]} if failed_cleanup else set()
+    outcome = _launch_and_confirm(ops, command, sleeper, remaining_pids)
     if outcome == "launch-failed":
         return RestartResult(
             ok=False, action="failed", killed=killed,
             detail="已清退 %d 个进程，但重启命令执行失败：%s" % (len(killed), command))
-    if outcome != "confirmed" and _launch_and_confirm(ops, command, sleeper) != "confirmed":
+    if outcome != "confirmed" and _launch_and_confirm(
+            ops, command, sleeper, remaining_pids) != "confirmed":
         return RestartResult(
             ok=False, action="unconfirmed", killed=killed, launched=command,
             detail="已清退 %d 个用户态进程并执行了重启命令，但未确认到 UU 远程"
@@ -501,6 +508,9 @@ def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
 
     if guard is not None:
         guard.mark(now)
+    if failed_cleanup is not None:
+        return RestartResult(ok=True, action="partial_recovery", killed=killed, launched=command,
+                             detail="部分 UU 进程清退失败，已补启动并确认用户态进程")
     return RestartResult(ok=True, action="restart", killed=killed,
                          launched=command,
                          detail="已清退 %d 个用户态进程并按自启项重新启动"
@@ -508,7 +518,8 @@ def restart_user_app(ops: Any, *, status: Optional[RemoteAppStatus] = None,
 
 
 def _launch_and_confirm(ops: Any, command: str,
-                        sleep: Callable[[float], None]) -> str:
+                        sleep: Callable[[float], None],
+                        excluded_pids: set[int]) -> str:
     """执行重启命令并**确认进程真的出现**（命令返回成功不算数）。
 
     返回 ``"confirmed"``（真的起来了）/ ``"launch-failed"``（命令本身失败）/
@@ -522,7 +533,7 @@ def _launch_and_confirm(ops: Any, command: str,
     for _ in range(RESTART_CONFIRM_ATTEMPTS):
         sleep(RESTART_CONFIRM_INTERVAL)
         try:
-            if discover(ops).user_processes:
+            if any(proc.pid not in excluded_pids for proc in discover(ops).user_processes):
                 return "confirmed"
         except Exception:                                 # noqa: BLE001 - 探测不可信
             continue

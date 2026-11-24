@@ -54,7 +54,7 @@ __all__ = [
 # 版本与取值范围
 # --------------------------------------------------------------------------- #
 #: 应用版本（唯一来源；``pyproject.toml`` 与打包版本资源均应与之一致，F22）。
-__version__ = "0.11.4"
+__version__ = "0.11.5"
 
 SCHEMA_VERSION = 1
 
@@ -80,6 +80,7 @@ E_PROBE_UNRELIABLE = "E_PROBE_UNRELIABLE"
 E_PORTAL_UNREACHABLE = "E_PORTAL_UNREACHABLE"
 E_AUTH_REJECTED = "E_AUTH_REJECTED"
 E_AUTH_CAPTCHA = "E_AUTH_CAPTCHA"
+E_AUTH_DEVICE_LIMIT = "E_AUTH_DEVICE_LIMIT"
 E_PORTAL_STRUCTURE_UNKNOWN = "E_PORTAL_STRUCTURE_UNKNOWN"
 E_PROXY_ENDPOINT_INVALID = "E_PROXY_ENDPOINT_INVALID"
 E_PROXY_WRITE = "E_PROXY_WRITE"
@@ -98,6 +99,7 @@ ERROR_MESSAGES: Dict[str, str] = {
     E_PORTAL_UNREACHABLE: "Portal 不可达（可能是 Wi-Fi 或网关故障）",
     E_AUTH_REJECTED: "Portal 拒绝认证（账号或密码错误）",
     E_AUTH_CAPTCHA: "Portal 要求验证码，需要人工处理",
+    E_AUTH_DEVICE_LIMIT: "Portal 报告在线设备数已达上限",
     E_PORTAL_STRUCTURE_UNKNOWN: "无法识别 Portal 页面结构（疑似改版），需要人工确认",
     E_PROXY_ENDPOINT_INVALID: "代理端点无效或未在监听，未启用代理联动",
     E_PROXY_WRITE: "写入系统代理设置失败",

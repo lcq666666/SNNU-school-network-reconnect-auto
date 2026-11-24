@@ -160,7 +160,7 @@ def test_v11_lifeline_auth_pipeline_also_uses_session_recovery(monkeypatch):
         _cancelled=lambda: False,
         get_config=lambda: config,
         stop_event=threading.Event(),
-        _repair_adapters=lambda: SimpleNamespace(probe_online=None),
+        _repair_lifeline_wifi=lambda: degraded,
         _recover_authenticated_degraded_wifi=lambda result: repaired.append(result) or recovered,
         set_state=lambda *args: None,
         log=SimpleNamespace(info=lambda *args: None,
@@ -186,8 +186,11 @@ def test_v11_lifeline_auth_pipeline_also_uses_session_recovery(monkeypatch):
     assert not app._repair_busy.is_set()
 
 
+@pytest.mark.parametrize("route_kind,expected", [
+    ("wifi", True), ("tun", True), ("wrong_portal", False), ("other_physical", False),
+])
 def test_active_wifi_reset_requires_two_bound_failure_rounds_and_exact_identity(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, route_kind, expected):
     from contextlib import contextmanager
 
     import campus_network as network
@@ -199,7 +202,7 @@ def test_active_wifi_reset_requires_two_bound_failure_rounds_and_exact_identity(
 
     snap = snapshot(eth=network.HealthState.INTERNET_UNREACHABLE,
                     wifi=network.HealthState.INTERNET_UNREACHABLE,
-                    egress_if=WIFI_IF)
+                    egress_if=WIFI_IF if route_kind == "wifi" else 99)
     session = FakeSession()
     session.trust_env = False
     session.route("http://202.117.144.205:8602/snnuportal/userstatus.jsp",
@@ -238,7 +241,11 @@ def test_active_wifi_reset_requires_two_bound_failure_rounds_and_exact_identity(
     adapter = SimpleNamespace(if_index=WIFI_IF, name=snap.wifi.interface,
                               media="wifi", virtual=False,
                               mac="10:11:12:13:14:15")
-    report = SimpleNamespace(adapters=[adapter])
+    report = SimpleNamespace(adapters=[adapter, SimpleNamespace(
+        if_index=99, virtual=route_kind in ("tun", "wrong_portal"))])
+    monkeypatch.setattr(network.NetworkObserver, "route_lookup",
+                        lambda self, target: SimpleNamespace(
+                            if_index=99 if route_kind == "wrong_portal" else WIFI_IF))
 
     class FailedVerifier:
         def __init__(self):
@@ -281,6 +288,11 @@ def test_active_wifi_reset_requires_two_bound_failure_rounds_and_exact_identity(
         app, RepairResult(auth_ok=True, network_ok=False,
                           status=PortalStatus.AUTHENTICATED_DEGRADED))
 
+    if not expected:
+        assert result is None
+        assert not repairs
+        assert not any(call["url"].endswith("/logoff") for call in session.calls)
+        return
     assert result.ok
     assert len(verifier.calls) == 2
     assert all(request.role == "wifi" for request in verifier.calls)
@@ -316,6 +328,8 @@ def test_active_wifi_reset_fails_closed_on_unreliable_probe(monkeypatch, tmp_pat
     monkeypatch.setattr(tray, "get_credentials",
                         lambda: pytest.fail("credentials must not be read"))
     monkeypatch.setattr(netdiag, "collect_health", lambda runner: report)
+    monkeypatch.setattr(network.NetworkObserver, "route_lookup",
+                        lambda self, target: SimpleNamespace(if_index=WIFI_IF))
     monkeypatch.setattr(engine, "wifi_state", lambda *args: ("SNNU", "connected"))
 
     result = tray.TrayApp._reset_degraded_wifi_session(

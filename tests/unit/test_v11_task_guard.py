@@ -58,16 +58,43 @@ def test_commands_are_shell_safe_and_use_guard_switch(tmp_path):
 
 
 def test_task_registration_is_per_user_and_reports_failure(monkeypatch):
+    from xml.etree import ElementTree
+
     calls = []
 
     class Result:
         returncode = 0
+        stdout = '"TEST\\user","S-1-5-21-42"'
 
     monkeypatch.setattr(guard.os, "name", "nt")
+
+    def run(args):
+        calls.append(args)
+        if "/XML" in args:
+            root = ElementTree.parse(args[args.index("/XML") + 1]).getroot()
+            assert root.findtext(".//{*}RunLevel") == "LeastPrivilege"
+            assert root.findtext(".//{*}LogonType") == "InteractiveToken"
+            assert root.findtext(".//{*}ExecutionTimeLimit") == "PT0S"
+            assert root.findtext(".//{*}LogonTrigger/{*}UserId") == "S-1-5-21-42"
+            assert root.findtext(".//{*}Arguments") == "--guard"
+        return Result()
+
     result = guard.register_task(
-        Path("C:/CampusReconnect.exe"), run=lambda args: calls.append(args) or Result(),
+        Path("C:/CampusReconnect.exe"), run=run,
         frozen=True)
     assert result.ok and result.action == "registered"
-    assert calls[0][:4] == ["schtasks.exe", "/Create", "/TN", guard.TASK_NAME]
-    assert "/SC" in calls[0] and "ONLOGON" in calls[0]
-    assert "--guard" in calls[0][calls[0].index("/TR") + 1]
+    assert calls[0][0] == "whoami.exe"
+    assert calls[1][:4] == ["schtasks.exe", "/Create", "/TN", guard.TASK_NAME]
+    assert "/XML" in calls[1]
+    assert calls[2][:4] == ["schtasks.exe", "/Query", "/TN", guard.TASK_NAME]
+
+
+def test_stale_supervisor_waits_if_previous_instance_cannot_be_replaced(tmp_path):
+    path = tmp_path / guard.HEARTBEAT_FILE
+    calls = []
+    guard.write_heartbeat(path, active=True, pid=123, now=1)
+    supervisor = guard.GuardSupervisor(
+        lambda: calls.append("launch"), heartbeat=path, clock=lambda: 100,
+        retire=lambda record: calls.append(record["pid"]) or False)
+    assert supervisor.check_once().action == "previous_instance_unconfirmed"
+    assert calls == [123]

@@ -69,7 +69,20 @@ def test_standby_uses_bound_snnu_pipeline_and_refreshes_observer(monkeypatch):
     wifi = snapshot(H, IU).wifi
     result = tray.TrayApp._repair_standby_wifi(app, wifi)
     assert result.ok and invalidated
-    assert captured["require_web"] and captured["force_login"]
+    assert captured["require_web"] and not captured.get("force_login", False)
     assert captured["allow_auth"] and captured["if_index"] == wifi.if_index
     assert captured["interface"] == wifi.interface
     assert captured["source_ip"] == wifi.source_ip
+
+
+def test_explicit_device_limit_temporarily_suspends_wireless_auth(monkeypatch):
+    import campus_reconnect_tray as tray
+
+    monkeypatch.setattr(tray.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(tray, "direct_session", lambda: pytest.fail("must not authenticate"))
+    app = SimpleNamespace(get_config=dict, _device_limit_retry_at=200)
+    result = tray.TrayApp._repair_standby_wifi(app, snapshot(H, IU).wifi)
+    assert result.repair.error_code == "E_AUTH_DEVICE_LIMIT"
+    assert tray.engine.portal_device_limit("当前在线设备数已达到上限").error_code == result.error
+    assert tray.engine.portal_device_limit("在线设备数上限为 5 台") is None
+    assert tray.engine.portal_device_limit("账号支持 5 台设备同时在线") is None

@@ -135,9 +135,10 @@ def restart_uu(log):
     if status.error:
         raise OSError("UU 进程或启动信息读取失败")
     if status.user_processes:
-        result = restart_user_app(ops, status=status)
+        result = restart_user_app(ops, status=status, recover_partial=True)
         if not result.ok:
             raise OSError("UU 重启未完成")
+        log(result.detail)
     else:
         command = launch_command(status)
         if not command or not ops.launch(command):
@@ -195,8 +196,10 @@ def session_locked():
 
 
 def schedule_reboot():
-    subprocess.run(["shutdown.exe", "/r", "/f", "/t", "60", "/c",
-                    "校园网与UU持续故障，自动恢复将在60秒后重启。请保存文件。"],
+    if not session_locked():
+        raise OSError("Windows 已解锁或锁屏状态不可确认")
+    subprocess.run(["shutdown.exe", "/r", "/t", "0", "/c",
+                    "校园网持续故障，自动恢复申请重启。"],
                    check=True, capture_output=True, timeout=10,
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 

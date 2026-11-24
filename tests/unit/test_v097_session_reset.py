@@ -74,6 +74,23 @@ def test_ambiguous_logout_timeout_still_restores_login(monkeypatch, tmp_path):
     assert reset(**args) is None
 
 
+def test_later_bound_login_finishes_interrupted_reset_without_second_logout(monkeypatch, tmp_path):
+    import json
+    from campus_session_reset import finish_interrupted_login
+
+    reset, session, args, _ = setup_reset(monkeypatch, tmp_path)
+    args["relogin"] = lambda: (_ for _ in ()).throw(RuntimeError("interrupted"))
+    with pytest.raises(RuntimeError, match="interrupted"):
+        reset(**args)
+    assert not finish_interrupted_login(args["journal"], if_index=41)
+    assert finish_interrupted_login(args["journal"], if_index=5)
+    assert json.loads(args["journal"].read_text()) == {
+        "last_attempt": 1000, "stage": "finished", "if_index": 5, "restored": True,
+    }
+    assert reset(**args) is None
+    assert sum(call["url"].endswith("/logoff") for call in session.calls) == 1
+
+
 def test_corrupt_journal_refuses_logout(monkeypatch, tmp_path):
     reset, session, args, calls = setup_reset(monkeypatch, tmp_path)
     args["journal"].write_text("broken", encoding="utf-8")

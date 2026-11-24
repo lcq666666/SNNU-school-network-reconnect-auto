@@ -53,7 +53,7 @@ except ImportError:
     print("缺少依赖，请先运行: py -m pip install requests keyring")
     raise SystemExit(2)
 
-from campus_core import (E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
+from campus_core import (E_AUTH_DEVICE_LIMIT, E_AUTH_REJECTED, E_PORTAL_STRUCTURE_UNKNOWN,
                          E_PORTAL_UNREACHABLE, MAX_BODY_BYTES, PROBE_EXACT,
                          PROBE_HTML_TITLE, BrowserLaunchResult, PortalResolution,
                          PortalStatus, ProbeResult, ProbeSpec, RepairAdapters,
@@ -1300,6 +1300,10 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
         return LoginOutcome(False, error, status=status,
                             error_code=E_PORTAL_STRUCTURE_UNKNOWN)
 
+    limited = portal_device_limit(body)
+    if limited is not None:
+        return limited
+
     # A stale "online" session may reveal its CAPTCHA only after the first POST.
     if not re.search(r"密码.{0,4}(错误|有误|不正确)|账号不存在|账户不存在", body):
         challenge = login_with_captcha(
@@ -1324,6 +1328,15 @@ def portal_login_detailed(session: requests.Session, account: str, password: str
     return LoginOutcome(False, "登录响应未能确认成功（状态页无有效登录账号）",
                         status=PortalStatus.AUTH_REQUIRED,
                         error_code=E_PORTAL_STRUCTURE_UNKNOWN)
+
+
+def portal_device_limit(body: str) -> Optional[LoginOutcome]:
+    if re.search(r"(在线设备数|同时在线数|在线终端数).{0,18}(已达到?|超过).{0,8}上限|"
+                 r"(在线设备数|同时在线数|在线终端数).{0,8}超限|"
+                 r"(已达|超过).{0,8}(最大|允许).{0,8}(设备|终端)数", body):
+        return LoginOutcome(False, "Portal 报告在线设备数已达上限",
+                            status=PortalStatus.NEEDS_USER, error_code=E_AUTH_DEVICE_LIMIT)
+    return None
 
 
 def edge_fallback(log: logging.Logger, force: bool = False) -> BrowserLaunchResult:
@@ -1489,6 +1502,7 @@ def failover(session: requests.Session, args: argparse.Namespace,
 def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
               interface: Optional[str], *, require_web: bool = False,
               force_login: bool = False, cancelled=lambda: False,
+              captcha_max_attempts: int = 3,
               sleep=time.sleep) -> SnnuOps:
     """P4 CLI 侧的注入式能力集合（指向本模块真实函数，便于测试替换）。
 
@@ -1518,10 +1532,11 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         if require_web:
             # Portal 或过滤网关可能允许 TCP 握手；认证前后都按网页内容确认公网。
             verify_web = partial(verify_internet, stop_on_failed_gate=True)
-            adapters = replace(_cli_adapters(), probe_online=verify_web)
-            if force_login:
-                adapters = replace(adapters, login=lambda sess, account, password, yys, port, logger:
-                    portal_login_detailed(sess, account, password, yys, port, logger, force_login=True))
+            adapters = replace(
+                _cli_adapters(), probe_online=verify_web, wifi_state=lambda: wifi_state(interface),
+                login=lambda sess, account, password, yys, port, logger: portal_login_detailed(
+                    sess, account, password, yys, port, logger, force_login=force_login,
+                    captcha_max_attempts=captcha_max_attempts))
             return repair_service(bound_session, options, time.monotonic,
                                   adapters, get_credentials, log=log,
                                   cancelled=cancelled, sleep=sleep)

@@ -1,5 +1,6 @@
 """V0.11 recovery timing and config budget contracts."""
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -221,8 +222,11 @@ def test_successful_repair_disagrees_with_probe_and_blocks_reboot(tmp_path):
     assert "reboot" not in calls
 
 
-@pytest.mark.parametrize("wifi_online,expected", [(True, True), (None, None)])
-def test_unreliable_ethernet_uses_bound_wifi_or_reports_unknown(wifi_online, expected):
+@pytest.mark.parametrize("wifi_online,system_online,expected", [
+    (True, True, True), (True, False, None), (None, False, None),
+])
+def test_physical_wifi_success_alone_does_not_prove_system(
+        wifi_online, system_online, expected, monkeypatch):
     from campus_reconnect import PathVerificationResult
 
     ethernet = SimpleNamespace(role="ethernet")
@@ -230,6 +234,8 @@ def test_unreliable_ethernet_uses_bound_wifi_or_reports_unknown(wifi_online, exp
     results = [PathVerificationResult(False, reliability="PROBE_UNRELIABLE")]
     if wifi is not None:
         results.append(PathVerificationResult(True))
+    monkeypatch.setattr(tray, "direct_session", lambda: nullcontext(object()))
+    monkeypatch.setattr(tray, "verify_internet", lambda *args, **kwargs: (system_online, "test"))
     app = SimpleNamespace(
         _build_path_verifier=lambda: SimpleNamespace(verify=lambda request: results.pop(0)),
         _automatic_setup_armed=False,
@@ -240,7 +246,7 @@ def test_unreliable_ethernet_uses_bound_wifi_or_reports_unknown(wifi_online, exp
     assert not results
 
 
-def test_working_system_route_vetoes_repair_without_authorizing_uu(monkeypatch):
+def test_working_system_route_can_monitor_uu_without_authorizing_wifi_repair(monkeypatch):
     from campus_reconnect import PathVerificationResult
 
     monkeypatch.setattr(tray, "direct_session", lambda: nullcontext(object()))
@@ -248,6 +254,68 @@ def test_working_system_route_vetoes_repair_without_authorizing_uu(monkeypatch):
     app = SimpleNamespace(
         _build_path_verifier=lambda: SimpleNamespace(
             verify=lambda request: PathVerificationResult(False)),
+        _automatic_setup_armed=False,
         log=SimpleNamespace(info=lambda *args: None),
     )
-    assert tray.TrayApp._verify_lifeline_paths(app, SimpleNamespace(role="wifi"), None) is None
+    assert tray.TrayApp._verify_lifeline_paths(app, SimpleNamespace(role="wifi"), None) is True
+
+
+@pytest.mark.parametrize("online,expected", [(True, True), (False, None)])
+def test_system_route_is_checked_even_without_physical_requests(monkeypatch, online, expected):
+    monkeypatch.setattr(tray, "direct_session", lambda: nullcontext(object()))
+    monkeypatch.setattr(tray, "verify_internet", lambda *a, **kw: (online, "system"))
+    app = SimpleNamespace(_automatic_setup_armed=False)
+    assert tray.TrayApp._verify_lifeline_paths(app, None, None) is expected
+
+
+def test_first_network_failure_after_uu_only_fault_waits_for_confirmation(tmp_path):
+    controller, calls, status = make_controller(tmp_path, online=True, uu=False)
+    controller.tick(1000)
+    status["online"] = False
+    controller.tick(2000)
+    assert controller.state["outage_at"] == 2000
+    assert calls == []
+
+
+def test_unknown_observation_restarts_network_confirmation(tmp_path):
+    controller, calls, status = make_controller(tmp_path)
+    controller.tick(1000)
+    status["online"] = None
+    controller.tick(1009)
+    status["online"] = False
+    controller.tick(1030)
+    assert controller.state["outage_at"] == 1030
+    assert calls == []
+
+
+def test_direct_portal_repair_leaves_system_proxy_untouched(tmp_path):
+    controller, calls, _ = make_controller(tmp_path)
+    controller.policy = replace(controller.policy, manage_system_proxy=False)
+    controller.state.update(stage="network_repair", outage_at=1000)
+    controller.tick(1100)
+    assert calls == ["repair"]
+
+
+@pytest.mark.parametrize("unlock,network,expected", [
+    (True, False, False), (False, True, False), (False, None, False), (False, False, True),
+])
+def test_reboot_countdown_stays_in_app_until_fresh_final_check(
+        tmp_path, unlock, network, expected):
+    controller, calls, status = make_controller(tmp_path)
+    controller.policy = replace(controller.policy, reboot_countdown=60)
+    controller.state.update(stage="network_repair", outage_at=1000)
+    controller.tick(1901, allow_reboot=True)
+    controller.tick(1959, allow_reboot=True)
+    assert "reboot" not in calls
+    assert controller.state["reboot_pending"] is False
+
+    def final_probe():
+        if unlock:
+            controller.ops.reboot_ready = lambda: False
+        return network
+
+    controller.ops.network_ok = final_probe
+    status["uu"] = True
+    controller.tick(1961, allow_reboot=True)
+    assert ("reboot" in calls) is expected
+    assert "cancel-reboot" not in calls
