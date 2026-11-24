@@ -1,4 +1,9 @@
 """V0.11 recovery timing and config budget contracts."""
+from contextlib import nullcontext
+from types import SimpleNamespace
+
+import pytest
+
 from campus_resilience import RecoveryController, RecoveryOps, RecoveryPolicy
 import campus_reconnect_tray as tray
 from campus_core import PortalStatus, RepairResult
@@ -191,3 +196,58 @@ def test_recovery_config_is_bounded_and_defaults_to_three_captcha_attempts():
     assert values["recovery_failure_threshold"] == 10
     assert values["captcha_max_attempts"] == 3
     assert values["watchdog_stale_after"] == 30
+
+
+def test_unlock_cancels_pending_reboot_before_slow_network_probe(tmp_path):
+    controller, calls, _ = make_controller(tmp_path)
+    controller.state["reboot_pending"] = True
+    controller.ops.reboot_ready = lambda: False
+
+    def probe():
+        assert calls == ["cancel-reboot"]
+        return None
+
+    controller.ops.network_ok = probe
+    controller.tick(1000, allow_reboot=True)
+    assert not controller.state["reboot_pending"]
+
+
+def test_successful_repair_disagrees_with_probe_and_blocks_reboot(tmp_path):
+    controller, calls, _ = make_controller(tmp_path)
+    controller.state.update(stage="network_repair", outage_at=1000)
+    controller.ops.repair = lambda: (True, "公网已连通")
+    controller.tick(1901, allow_reboot=True)
+    assert not controller.state["reboot_pending"]
+    assert "reboot" not in calls
+
+
+@pytest.mark.parametrize("wifi_online,expected", [(True, True), (None, None)])
+def test_unreliable_ethernet_uses_bound_wifi_or_reports_unknown(wifi_online, expected):
+    from campus_reconnect import PathVerificationResult
+
+    ethernet = SimpleNamespace(role="ethernet")
+    wifi = SimpleNamespace(role="wifi") if wifi_online else None
+    results = [PathVerificationResult(False, reliability="PROBE_UNRELIABLE")]
+    if wifi is not None:
+        results.append(PathVerificationResult(True))
+    app = SimpleNamespace(
+        _build_path_verifier=lambda: SimpleNamespace(verify=lambda request: results.pop(0)),
+        _automatic_setup_armed=False,
+        log=SimpleNamespace(info=lambda *args: None),
+    )
+
+    assert tray.TrayApp._verify_lifeline_paths(app, ethernet, wifi) is expected
+    assert not results
+
+
+def test_working_system_route_vetoes_repair_without_authorizing_uu(monkeypatch):
+    from campus_reconnect import PathVerificationResult
+
+    monkeypatch.setattr(tray, "direct_session", lambda: nullcontext(object()))
+    monkeypatch.setattr(tray, "verify_internet", lambda *args, **kwargs: (True, "system route"))
+    app = SimpleNamespace(
+        _build_path_verifier=lambda: SimpleNamespace(
+            verify=lambda request: PathVerificationResult(False)),
+        log=SimpleNamespace(info=lambda *args: None),
+    )
+    assert tray.TrayApp._verify_lifeline_paths(app, SimpleNamespace(role="wifi"), None) is None

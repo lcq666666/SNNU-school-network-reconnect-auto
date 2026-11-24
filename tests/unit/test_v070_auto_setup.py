@@ -223,6 +223,25 @@ def test_new_install_initialization_enables_guard_and_autostart(monkeypatch):
     assert not app.config["lifeline_reboot_enabled"]
 
 
+def test_packaged_setup_preserves_disabled_computer_reboot(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    import campus_reconnect_tray as tray
+    import campus_windows_guard
+
+    app = tray.TrayApp(logging.getLogger("campus"), config=dict(tray.DEFAULT_CONFIG))
+    saved = []
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(tray, "save_config", lambda cfg: saved.append(cfg.copy()) or True)
+    monkeypatch.setattr(campus_windows_guard, "configure_startup_guard",
+                        lambda **kwargs: SimpleNamespace(detail="test", ok=True))
+    monkeypatch.setattr(tray, "register_task", lambda **kwargs: SimpleNamespace(detail="test", ok=True))
+    app.enable_automatic_setup()
+    assert saved and not saved[0]["lifeline_reboot_enabled"]
+    assert not app.config["lifeline_reboot_enabled"]
+
+
 def test_client_restart_journal_recovers_after_helper_crash(tmp_path):
     from campus_install import atomic_json
     executable = tmp_path / "clash-verge.exe"

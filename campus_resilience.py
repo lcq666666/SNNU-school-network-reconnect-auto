@@ -95,17 +95,17 @@ class RecoveryController:
 
     def _tick(self, now=None, *, allow_reboot=False):
         now = self.clock() if now is None else float(now)
+        if self.state["reboot_pending"] and (not allow_reboot or not self.ops.reboot_ready()):
+            self.cancel_pending()
         self.recover_proxy()
         network = self.ops.network_ok()
+        if self.state["reboot_pending"] and network is not False:
+            self.cancel_pending()
         # UU is only meaningful after the active network has been verified.  A
         # network outage must not be mislabeled as a UU outage and must not
         # trigger a remote-client restart.
         uu = self.ops.uu_ok() if network is True else None
         self.last_network, self.last_uu = network, uu
-        if self.state["reboot_pending"] and network is not False:
-            self.ops.cancel_reboot()
-            self.state["reboot_pending"] = False
-            self.save()
         if network is True and self.ops.standby_repair is not None:
             try:
                 self.ops.standby_repair()
@@ -118,8 +118,6 @@ class RecoveryController:
             self.detail = "网络已确认，UU 状态采集失败，等待复核"
             return
         if network is True and uu is True:
-            if self.state["reboot_pending"]:
-                self.ops.cancel_reboot()
             self.state.update(stage="healthy", outage_at=None, next_action=0,
                               reboot_pending=False)
             self.save()
@@ -208,7 +206,7 @@ class RecoveryController:
             last_reboot = self.state["last_reboot"]
             reboot_due = last_reboot is None or now - last_reboot >= 6 * 3600
             if elapsed >= 900 and allow_reboot and reboot_due:
-                self._repair(now)
+                repair_ok = self._repair(now)
                 network_after_repair = self.ops.network_ok()
                 if network_after_repair is True:
                     self.log("最后一轮网络恢复后公网已通过，继续检查 UU，不安排电脑重启")
@@ -217,6 +215,9 @@ class RecoveryController:
                     return
                 if network_after_repair is not False:
                     self.log("最后一轮网络探测结果不确定，暂不安排电脑重启")
+                    return
+                if repair_ok:
+                    self.log("网络恢复结果和接口探测不一致，暂不安排电脑重启")
                     return
                 if not self.ops.reboot_ready():
                     self.log("Portal 登录仍需处理或 Windows 重启条件未满足，继续按恢复周期重试")
@@ -250,6 +251,7 @@ class RecoveryController:
             now + self.policy.repair_retry_delay,
             self.clock() + self.policy.repair_retry_delay)
         self.save()
+        return ok
 
 
 class StandbyWifiGuard:

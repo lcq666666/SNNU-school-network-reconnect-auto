@@ -154,6 +154,46 @@ def uu_available():
     return bool(status.user_processes or launch_command(status))
 
 
+def session_locked():
+    """Confirm that this Windows session is locked. Unknown results are unsafe."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SessionInfo(ctypes.Structure):
+        _fields_ = [("session_id", wintypes.DWORD), ("state", ctypes.c_int),
+                    ("flags", wintypes.LONG)]
+
+    class SessionData(ctypes.Union):
+        _fields_ = [("info", SessionInfo), ("alignment", ctypes.c_longlong)]
+
+    class SessionInfoEx(ctypes.Structure):
+        _fields_ = [("level", wintypes.DWORD), ("data", SessionData)]
+
+    try:
+        api = ctypes.WinDLL("wtsapi32", use_last_error=True)
+        query = api.WTSQuerySessionInformationW
+        query.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
+                          ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+        query.restype = wintypes.BOOL
+        release = api.WTSFreeMemory
+        release.argtypes = [ctypes.c_void_p]
+        release.restype = None
+        buffer, size = ctypes.c_void_p(), wintypes.DWORD()
+        # WTS_CURRENT_SESSION and WTSSessionInfoEx.
+        if not query(None, 0xFFFFFFFF, 25, ctypes.byref(buffer), ctypes.byref(size)):
+            return False
+        try:
+            if not buffer or size.value < ctypes.sizeof(SessionInfoEx):
+                return False
+            info = ctypes.cast(buffer, ctypes.POINTER(SessionInfoEx)).contents
+            return info.level == 1 and info.data.info.state == 0 and info.data.info.flags == 0
+        finally:
+            if buffer:
+                release(buffer)
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def schedule_reboot():
     subprocess.run(["shutdown.exe", "/r", "/f", "/t", "60", "/c",
                     "校园网与UU持续故障，自动恢复将在60秒后重启。请保存文件。"],

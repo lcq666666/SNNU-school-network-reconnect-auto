@@ -3655,7 +3655,7 @@ class TrayApp:
             return
         cfg = self.get_config()
         cfg.update(lifeline_enabled=True, automatic_proxy_enabled=True,
-                   v06_auto_prompted=True, lifeline_reboot_enabled=True)
+                   v06_auto_prompted=True)
         if first_install:
             cfg.update(remote_restart_enabled=True, watchdog_enabled=True)
         if save_config(cfg):
@@ -3981,6 +3981,45 @@ class TrayApp:
             self.log.warning("[无线会话恢复] 本轮安全检查未完成：%s", type(exc).__name__)
             return None
 
+    def _verify_lifeline_paths(self, primary, alternate):
+        """Use a verified physical path, or report uncertainty without repairing."""
+        verifier = self._build_path_verifier()
+        failed = False
+        partially_online = False
+        for request in (primary, alternate):
+            if request is None:
+                continue
+            try:
+                result = verifier.verify(request)
+            except Exception as exc:
+                self.log.warning("[三层恢复] 接口验证异常：%s", type(exc).__name__)
+                continue
+            if result.reliability != engine.PATH_OK:
+                self.log.info("[三层恢复] %s 接口探测不可信：%s", request.role, result.reason)
+                continue
+            if result.allows_recovery:
+                if self._automatic_setup_armed:
+                    self._guard_proxy_health()
+                return True
+            gate_error = getattr(result.gate_result, "error", None)
+            if (not result.captive_portal and gate_error in {"dns", "connection", "timeout"}
+                    and sum(item.ok is True for item in result.cross_results) >= 2):
+                self.log.warning("[三层恢复] %s 的备用公网探测通过，等待主探测复核", request.role)
+                partially_online = True
+                continue
+            self.log.info("[三层恢复] %s 接口验证未通过：%s", request.role, result.reason)
+            failed = True
+        if failed and not partially_online:
+            # The system route can go through TUN. Its success vetoes disruptive
+            # recovery, but cannot authorize operations on a physical interface.
+            with direct_session() as session:
+                system_ok, _ = verify_internet(session, timeout=(2, 2), stop_on_failed_gate=True)
+            if system_ok:
+                self.log.info("[三层恢复] Windows 当前出口可上网，物理接口结果待复核")
+                return None
+            return False
+        return None
+
     def _lifeline_tick(self):
         if self._lifeline_busy.is_set() or self._repair_busy.is_set():
             return
@@ -4010,65 +4049,33 @@ class TrayApp:
             # make the recovery controller reset Wi-Fi unnecessarily.
             controller = getattr(self, "dual_path", None)
             role = self._active_role_hint()
-            request = (controller.verification_request(role)
-                       if controller is not None else None)
+            other = "wifi" if role == "ethernet" else "ethernet"
+            requests = {}
+            if controller is not None:
+                requests = {candidate: controller.verification_request(candidate)
+                            for candidate in (role, other)}
             # A snapshot can be temporarily untrusted while its collector is
             # rebuilding after DHCP/interface changes.  Refresh the read-only
             # facts once and derive whichever physical path is actually
             # present; do not let a stale ``ethernet`` fallback suppress Wi-Fi
             # recovery on a Wi-Fi-only machine.
-            if request is None:
+            if not requests.get(role) or not requests.get(other):
                 try:
                     observation = self._observe_snapshot(time.monotonic())
                     snapshot = (getattr(observation, "usable_snapshot", None)
                                 or getattr(observation, "snapshot", None))
-                    for candidate in (role, "wifi", "ethernet"):
-                        request = (path_request_from_snapshot(
+                    for candidate in (role, other):
+                        request = path_request_from_snapshot(
                             snapshot, candidate,
                             generation=(controller.network_epoch if controller else 0))
-                                   if snapshot is not None else None)
                         if request is not None:
-                            role = candidate
-                            break
+                            requests[candidate] = request
                 except Exception as exc:
                     self.log.info("[三层恢复] 活动接口快照暂不可用：%s", type(exc).__name__)
-            if request is None:
+            if not any(requests.values()):
                 self.log.info("[三层恢复] 缺少活动接口事实，暂不执行网络修复")
                 return None
-            try:
-                verification = self._build_path_verifier().verify(request)
-            except Exception as exc:
-                self.log.warning("[三层恢复] 接口受限公网验证异常：%s", type(exc).__name__)
-                return None
-            direct_ok = bool(verification.allows_recovery)
-            if not direct_ok:
-                # Baidu is a recovery gate, but it is also a single upstream
-                # dependency.  If two independent interface-bound targets are
-                # healthy and the gate failed only with a transient DNS/
-                # connection/timeout error, keep the Wi-Fi session intact and
-                # retry the gate later instead of resetting the adapter.
-                gate = getattr(verification, "gate_result", None)
-                gate_error = str(getattr(gate, "error", "") or "").lower()
-                cross_hits = sum(1 for item in
-                                 getattr(verification, "cross_results", ())
-                                 if getattr(item, "ok", False))
-                if (not getattr(verification, "captive_portal", False)
-                        and gate_error in {"dns", "connection", "timeout"}
-                        and cross_hits >= 2):
-                    direct_ok = True
-                    self.log.warning(
-                        "[三层恢复] 公网接口可用但百度闸门单点异常（交叉 %d/3），保留 Wi-Fi，稍后复核",
-                        cross_hits)
-            if not direct_ok:
-                self.log.info("[三层恢复] %s 接口验证未通过：%s",
-                              role, verification.reason or "未验证")
-            if direct_ok and self._automatic_setup_armed:
-                # Clash/system-proxy health is a separate axis.  A proxy
-                # failure may need proxy remediation, but must not trigger
-                # Wi-Fi reconnect or Portal re-authentication.
-                self._guard_proxy_health()
-            return direct_ok
-
+            return self._verify_lifeline_paths(requests.get(role), requests.get(other))
         def standby_repair():
             from campus_resilience import StandbyWifiGuard
             if not hasattr(self, "_standby_wifi_guard"):
@@ -4169,6 +4176,10 @@ class TrayApp:
             return True
 
         def reboot_ready():
+            from campus_resilience_windows import session_locked
+            if (not self.get_config().get("lifeline_reboot_enabled", False)
+                    or not session_locked()):
+                return False
             if _portal_result_blocks_computer_reboot(self._last_result):
                 self.log.info("[三层恢复] 最近一次 Portal 结果表示需重新认证或人工处理，保留电脑并继续恢复")
                 return False
@@ -4952,7 +4963,7 @@ class TrayApp:
                 messagebox.showerror("保存失败", "三层恢复设置未保存", parent=win)
         ttk.Checkbutton(recover, text="启用三层恢复（UU重启、代理恢复、电脑重启）",
                         variable=v_lifeline, command=save_lifeline).grid(row=8, column=0, sticky="w", pady=8)
-        ttk.Checkbutton(recover, text="允许故障持续15分钟后强制重启电脑",
+        ttk.Checkbutton(recover, text="允许锁屏时在故障持续15分钟后重启电脑",
                         variable=v_reboot, command=save_lifeline).grid(row=9, column=0, sticky="w")
         ttk.Button(recover, text="本机设置重启后自动登录与锁屏…",
                    command=self._configure_boot_recovery).grid(row=10, column=0, sticky="w", pady=8)
@@ -5363,6 +5374,7 @@ def main(argv=None) -> int:
     parser.add_argument("--load-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--startup-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--update-receipt", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--installed-launch", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--configure-autologon", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.configure_autologon:
@@ -5411,7 +5423,8 @@ def main(argv=None) -> int:
     from campus_ui_prefs import load_theme
     set_theme(load_theme())
     boot_config = load_config()
-    if (packaged and args.background and args.update_receipt is None and boot_config.get("lifeline_enabled", False)
+    if (packaged and args.background and not args.installed_launch
+            and args.update_receipt is None and boot_config.get("lifeline_enabled", False)
             and boot_config.get("lock_after_autologon", True)):
         from campus_boot import autologon_ready, lock_after_boot
         if autologon_ready():
