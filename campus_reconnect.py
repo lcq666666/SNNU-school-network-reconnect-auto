@@ -1552,22 +1552,33 @@ def _snnu_ops(session: requests.Session, observer: Any, log: logging.Logger,
         return repair_service(bound_session, options, time.monotonic,
                               adapters, get_credentials, log=log)
 
+    binding_report = None
+
     def _binding_report():
+        collect_binding = getattr(observer, "observe_wifi_binding", None)
+        if require_web and callable(collect_binding):
+            return collect_binding()
         collect_health = getattr(observer, "observe_health", None)
         return collect_health() if callable(collect_health) else observer.observe(target_ssid="SNNU")
 
     def _refresh_binding():
-        report = _binding_report()
-        adapter = next((item for item in report.adapters
+        nonlocal binding_report
+        binding_report = _binding_report()
+        adapter = next((item for item in binding_report.adapters
                         if getattr(item, "name", "") == interface), None)
-        if adapter is None:
-            raise RuntimeError("SNNU 接口不存在")
-        source = _wifi_source_ip(report, adapter.if_index)
+        if (adapter is None or getattr(adapter, "virtual", None) is True
+                or getattr(adapter, "media", "wifi") != "wifi"):
+            raise RuntimeError("未找到 SNNU 对应的物理无线接口")
+        source = _wifi_source_ip(binding_report, adapter.if_index)
         return InterfaceBinding(interface=interface or "",
                                 if_index=adapter.if_index, source_ip=source)
     def _bind_interface(bound_session, binding):
+        nonlocal binding_report
         from campus_network import _interface_dns
-        report = _binding_report()
+        # The same read supplies the source address and its DNS configuration.
+        report, binding_report = binding_report, None
+        if report is None:
+            report = _binding_report()
         transport = WindowsProbeEngine().for_interface(
             binding.if_index, binding.source_ip,
             _interface_dns(report, binding.if_index))

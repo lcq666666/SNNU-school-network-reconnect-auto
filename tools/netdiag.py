@@ -1050,10 +1050,22 @@ class DiagReport:
         return "\n".join(lines)
 
 
+def collect_wifi_binding(runner: Any) -> DiagReport:
+    """Collect the local adapter, address and DNS facts needed for binding."""
+    return _collect_health(runner, include_routes=False)
+
+
 def collect_health(runner: Any) -> DiagReport:
     """只采集接口健康评估所需的 Windows 数据。独立查询最多三项并行。"""
-    names = ("adapters", "cim_adapters", "ip_addresses", "dns_servers",
-             "default_routes", "egress_v4")
+    return _collect_health(runner, include_routes=True)
+
+
+def _collect_health(runner: Any, *, include_routes: bool) -> DiagReport:
+    names = ("adapters", "cim_adapters", "ip_addresses", "dns_servers")
+    required = ("adapters", "ip_addresses", "dns_servers")
+    if include_routes:
+        names += ("default_routes", "egress_v4")
+        required += ("default_routes",)
 
     def query(name):
         return runner.run(name, COMMANDS[name])
@@ -1061,7 +1073,7 @@ def collect_health(runner: Any) -> DiagReport:
     with ThreadPoolExecutor(max_workers=3) as pool:
         replies = dict(zip(names, pool.map(query, names)))
 
-    for name in ("adapters", "ip_addresses", "dns_servers", "default_routes"):
+    for name in required:
         rc, output, _ = replies[name]
         if rc != 0 and not output.strip():
             # 读取失败不同于系统确实没有地址/路由。拒绝用错误的空数据判定掉线。
@@ -1072,8 +1084,9 @@ def collect_health(runner: Any) -> DiagReport:
         adapters=parse_adapters(replies["adapters"][1], replies["cim_adapters"][1]),
         ip_addresses=parse_ip_addresses(replies["ip_addresses"][1]),
         dns_servers=parse_dns_servers(replies["dns_servers"][1]),
-        default_routes=parse_default_routes(replies["default_routes"][1]),
-        egress={"public_ipv4": parse_egress(replies["egress_v4"], EGRESS_TARGETS[0][1])},
+        default_routes=parse_default_routes(replies["default_routes"][1]) if include_routes else [],
+        egress=({"public_ipv4": parse_egress(replies["egress_v4"], EGRESS_TARGETS[0][1])}
+                if include_routes else {}),
         commands_executed=list(names),
     )
 

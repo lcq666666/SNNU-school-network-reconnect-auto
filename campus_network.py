@@ -246,6 +246,9 @@ class NetworkObserver:
     def observe_health(self) -> "netdiag.DiagReport":
         return netdiag.collect_health(self._runner)
 
+    def observe_wifi_binding(self) -> "netdiag.DiagReport":
+        return netdiag.collect_wifi_binding(self._runner)
+
     def route_lookup(self, target: str) -> Optional[EgressInfo]:
         """按目标地址查询系统最佳路由（Find-NetRoute，不发包）。
 

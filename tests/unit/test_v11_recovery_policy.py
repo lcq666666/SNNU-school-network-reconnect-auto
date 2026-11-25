@@ -296,6 +296,30 @@ def test_direct_portal_repair_leaves_system_proxy_untouched(tmp_path):
     assert calls == ["repair"]
 
 
+def test_wifi_facts_unavailable_retries_without_using_auth_cooldown(tmp_path):
+    from campus_resilience import RepairDeferred
+
+    controller, calls, _ = make_controller(tmp_path)
+    controller.policy = replace(controller.policy, repair_retry_delay=300, manage_system_proxy=False)
+    controller.state.update(stage="network_repair", outage_at=1000)
+    repair = controller.ops.repair
+
+    def temporarily_unavailable():
+        raise RepairDeferred("无线网卡信息暂不可用")
+
+    controller.ops.repair = temporarily_unavailable
+    controller.tick(2000, allow_reboot=True)
+    assert controller.state["next_action"] == 2015
+    assert "无线网卡信息暂不可用" in controller.detail
+    assert calls == []
+    controller.ops.repair = repair
+    controller.tick(2014)
+    assert calls == []
+    controller.tick(2015)
+    assert calls == ["repair"]
+    assert controller.state["next_action"] == 2315
+
+
 @pytest.mark.parametrize("unlock,network,expected", [
     (True, False, False), (False, True, False), (False, None, False), (False, False, True),
 ])

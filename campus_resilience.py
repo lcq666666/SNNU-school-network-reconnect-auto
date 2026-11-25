@@ -11,6 +11,10 @@ from typing import Callable
 from campus_install import atomic_json
 
 
+class RepairDeferred(Exception):
+    """A temporary prerequisite failed before Portal authentication began."""
+
+
 @dataclass
 class RecoveryOps:
     network_ok: Callable
@@ -47,6 +51,7 @@ class RecoveryPolicy:
     uu_confirmation_delay: float = 60.0
     manage_system_proxy: bool = True
     reboot_countdown: float = 0.0
+    transient_repair_retry_delay: float = 15.0
 
 
 class RecoveryController:
@@ -231,6 +236,8 @@ class RecoveryController:
             reboot_due = last_reboot is None or now - last_reboot >= 6 * 3600
             if elapsed >= 900 and allow_reboot and reboot_due:
                 repair_ok = self._repair(now)
+                if repair_ok is None:
+                    return
                 network_after_repair = self.ops.network_ok()
                 if network_after_repair is True:
                     self.log("最后一轮网络恢复后公网已通过，继续检查 UU，不安排电脑重启")
@@ -274,18 +281,22 @@ class RecoveryController:
         if change_proxy:
             self.state["proxy_before"] = self.ops.proxy_snapshot()
             self.save()
+        delay = self.policy.repair_retry_delay
         try:
             if change_proxy:
                 self.ops.proxy_disable()
             ok, detail = self.ops.repair()
             self.detail = detail
             self.log("网络重连完成：%s" % ("已恢复" if ok else "等待后续验证"))
+        except RepairDeferred as exc:
+            ok = None
+            delay = min(delay, self.policy.transient_repair_retry_delay)
+            self.detail = "%s，%g 秒后重新检查" % (exc, delay)
+            self.log(self.detail)
         finally:
             if change_proxy:
                 self.recover_proxy()
-        self.state["next_action"] = max(
-            now + self.policy.repair_retry_delay,
-            self.clock() + self.policy.repair_retry_delay)
+        self.state["next_action"] = max(now, self.clock()) + delay
         self.save()
         return ok
 

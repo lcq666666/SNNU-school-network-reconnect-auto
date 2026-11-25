@@ -515,6 +515,18 @@ def test_monitor_collects_network_inputs_without_running_full_diagnostics(fake_r
     assert report.remote_control == {}
 
 
+def test_wifi_binding_collection_is_independent_of_default_routes(fake_runner):
+    fake_runner.responses.update({
+        "adapters": ADAPTERS_JSON, "cim_adapters": "[]", "ip_addresses": IP_ADDRESSES_JSON,
+        "dns_servers": "[]", "default_routes": (1, "", "unavailable"),
+    })
+    report = netdiag.collect_wifi_binding(fake_runner)
+
+    assert set(fake_runner.calls) == {"adapters", "cim_adapters", "ip_addresses", "dns_servers"}
+    assert report.adapters and report.ip_addresses
+    assert not report.default_routes
+
+
 def test_powercfg_parses_available_sleep_states():
     states = netdiag.parse_powercfg(POWERCFG_TEXT)
     assert states["standby_available"] is True

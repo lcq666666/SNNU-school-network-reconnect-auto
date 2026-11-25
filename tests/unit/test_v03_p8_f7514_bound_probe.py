@@ -300,3 +300,23 @@ def test_f7514_snnu_repair_fails_closed_without_source_ip(monkeypatch):
     assert result.detail != "公网已连通，无需认证", result.detail
     assert unbound == [] and bound == [], (
         "源地址不可得时不应做任何 IP 级证据：unbound=%r bound=%r" % (unbound, bound))
+
+
+def test_wifi_auth_uses_one_fresh_binding_report(monkeypatch):
+    report = types.SimpleNamespace(
+        adapters=[types.SimpleNamespace(name="WLAN", if_index=5, media="wifi", virtual=False)],
+        ip_addresses=[{"if_index": 5, "address_family": "IPv4", "ip_address": SNNU_SOURCE_IP}],
+        dns_servers=[{"if_index": 5, "server_addresses": ["192.0.2.53"]}],
+    )
+    reports = iter([report])
+    observer = types.SimpleNamespace(observe_wifi_binding=lambda: next(reports),
+                                     route_lookup=lambda target: None)
+    session = FakeSession()
+    ops = engine._snnu_ops(session, observer, logging.getLogger("campus"), "WLAN", require_web=True)
+
+    def transport(_self, if_index, source_ip, dns_servers):
+        assert (if_index, source_ip, dns_servers) == (5, SNNU_SOURCE_IP, ["192.0.2.53"])
+        return types.SimpleNamespace(interface_bound=True, bind_session=lambda sess: sess is session)
+
+    monkeypatch.setattr(engine.WindowsProbeEngine, "for_interface", transport)
+    assert ops.bind_interface(session, ops.refresh_binding())

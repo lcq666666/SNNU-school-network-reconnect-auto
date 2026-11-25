@@ -110,7 +110,7 @@ from campus_update import (UPDATE_CHECK_INTERVAL_S, UPDATE_RETRY_INTERVAL_S,
 from campus_task_guard import (GUARD_RESTART_LIMIT, GUARD_STALE_SECONDS,
                                register_task, run_guard, unregister_task,
                                write_heartbeat)
-from campus_resilience import RecoveryPolicy
+from campus_resilience import RepairDeferred, RecoveryPolicy
 
 # ---- V0.6：CustomTkinter 界面（缺失时回退原生 ttk，仍能启动）----
 try:
@@ -3801,19 +3801,25 @@ class TrayApp:
 
     def _repair_lifeline_wifi(self):
         from campus_network import resolve_roles
+        from campus_snnu import SnnuAuthError
         from tools import netdiag
 
         config = self.get_config()
-        report = netdiag.collect_health(netdiag.PowerShellRunner(timeout=5))
+        try:
+            report = netdiag.collect_wifi_binding(netdiag.PowerShellRunner(timeout=5))
+        except (OSError, RuntimeError) as exc:
+            raise RepairDeferred("无线网卡信息暂不可用（%s）" % exc) from exc
         wifi = resolve_roles(report, engine._load_adapters_config())["wifi"]
         if (wifi is None or wifi.virtual is True or wifi.media != "wifi"
                 or (config.get("interface") and config["interface"] != wifi.name)):
-            return RepairResult(error_code="E_SNNU_AUTH_PATH_UNCONFIRMED",
-                                detail="未确认目标无线网卡，等待重新探测", retryable=True)
+            raise RepairDeferred("尚未确认目标无线网卡")
         from types import SimpleNamespace
         result = self._repair_active_wifi(SimpleNamespace(
             interface=wifi.name, if_index=wifi.if_index,
             source_ip=engine._wifi_source_ip(report, wifi.if_index)))
+        if result.repair is None and result.error in (
+                SnnuAuthError.AUTH_PATH_UNCONFIRMED.value, SnnuAuthError.NO_IP.value):
+            raise RepairDeferred(result.detail)
         return result.repair or RepairResult(error_code=result.error, detail=result.detail,
                                             retryable=True)
 

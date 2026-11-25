@@ -7,6 +7,21 @@ from campus_session_reset import (has_confirmed_internet_failure,
                                   is_confirmed_degraded_auth)
 
 
+def test_lifeline_defers_before_login_when_windows_adapter_query_fails(monkeypatch):
+    from campus_reconnect_tray import TrayApp
+    from campus_resilience import RepairDeferred
+    from tools import netdiag
+
+    def unavailable(_runner):
+        raise RuntimeError("网络采集查询失败：adapters")
+
+    monkeypatch.setattr(netdiag, "collect_wifi_binding", unavailable)
+    app = SimpleNamespace(get_config=dict,
+                          _repair_active_wifi=lambda wifi: pytest.fail("binding must be confirmed"))
+    with pytest.raises(RepairDeferred, match="adapters"):
+        TrayApp._repair_lifeline_wifi(app)
+
+
 def test_only_authenticated_degraded_results_qualify_for_session_reset():
     degraded = RepairResult(
         auth_ok=True, network_ok=False,
